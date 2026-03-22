@@ -1,18 +1,21 @@
 /// Icarus-v2 CLI Entry Point
 ///
-/// Multi-model AI image cropping system. Runs object detection on an input image
-/// using one of the five supported ONNX detection models, then optionally saves
-/// cropped regions, annotated images, or raw detection JSON to disk.
+/// AI image cropping system. Runs YOLOv10 object detection on an input image via
+/// ONNX Runtime, then optionally saves cropped regions, annotated images, or raw
+/// detection JSON to disk.
+///
+/// The YOLOv10n ONNX model is downloaded from HuggingFace Hub on first use and
+/// cached locally in `~/.cache/huggingface/hub/`.
 ///
 /// # Example
 /// ```
-/// icarus-v2 --input photo.jpg --output crop.jpg --model detr-resnet101 \
-///            --model-path ./models/detr/model.onnx --confidence 0.5
+/// icarus-v2 --input photo.jpg --output crop.jpg --model yolov10 --confidence 0.3
 /// ```
 use anyhow::{bail, Context, Result};
+use candle_core::Device;
 use clap::Parser;
-use icarus_v2::image_utils::{crop_image, Detection};
-use icarus_v2::models::implementations::{DETRResNet101, DFineL, RFDETRLarge, RFDETRMedium, YOLOv9c};
+use icarus_v2::image_utils::crop_image;
+use icarus_v2::models::load_candle_model;
 use image::DynamicImage;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -21,22 +24,18 @@ use std::path::{Path, PathBuf};
 // Argument definitions
 // ---------------------------------------------------------------------------
 
-/// Known model names with their default ONNX file locations.
+/// Known model names supported by the detection backend.
 const VALID_MODELS: &[&str] = &[
-    "detr-resnet101",
-    "yolov9-c",
-    "dfine-l",
-    "rf-detr-large",
-    "rf-detr-medium",
+    "yolov10", // YOLOv10n via ONNX Runtime
 ];
 
 #[derive(Parser, Debug)]
 #[command(
     name = "icarus-v2",
-    about = "Multi-Model AI Image Cropping System",
-    long_about = "Detect objects in images using one of five ONNX detection models \
-                  (DETR, YOLO, D-FINE, RF-DETR). Supports saving cropped regions, \
-                  annotated images, and raw detection JSON.",
+    about = "AI Image Cropping System",
+    long_about = "Detect objects in images using YOLOv10 via ONNX Runtime. \
+                  Supports saving cropped regions, annotated images, and raw detection JSON. \
+                  The YOLOv10n ONNX model (~9 MB) is downloaded from HuggingFace Hub on first use.",
     version
 )]
 struct Args {
@@ -51,13 +50,13 @@ struct Args {
     /// Model to use for detection
     #[arg(
         long,
-        default_value = "detr-resnet101",
+        default_value = "yolov10",
         value_name = "MODEL",
-        help = "One of: detr-resnet101, yolov9-c, dfine-l, rf-detr-large, rf-detr-medium"
+        help = "Currently supported: yolov10 (YOLOv10n via ONNX Runtime)"
     )]
     model: String,
 
-    /// Path to ONNX model file (uses built-in default path if omitted)
+    /// (Ignored — retained for backward compatibility; weights are loaded from HuggingFace Hub)
     #[arg(long, value_name = "FILE")]
     model_path: Option<PathBuf>,
 
@@ -69,13 +68,43 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     output_boxes: Option<PathBuf>,
 
-    /// Draw detection boxes on image and save to this path
-    #[arg(long, value_name = "FILE")]
+    /// Draw detection boxes on image and save to this path (alias: --annotate)
+    #[arg(long, alias = "annotate", value_name = "FILE")]
     visualize: Option<PathBuf>,
 
     /// Suppress all informational output (errors are still shown)
     #[arg(long)]
     quiet: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Unified Detection type for CLI output
+// ---------------------------------------------------------------------------
+
+/// A detection result in a form convenient for the CLI output helpers.
+///
+/// Converted from `candle_backend::Detection` after inference.
+#[derive(Debug, Clone)]
+struct Detection {
+    /// Bounding box in XYXY pixel coordinates: [x1, y1, x2, y2].
+    bbox: [f32; 4],
+    /// Class label string (e.g. "person").
+    label: String,
+    /// Zero-based COCO class index.
+    class_id: usize,
+    /// Detection confidence in (0.0, 1.0].
+    confidence: f32,
+}
+
+impl From<icarus_v2::models::Detection> for Detection {
+    fn from(d: icarus_v2::models::Detection) -> Self {
+        Self {
+            bbox: [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+            label: d.class_name,
+            class_id: d.class_id,
+            confidence: d.confidence,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,79 +130,6 @@ impl From<&Detection> for DetectionRecord {
             bbox: d.bbox,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Model dispatch
-// ---------------------------------------------------------------------------
-
-/// Resolve the default ONNX model file path for a given model name.
-///
-/// Returns `None` if the model name has no known default path (callers should
-/// then require the user to supply `--model-path`).
-fn default_model_path(model_name: &str) -> Option<PathBuf> {
-    match model_name {
-        "detr-resnet101" => Some(PathBuf::from("./icarus-v1-rust/models/detr/model.onnx")),
-        // YOLOv10m is the closest available weight file for the yolov9-c variant.
-        "yolov9-c" => Some(PathBuf::from(
-            "./icarus-v1-rust/models/yolov10m/model.onnx",
-        )),
-        _ => None,
-    }
-}
-
-/// Run detection using the model identified by `model_name` loaded from `model_path`.
-///
-/// Returns the full unsorted detection list; confidence filtering happens here.
-async fn run_detection(
-    model_name: &str,
-    model_path: &Path,
-    image: DynamicImage,
-    confidence_threshold: f32,
-) -> Result<Vec<Detection>> {
-    let detections = match model_name {
-        "detr-resnet101" => {
-            let model = DETRResNet101::new(model_path)
-                .with_context(|| format!("Failed to load DETR-ResNet101 from {:?}", model_path))?;
-            model.detect(image).await?
-        }
-        "yolov9-c" => {
-            let model = YOLOv9c::new(model_path)
-                .with_context(|| format!("Failed to load YOLOv9-c from {:?}", model_path))?;
-            model.detect(image).await?
-        }
-        "dfine-l" => {
-            let model = DFineL::new(model_path)
-                .with_context(|| format!("Failed to load D-FINE-L from {:?}", model_path))?;
-            model.detect(image).await?
-        }
-        "rf-detr-large" => {
-            let model = RFDETRLarge::new(model_path)
-                .with_context(|| format!("Failed to load RF-DETR-Large from {:?}", model_path))?;
-            model.detect(image).await?
-        }
-        "rf-detr-medium" => {
-            let model = RFDETRMedium::new(model_path)
-                .with_context(|| {
-                    format!("Failed to load RF-DETR-Medium from {:?}", model_path)
-                })?;
-            model.detect(image).await?
-        }
-        unknown => bail!(
-            "Unknown model '{}'. Valid options are: {}",
-            unknown,
-            VALID_MODELS.join(", ")
-        ),
-    };
-
-    // Apply confidence threshold (the postprocessor already does this at 0.5, but the
-    // CLI flag lets users tighten it further without recompiling).
-    let filtered: Vec<Detection> = detections
-        .into_iter()
-        .filter(|d| d.confidence >= confidence_threshold)
-        .collect();
-
-    Ok(filtered)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,13 +195,13 @@ fn save_visualized(
 
     // Simple colour palette — cycles by class_id.
     let palette: &[[u8; 4]] = &[
-        [255, 0, 0, 220],   // red
-        [0, 200, 0, 220],   // green
-        [0, 100, 255, 220], // blue
-        [255, 165, 0, 220], // orange
-        [148, 0, 211, 220], // purple
-        [0, 206, 209, 220], // teal
-        [255, 20, 147, 220],// pink
+        [255, 0, 0, 220],    // red
+        [0, 200, 0, 220],    // green
+        [0, 100, 255, 220],  // blue
+        [255, 165, 0, 220],  // orange
+        [148, 0, 211, 220],  // purple
+        [0, 206, 209, 220],  // teal
+        [255, 20, 147, 220], // pink
     ];
 
     for det in detections {
@@ -310,13 +266,24 @@ async fn main() -> Result<()> {
         );
     }
 
-    // ── Validate model name early (before touching the filesystem) ─────────
+    // ── Validate model name early ──────────────────────────────────────────
     if !VALID_MODELS.contains(&args.model.as_str()) {
         bail!(
             "Unknown model '{}'. Valid options are:\n  {}",
             args.model,
             VALID_MODELS.join("\n  ")
         );
+    }
+
+    // ── Warn if --model-path was supplied (no longer used) ─────────────────
+    if let Some(ref p) = args.model_path {
+        if !args.quiet {
+            eprintln!(
+                "Warning: --model-path {:?} is ignored; weights are loaded from \
+                 HuggingFace Hub automatically.",
+                p
+            );
+        }
     }
 
     // ── Load input image ───────────────────────────────────────────────────
@@ -328,10 +295,7 @@ async fn main() -> Result<()> {
     }
 
     if !args.quiet {
-        println!(
-            "Icarus-v2: loading image from {:?}",
-            args.input
-        );
+        println!("Icarus-v2: loading image from {:?}", args.input);
     }
 
     let image = image::open(&args.input)
@@ -347,42 +311,50 @@ async fn main() -> Result<()> {
         );
     }
 
-    // ── Resolve model file path ────────────────────────────────────────────
-    let model_path: PathBuf = match &args.model_path {
-        Some(p) => p.clone(),
-        None => match default_model_path(&args.model) {
-            Some(p) => p,
-            None => bail!(
-                "No default model path configured for '{}'. \
-                 Please supply --model-path pointing to an ONNX file.",
-                args.model
-            ),
-        },
-    };
-
-    if !model_path.exists() {
-        bail!(
-            "Model file not found: {:?}\n\
-             Tip: You can download the model and pass its location with --model-path.",
-            model_path
-        );
-    }
+    // ── Select compute device ──────────────────────────────────────────────
+    // Always CPU for now; GPU support (Device::Cuda(0)) can be added later.
+    // TODO: Add --device flag to expose GPU selection once GPU testing is available.
+    let device = Device::Cpu;
 
     if !args.quiet {
-        println!("  Model: {} (from {:?})", args.model, model_path);
+        println!(
+            "  Model: {} (loading weights from HuggingFace Hub…)",
+            args.model
+        );
         println!("  Confidence threshold: {}", args.confidence);
+    }
+
+    // ── Load model ─────────────────────────────────────────────────────────
+    let model = load_candle_model(&args.model, &device)
+        .await
+        .with_context(|| format!("Failed to load model '{}'", args.model))?;
+
+    if !args.quiet {
         println!("  Running inference…");
     }
 
-    // ── Run detection ──────────────────────────────────────────────────────
-    let detections = run_detection(&args.model, &model_path, image.clone(), args.confidence)
-        .await
-        .with_context(|| {
-            format!(
-                "Detection failed for model '{}' on image {:?}",
-                args.model, args.input
-            )
-        })?;
+    // ── Run inference ──────────────────────────────────────────────────────
+    let input_tensor = model
+        .preprocess(&[image.clone()])
+        .map_err(|e| anyhow::anyhow!("Preprocessing failed for '{}': {e}", args.model))?;
+
+    let (logits, boxes) = model
+        .forward(&input_tensor)
+        .map_err(|e| anyhow::anyhow!("Inference failed for '{}': {e}", args.model))?;
+
+    let raw_detections = model
+        .postprocess(logits, boxes)
+        .map_err(|e| anyhow::anyhow!("Postprocessing failed for '{}': {e}", args.model))?;
+
+    // Convert from candle_backend::Detection to the CLI's Detection type, then
+    // apply the user-supplied confidence threshold (the model already applies its
+    // own internal threshold at inference time; this allows users to tighten it
+    // further via --confidence without recompiling).
+    let detections: Vec<Detection> = raw_detections
+        .into_iter()
+        .map(Detection::from)
+        .filter(|d| d.confidence >= args.confidence)
+        .collect();
 
     // ── Report results ─────────────────────────────────────────────────────
     if detections.is_empty() {
@@ -396,21 +368,19 @@ async fn main() -> Result<()> {
                 args.confidence
             );
         }
-    } else {
-        if !args.quiet {
-            println!("Found {} object(s):", detections.len());
-            for (i, det) in detections.iter().enumerate() {
-                println!(
-                    "  [{:2}] {:<20} conf={:.3}  bbox=[{:.0},{:.0},{:.0},{:.0}]",
-                    i + 1,
-                    det.label,
-                    det.confidence,
-                    det.bbox[0],
-                    det.bbox[1],
-                    det.bbox[2],
-                    det.bbox[3]
-                );
-            }
+    } else if !args.quiet {
+        println!("Found {} object(s):", detections.len());
+        for (i, det) in detections.iter().enumerate() {
+            println!(
+                "  [{:2}] {:<20} conf={:.3}  bbox=[{:.0},{:.0},{:.0},{:.0}]",
+                i + 1,
+                det.label,
+                det.confidence,
+                det.bbox[0],
+                det.bbox[1],
+                det.bbox[2],
+                det.bbox[3]
+            );
         }
     }
 
@@ -466,5 +436,36 @@ async fn main() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "debug_tensors")]
+fn debug_tensor_inspection() -> anyhow::Result<()> {
+    use std::path::Path;
+    let weights_path = Path::new("/home/developer/.cache/huggingface/hub/models--facebook--detr-resnet-50/snapshots/1d5f47bd3bdd2c4bbfa585418ffe6da5028b4c0b/model.safetensors");
+    
+    let data = std::fs::read(weights_path)?;
+    let tensors = safetensors::SafeTensors::deserialize(&data)?;
+    
+    let mut keys: Vec<_> = tensors.names().collect();
+    keys.sort();
+    
+    println!("Total tensors: {}\n", keys.len());
+    
+    println!("=== ALL KEYS (first 100) ===");
+    for (i, key) in keys.iter().take(100).enumerate() {
+        println!("{:3}: {}", i, key);
+    }
+    
+    println!("\n\n=== BACKBONE KEYS ===");
+    let backbone_keys: Vec<_> = keys.iter()
+        .filter(|k| k.contains("backbone"))
+        .collect();
+    
+    println!("Total backbone keys: {}", backbone_keys.len());
+    for key in backbone_keys.iter().take(60) {
+        println!("  {}", key);
+    }
+    
     Ok(())
 }

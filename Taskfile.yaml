@@ -1,13 +1,107 @@
 version: "3"
 
 tasks:
-  default:
-    - task --list-all
+    default:
+        - task --list-all
 
-  test-crop:
-    desc: "Test cropping using actual sample photo"
-    cmds:
-      - cargo run --
-        --input input/sample.jpg
-        --output output/sample.jpg
-        --visualize output/sample_annotated.jpg
+    deps:
+        desc: "Install build dependencies (protoc for candle-onnx)"
+        cmds:
+            - cmd: |
+                  set -e
+                  PROTOC_DIR="${HOME}/.local/bin"
+                  mkdir -p "$PROTOC_DIR"
+
+                  # Check if protoc is already installed
+                  if command -v protoc &> /dev/null; then
+                      echo "✓ protoc is already installed at $(which protoc)"
+                      protoc --version
+                      exit 0
+                  fi
+
+                  # Detect OS and architecture
+                  OS=$(uname -s)
+                  ARCH=$(uname -m)
+
+                  if [ "$OS" = "Linux" ]; then
+                      if [ "$ARCH" = "x86_64" ]; then
+                          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v26.1/protoc-26.1-linux-x86_64.zip"
+                      elif [ "$ARCH" = "aarch64" ]; then
+                          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v26.1/protoc-26.1-linux-aarch_64.zip"
+                      else
+                          echo "Unsupported architecture: $ARCH"
+                          exit 1
+                      fi
+                  elif [ "$OS" = "Darwin" ]; then
+                      if [ "$ARCH" = "x86_64" ]; then
+                          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v26.1/protoc-26.1-osx-x86_64.zip"
+                      elif [ "$ARCH" = "arm64" ]; then
+                          PROTOC_URL="https://github.com/protocolbuffers/protobuf/releases/download/v26.1/protoc-26.1-osx-aarch_64.zip"
+                      else
+                          echo "Unsupported architecture: $ARCH"
+                          exit 1
+                      fi
+                  else
+                      echo "Unsupported OS: $OS"
+                      exit 1
+                  fi
+
+                  echo "Downloading protoc from: $PROTOC_URL"
+                  TMP_DIR=$(mktemp -d)
+                  cd "$TMP_DIR"
+                  curl -L -o protoc.zip "$PROTOC_URL"
+                  unzip -q protoc.zip
+
+                  # Install protoc to ~/.local/bin
+                  cp bin/protoc "$PROTOC_DIR/"
+                  cp -r include/* /usr/local/include/ 2>/dev/null || true
+
+                  cd -
+                  rm -rf "$TMP_DIR"
+
+                  # Verify installation
+                  echo "✓ protoc installed successfully"
+                  "$PROTOC_DIR/protoc" --version
+
+                  # Add to PATH if not already there
+                  if ! grep -q "$PROTOC_DIR" <<< "$PATH"; then
+                      echo ""
+                      echo "Add to your shell profile (~/.bashrc, ~/.zshrc, etc):"
+                      echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+                      echo ""
+                      echo "Or run: export PATH=\"$PROTOC_DIR:\$PATH\""
+                  fi
+
+    test-crop-exec:
+        ignore_error: true
+        vars:
+            DETR_CONFIDENCE: 0.25
+        cmds:
+            - time cargo run --
+              --model detr-resnet50
+              --input input/sample.jpg
+              --output output/sample_detr.jpg
+              --visualize output/sample_detr_annotated.jpg
+              --confidence {{ .DETR_CONFIDENCE }}
+            - time cargo run --
+              --model yolov9-c
+              --input input/sample.jpg
+              --output output/sample_yolo.jpg
+              --visualize output/sample_yolo_annotated.jpg
+            - time cargo run --
+              --model detr
+              --input input/sample.jpg
+              --output output/sample_dfine.jpg
+              --visualize output/sample_dfine_annotated.jpg
+              --confidence {{ .DETR_CONFIDENCE }}
+            - time cargo run --
+              --model rt-detr
+              --input input/sample.jpg
+              --output output/sample_rfdetr_large.jpg
+              --visualize output/sample_rfdetr_large_annotated.jpg
+              --confidence {{ .DETR_CONFIDENCE }}
+
+    test-crop:
+        desc: "Test cropping using actual sample photo"
+        cmds:
+            - time task test-crop-exec

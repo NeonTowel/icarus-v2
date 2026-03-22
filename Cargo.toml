@@ -4,9 +4,6 @@ version = "2.0.0"
 edition = "2021"
 
 [dependencies]
-ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-ndarray = "0.17"
-ndarray-stats = "0.5"
 image = "0.25"
 nalgebra = "0.33"
 serde = { version = "1.0", features = ["derive"] }
@@ -19,9 +16,26 @@ log = "0.4"
 env_logger = "0.11"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 
+# Candle ML framework (retained for utilities: candle_backend trait types, NMS, etc.)
+candle-core = "0.9"
+candle-onnx = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+
+# HuggingFace Hub client
+hf-hub = "0.3"
+
+# safetensors format support
+safetensors = "0.3"
+
+# YOLOv10 ONNX Runtime integration (ONNX backend, no Candle)
+yolov10 = { version = "0.2", default-features = false, features = ["cpu"] }
+# Pinned to match yolov10's exact transitive requirements; download-binaries fetches
+# the ONNX Runtime shared library automatically at build time.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries"] }
+ndarray = "0.16"
+
 [dev-dependencies]
-# Used in inspector tests to create temporary files with invalid ONNX content.
-tempfile = "3"
 
 [[bin]]
 name = "icarus-v2"
