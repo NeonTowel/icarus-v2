@@ -1,0 +1,13 @@
+version: "3"
+
+tasks:
+  default:
+    - task --list-all
+
+  test-crop:
+    desc: "Test cropping using actual sample photo"
+    cmds:
+      - cargo run --
+        --input input/sample.jpg
+        --output output/sample.jpg
+        --visualize output/sample_annotated.jpg
