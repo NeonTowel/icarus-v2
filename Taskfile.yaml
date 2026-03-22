@@ -131,6 +131,7 @@ tasks:
               --confidence {{ .CONFIDENCE }}
 
     test-batch:
+        deps: [build-without-warnings]
         silent: true
         desc: "Test cropping with yolo model using actual batch of sample photos"
         sources:
@@ -142,7 +143,7 @@ tasks:
             - for: sources
               cmd: |-
                   echo "Processing {{ base .ITEM }}"
-                  time cargo run --quiet -- \
+                  time target/debug/icarus-v2 \
                     --model yolov10 \
                     --input input/{{ base .ITEM }} \
                     --output output/{{ base .ITEM }} \
