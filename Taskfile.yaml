@@ -151,13 +151,15 @@ tasks:
 
     test-align-issue:
         deps: [build-without-warnings]
-        desc: "Test cropping with yolo model using actual batch of sample photos for alignment issues"
+        desc: "Test multi-format cropping using sample align-issue photos"
         silent: true
         sources:
             - input/sample_align_issue*
         method: none
         vars:
             CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
         cmds:
             - for: sources
               cmd: |-
@@ -167,6 +169,7 @@ tasks:
                     --input input/{{ base .ITEM }} \
                     --output output/align_issue_{{ base .ITEM }} \
                     --visualize output/align_issue_annotated_{{ base .ITEM }} \
-                    --confidence {{ .CONFIDENCE }}
+                    --confidence {{ .CONFIDENCE }} \
+                    --margin {{ .MARGIN }}
 
 #                    --quiet

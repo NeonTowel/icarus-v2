@@ -14,8 +14,12 @@
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
-use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9, crop_to_ultrawide_21_9_centered};
+use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use icarus_v2::models::load_candle_model;
+use icarus_v2::multi_format_cropping::{
+    BBox, CropRegion, calculate_landscape_21_9_crop, calculate_portrait_9_16_crop,
+    calculate_portrait_9_21_crop, detect_suitable_formats,
+};
 use image::DynamicImage;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -86,6 +90,17 @@ struct Args {
     /// adjustment.
     #[arg(long, default_value_t = false)]
     keep_aspect_ratio: bool,
+
+    /// Add symmetric padding around the detected person bounding box before cropping.
+    ///
+    /// The value is a percentage of the bbox dimensions:
+    /// - Horizontal margin = bbox_width  × (margin / 100)
+    /// - Vertical margin   = bbox_height × (margin / 100)
+    ///
+    /// For example, `--margin 10` adds 10% padding on each side.
+    /// Margins are clamped to photo bounds, so they will never go negative or exceed the photo.
+    #[arg(long, default_value_t = 0.0, value_name = "PERCENT")]
+    margin: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,52 +183,37 @@ fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
 // Output helpers
 // ---------------------------------------------------------------------------
 
-/// Save a cropped JPEG/PNG to `output_path`, prioritising person-based cropping.
+/// Save a raw bounding-box crop (fallback when `--keep-aspect-ratio` is specified or no
+/// multi-format output path is configured).
 ///
-/// - If `person_detection` is `Some`, the crop is centered on that person's bounding box.
-/// - If `person_detection` is `None`, falls back to a centered 21:9 crop of the full image
-///   (or returns the full image unchanged when `keep_aspect_ratio` is `true`).
-///
-/// Always returns `Ok(true)` — a file is always written.
-///
-/// When `keep_aspect_ratio` is `false` (the default), the crop is expanded to a
-/// 21:9 ultrawide aspect ratio — ideal for desktop wallpapers. Pass `true` to use
-/// the raw detected bounding box (or full image if no person detected).
-fn save_crop(
+/// When `keep_aspect_ratio` is `false` (the default), falls back to a centered 21:9 crop
+/// of the full image. Pass `true` to return the full image unchanged (no person found).
+fn save_fallback_crop(
     image: &DynamicImage,
-    person_detection: Option<&Detection>,
     output_path: &Path,
-    keep_aspect_ratio: bool,
-) -> Result<bool> {
-    let crop = match person_detection {
-        Some(person) => {
-            // Person detected: crop centered on that person's bounding box.
-            if keep_aspect_ratio {
-                crop_image(image, person.bbox)
-                    .with_context(|| format!("Failed to crop image for bbox {:?}", person.bbox))?
-            } else {
-                crop_to_ultrawide_21_9(image, person.bbox)
-                    .with_context(|| {
-                        format!("Failed to crop image to 21:9 for bbox {:?}", person.bbox)
-                    })?
-            }
-        }
-        None => {
-            // No person detected: fall back to center cropping.
-            if keep_aspect_ratio {
-                // No bounding box available; return the full image unchanged.
-                image.clone()
-            } else {
-                crop_to_ultrawide_21_9_centered(image)
-                    .with_context(|| "Failed to crop image to centered 21:9")?
-            }
-        }
-    };
-
+) -> Result<()> {
+    let crop = crop_to_ultrawide_21_9_centered(image)
+        .with_context(|| "Failed to crop image to centered 21:9")?;
     crop.save(output_path)
         .with_context(|| format!("Failed to save cropped image to {:?}", output_path))?;
+    Ok(())
+}
 
-    Ok(true)
+/// Crop the image to the given `CropRegion` and save to `output_path`.
+///
+/// The crop coordinates are clamped to photo bounds before saving.
+fn save_crop_region(
+    image: &DynamicImage,
+    crop: &CropRegion,
+    output_path: &Path,
+) -> Result<()> {
+    let xyxy = crop.to_xyxy_clamped(image.width(), image.height());
+    let cropped = crop_image(image, xyxy)
+        .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
+    cropped
+        .save(output_path)
+        .with_context(|| format!("Failed to save cropped image to {:?}", output_path))?;
+    Ok(())
 }
 
 /// Save detection bounding boxes as a JSON array to `output_path`.
@@ -442,14 +442,187 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Save cropped output ────────────────────────────────────────────────
-    // Always attempt to crop: person_for_crop drives person-centric cropping;
-    // when None, save_crop() falls back to a centered 21:9 frame.
+    // ── Multi-format cropping ──────────────────────────────────────────────
+    //
+    // When --output is supplied and a person was detected, we run the multi-format
+    // intelligent cropping pipeline:
+    //
+    //   1. Detect suitable formats (21:9, 9:21, 9:16) based on bbox orientation
+    //      and visibility checks.
+    //   2. For each suitable format, calculate the crop region and save a
+    //      format-suffixed file (e.g. photo_21_9.jpg).
+    //   3. If --visualize is also supplied, save a per-format annotated image
+    //      (e.g. photo_21_9_annotated.jpg).
+    //
+    // Fallback: when no person is detected OR --keep-aspect-ratio is set, we
+    // fall back to the old behaviour (centered 21:9 of the whole image).
+
     if let Some(ref output_path) = args.output {
-        let saved = save_crop(&image, person_for_crop, output_path, args.keep_aspect_ratio)
-            .with_context(|| format!("Failed to save crop to {:?}", output_path))?;
-        if saved && !args.quiet {
-            println!("Saved cropped image to {:?}", output_path);
+        if args.keep_aspect_ratio || person_for_crop.is_none() {
+            // ── Legacy / keep-aspect-ratio path ───────────────────────────
+            if person_for_crop.is_none() && !args.quiet {
+                println!("  No person detected — falling back to centered 21:9 crop.");
+            }
+            if args.keep_aspect_ratio {
+                // Raw bbox crop (no aspect-ratio expansion)
+                if let Some(person) = person_for_crop {
+                    let cropped = crop_image(&image, person.bbox)
+                        .with_context(|| format!("Failed to crop bbox {:?}", person.bbox))?;
+                    cropped.save(output_path)
+                        .with_context(|| format!("Failed to save to {:?}", output_path))?;
+                } else {
+                    image.save(output_path)
+                        .with_context(|| format!("Failed to save to {:?}", output_path))?;
+                }
+            } else {
+                save_fallback_crop(&image, output_path)
+                    .with_context(|| format!("Failed to save fallback crop to {:?}", output_path))?;
+            }
+            if !args.quiet {
+                println!("Saved cropped image to {:?}", output_path);
+            }
+            // Single-format visualisation
+            if let Some(ref viz_path) = args.visualize {
+                save_visualized(&image, &detections, viz_path)
+                    .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
+                if !args.quiet {
+                    println!("Saved visualized image to {:?}", viz_path);
+                }
+            }
+        } else {
+            // ── Multi-format intelligent cropping path ─────────────────────
+            let person = person_for_crop.unwrap(); // safe: checked above
+            let raw_bbox: BBox = person.bbox.into();
+
+            if args.margin < 0.0 {
+                bail!("--margin must be ≥ 0, got {}", args.margin);
+            }
+
+            let suitable_formats =
+                detect_suitable_formats(image.width(), image.height(), &raw_bbox, args.margin);
+
+            if suitable_formats.is_empty() {
+                if !args.quiet {
+                    println!(
+                        "  No suitable crop formats found for this photo \
+                         (person visibility < 50% in all formats). \
+                         Try lowering --margin or adjusting --confidence."
+                    );
+                }
+                // Still write the fallback so callers get *some* output
+                save_fallback_crop(&image, output_path)
+                    .with_context(|| "Failed to save fallback crop")?;
+                if !args.quiet {
+                    println!("Saved fallback centered 21:9 crop to {:?}", output_path);
+                }
+            } else {
+                if !args.quiet {
+                    println!("  Suitable formats: {}", suitable_formats.join(", "));
+                }
+
+                // Build the output stem + extension so we can construct per-format paths.
+                // e.g. "output/photo.jpg" → stem="photo", ext="jpg"
+                let stem = output_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("crop");
+                let ext = output_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                let dir = output_path.parent().unwrap_or(Path::new("."));
+
+                // Visualise path stem for annotated outputs
+                let viz_stem = args.visualize.as_ref().and_then(|p| {
+                    p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+                });
+                let viz_ext = args.visualize.as_ref().and_then(|p| {
+                    p.extension().and_then(|e| e.to_str()).map(|s| s.to_string())
+                });
+                let viz_dir = args
+                    .visualize
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf();
+
+                for format in &suitable_formats {
+                    // Derive format-safe filename suffix: "21:9" → "21_9"
+                    let suffix = format.replace(':', "_");
+
+                    // Calculate crop region for this format
+                    let maybe_crop: Option<CropRegion> = {
+                        // Apply margin to get the working bbox (same as detect_suitable_formats)
+                        use icarus_v2::multi_format_cropping::apply_margin_to_bbox;
+                        let working_bbox =
+                            apply_margin_to_bbox(&raw_bbox, args.margin, image.width(), image.height());
+                        match format.as_str() {
+                            "21:9" => calculate_landscape_21_9_crop(
+                                image.width(),
+                                image.height(),
+                                &working_bbox,
+                            ),
+                            "9:21" => calculate_portrait_9_21_crop(
+                                image.width(),
+                                image.height(),
+                                &working_bbox,
+                            ),
+                            "9:16" => calculate_portrait_9_16_crop(
+                                image.width(),
+                                image.height(),
+                                &working_bbox,
+                            ),
+                            other => {
+                                eprintln!("Warning: unknown format '{}' — skipping.", other);
+                                None
+                            }
+                        }
+                    };
+
+                    let crop = match maybe_crop {
+                        Some(c) => c,
+                        None => {
+                            if !args.quiet {
+                                eprintln!(
+                                    "Warning: format {} became unavailable during crop calculation — skipping.",
+                                    format
+                                );
+                            }
+                            continue;
+                        }
+                    };
+
+                    // e.g. output/photo_21_9.jpg
+                    let crop_path = dir.join(format!("{}_{}.{}", stem, suffix, ext));
+                    save_crop_region(&image, &crop, &crop_path)
+                        .with_context(|| format!("Failed to save {} crop to {:?}", format, crop_path))?;
+                    if !args.quiet {
+                        println!("  Saved {} crop → {:?}", format, crop_path);
+                    }
+
+                    // Annotated visualisation for this format
+                    if let (Some(ref vstem), Some(ref vext)) = (&viz_stem, &viz_ext) {
+                        // e.g. output/photo_annotated_21_9.jpg
+                        let viz_path = viz_dir.join(format!("{}_{}.{}", vstem, suffix, vext));
+                        save_visualized(&image, &detections, &viz_path)
+                            .with_context(|| {
+                                format!("Failed to save {} visualization to {:?}", format, viz_path)
+                            })?;
+                        if !args.quiet {
+                            println!("  Saved {} annotated → {:?}", format, viz_path);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // No --output supplied; still emit the visualisation if requested.
+        if let Some(ref viz_path) = args.visualize {
+            save_visualized(&image, &detections, viz_path)
+                .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
+            if !args.quiet {
+                println!("Saved visualized image to {:?}", viz_path);
+            }
         }
     }
 
@@ -466,24 +639,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Save annotated visualisation ───────────────────────────────────────
-    if let Some(ref viz_path) = args.visualize {
-        save_visualized(&image, &detections, viz_path)
-            .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
-        if !args.quiet {
-            println!("Saved visualized image to {:?}", viz_path);
-        }
-    }
-
     // ── Final summary line ─────────────────────────────────────────────────
     if !args.quiet {
         println!(
-            "Done. Found {} object(s){}.",
+            "Done. Found {} object(s).",
             detections.len(),
-            args.output
-                .as_ref()
-                .map(|p| format!(", saved crop to {:?}", p))
-                .unwrap_or_default()
         );
     }
 

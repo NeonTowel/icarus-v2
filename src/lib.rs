@@ -7,5 +7,6 @@ pub mod config;
 pub mod error;
 pub mod image_utils;
 pub mod models;
+pub mod multi_format_cropping;
 
 pub use error::{Error, Result};
