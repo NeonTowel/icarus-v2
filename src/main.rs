@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
-use icarus_v2::image_utils::crop_image;
+use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9};
 use icarus_v2::models::load_candle_model;
 use image::DynamicImage;
 use serde::Serialize;
@@ -75,6 +75,17 @@ struct Args {
     /// Suppress all informational output (errors are still shown)
     #[arg(long)]
     quiet: bool,
+
+    /// Disable ultrawide 21:9 cropping and use the original detected bbox instead.
+    ///
+    /// By default, Icarus-v2 crops to a 21:9 (2.33:1) ultrawide aspect ratio,
+    /// centering the detected person horizontally and positioning them in the
+    /// upper-third of the frame — ideal for desktop wallpapers.
+    ///
+    /// Pass this flag to revert to the raw bounding-box crop with no aspect-ratio
+    /// adjustment.
+    #[arg(long, default_value_t = false)]
+    keep_aspect_ratio: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,17 +152,29 @@ impl From<&Detection> for DetectionRecord {
 /// If multiple detections are found, only the highest-confidence one is saved.
 /// Returns `Ok(true)` when a crop was written, `Ok(false)` when there were no
 /// detections to crop.
+///
+/// When `keep_aspect_ratio` is `false` (the default), the crop is expanded to a
+/// 21:9 ultrawide aspect ratio centered on the detected person — ideal for
+/// desktop wallpapers.  Pass `true` to use the raw detected bounding box instead.
 fn save_crop(
     image: &DynamicImage,
     detections: &[Detection],
     output_path: &Path,
+    keep_aspect_ratio: bool,
 ) -> Result<bool> {
     let Some(best) = detections.first() else {
         return Ok(false);
     };
 
-    let crop = crop_image(image, best.bbox)
-        .with_context(|| format!("Failed to crop image for bbox {:?}", best.bbox))?;
+    let crop = if keep_aspect_ratio {
+        // Original behavior: crop to the raw detected bounding box
+        crop_image(image, best.bbox)
+            .with_context(|| format!("Failed to crop image for bbox {:?}", best.bbox))?
+    } else {
+        // Default: expand crop to 21:9 ultrawide, person centered horizontally
+        crop_to_ultrawide_21_9(image, best.bbox)
+            .with_context(|| format!("Failed to crop image to 21:9 for bbox {:?}", best.bbox))?
+    };
 
     crop.save(output_path)
         .with_context(|| format!("Failed to save cropped image to {:?}", output_path))?;
@@ -394,7 +417,7 @@ async fn main() -> Result<()> {
                 );
             }
         } else {
-            let saved = save_crop(&image, &detections, output_path)
+            let saved = save_crop(&image, &detections, output_path, args.keep_aspect_ratio)
                 .with_context(|| format!("Failed to save crop to {:?}", output_path))?;
             if saved && !args.quiet {
                 println!("Saved cropped image to {:?}", output_path);
