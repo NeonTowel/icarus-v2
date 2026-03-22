@@ -3,3 +3,5 @@ ai-image-crop-2.0-python
 icarus-v1-rust
 input
 output
+target
+tests

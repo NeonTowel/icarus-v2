@@ -101,7 +101,72 @@ tasks:
               --visualize output/sample_rfdetr_large_annotated.jpg
               --confidence {{ .DETR_CONFIDENCE }}
 
+    build:
+        desc: "Cargo debug build"
+        cmds:
+            - time cargo build
+
+    build-without-warnings:
+        desc: "Cargo debug build"
+        cmds:
+            - task: build
+              env:
+                  RUSTFLAGS: -Awarnings
+
     test-crop:
         desc: "Test cropping using actual sample photo"
         cmds:
             - time task test-crop-exec
+
+    test-yolo:
+        desc: "Test cropping with yolo model using actual sample photo"
+        vars:
+            CONFIDENCE: 0.5
+        cmds:
+            - time cargo run --
+              --model yolov10
+              --input input/sample.jpg
+              --output output/sample_yolov10.jpg
+              --visualize output/sample_yolov10_annotated.jpg
+              --confidence {{ .CONFIDENCE }}
+
+    test-batch:
+        silent: true
+        desc: "Test cropping with yolo model using actual batch of sample photos"
+        sources:
+            - input/*
+        method: none
+        vars:
+            CONFIDENCE: 0.5
+        cmds:
+            - for: sources
+              cmd: |-
+                  echo "Processing {{ base .ITEM }}"
+                  time cargo run --quiet -- \
+                    --model yolov10 \
+                    --input input/{{ base .ITEM }} \
+                    --output output/{{ base .ITEM }} \
+                    --visualize output/annotated_{{ base .ITEM }} \
+                    --confidence {{ .CONFIDENCE }}
+
+    test-align-issue:
+        deps: [build-without-warnings]
+        desc: "Test cropping with yolo model using actual batch of sample photos for alignment issues"
+        silent: true
+        sources:
+            - input/sample_align_issue*
+        method: none
+        vars:
+            CONFIDENCE: 0.5
+        cmds:
+            - for: sources
+              cmd: |-
+                  echo "Processing {{ base .ITEM }}"
+                  time target/debug/icarus-v2 \
+                    --model yolov10 \
+                    --input input/{{ base .ITEM }} \
+                    --output output/align_issue_{{ base .ITEM }} \
+                    --visualize output/align_issue_annotated_{{ base .ITEM }} \
+                    --confidence {{ .CONFIDENCE }}
+
+#                    --quiet

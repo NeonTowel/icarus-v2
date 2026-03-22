@@ -40,6 +40,44 @@ pub fn crop_image(image: &DynamicImage, bbox: [f32; 4]) -> Result<DynamicImage> 
     Ok(image.crop_imm(x1, y1, width, height))
 }
 
+/// Crop image to 21:9 ultrawide aspect ratio, centered on the image itself.
+///
+/// When no person is detected, this provides a sensible fallback crop:
+/// the 21:9 frame is centered both horizontally and vertically on the image.
+///
+/// # Parameters
+/// - `image`: Source image
+///
+/// # Returns
+/// Cropped image with 21:9 aspect ratio, or an error if dimensions are invalid.
+///
+/// # Example
+/// ```rust,ignore
+/// let img = image::open("photo.jpg").unwrap();
+/// let crop = crop_to_ultrawide_21_9_centered(&img).unwrap();
+/// assert!((crop.width() as f32 / crop.height() as f32 - 21.0 / 9.0).abs() < 0.02);
+/// ```
+pub fn crop_to_ultrawide_21_9_centered(image: &DynamicImage) -> Result<DynamicImage> {
+    const ASPECT_RATIO: f32 = 21.0 / 9.0; // ~2.333
+
+    let (img_w, img_h) = (image.width() as f32, image.height() as f32);
+
+    // Start from full image width; reduce if 21:9 height overshoots
+    let mut crop_w = img_w;
+    let mut crop_h = crop_w / ASPECT_RATIO;
+
+    if crop_h > img_h {
+        crop_h = img_h;
+        crop_w = crop_h * ASPECT_RATIO;
+    }
+
+    // Center crop both horizontally and vertically
+    let crop_x = (img_w - crop_w) / 2.0;
+    let crop_y = (img_h - crop_h) / 2.0;
+
+    crop_image(image, [crop_x, crop_y, crop_x + crop_w, crop_y + crop_h])
+}
+
 /// Crop an image to 21:9 ultrawide aspect ratio, centering the detected person.
 ///
 /// # Parameters

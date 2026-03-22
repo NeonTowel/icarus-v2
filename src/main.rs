@@ -14,7 +14,7 @@
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
-use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9};
+use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9, crop_to_ultrawide_21_9_centered};
 use icarus_v2::models::load_candle_model;
 use image::DynamicImage;
 use serde::Serialize;
@@ -144,36 +144,70 @@ impl From<&Detection> for DetectionRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Person detection helpers
+// ---------------------------------------------------------------------------
+
+/// COCO class index for the "person" category.
+const PERSON_CLASS_ID: usize = 0;
+
+/// Return the highest-confidence person detection from a slice of detections.
+///
+/// Detections are expected to be sorted by confidence descending (as produced
+/// by the ONNX postprocessor). The first match is therefore the best person.
+///
+/// # Returns
+/// `Some(&Detection)` if any detection has `class_id == PERSON_CLASS_ID`,
+/// `None` otherwise.
+fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
+    detections
+        .iter()
+        .find(|d| d.class_id == PERSON_CLASS_ID)
+}
+
+// ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
 
-/// Save the first detected object as a cropped JPEG/PNG to `output_path`.
+/// Save a cropped JPEG/PNG to `output_path`, prioritising person-based cropping.
 ///
-/// If multiple detections are found, only the highest-confidence one is saved.
-/// Returns `Ok(true)` when a crop was written, `Ok(false)` when there were no
-/// detections to crop.
+/// - If `person_detection` is `Some`, the crop is centered on that person's bounding box.
+/// - If `person_detection` is `None`, falls back to a centered 21:9 crop of the full image
+///   (or returns the full image unchanged when `keep_aspect_ratio` is `true`).
+///
+/// Always returns `Ok(true)` — a file is always written.
 ///
 /// When `keep_aspect_ratio` is `false` (the default), the crop is expanded to a
-/// 21:9 ultrawide aspect ratio centered on the detected person — ideal for
-/// desktop wallpapers.  Pass `true` to use the raw detected bounding box instead.
+/// 21:9 ultrawide aspect ratio — ideal for desktop wallpapers. Pass `true` to use
+/// the raw detected bounding box (or full image if no person detected).
 fn save_crop(
     image: &DynamicImage,
-    detections: &[Detection],
+    person_detection: Option<&Detection>,
     output_path: &Path,
     keep_aspect_ratio: bool,
 ) -> Result<bool> {
-    let Some(best) = detections.first() else {
-        return Ok(false);
-    };
-
-    let crop = if keep_aspect_ratio {
-        // Original behavior: crop to the raw detected bounding box
-        crop_image(image, best.bbox)
-            .with_context(|| format!("Failed to crop image for bbox {:?}", best.bbox))?
-    } else {
-        // Default: expand crop to 21:9 ultrawide, person centered horizontally
-        crop_to_ultrawide_21_9(image, best.bbox)
-            .with_context(|| format!("Failed to crop image to 21:9 for bbox {:?}", best.bbox))?
+    let crop = match person_detection {
+        Some(person) => {
+            // Person detected: crop centered on that person's bounding box.
+            if keep_aspect_ratio {
+                crop_image(image, person.bbox)
+                    .with_context(|| format!("Failed to crop image for bbox {:?}", person.bbox))?
+            } else {
+                crop_to_ultrawide_21_9(image, person.bbox)
+                    .with_context(|| {
+                        format!("Failed to crop image to 21:9 for bbox {:?}", person.bbox)
+                    })?
+            }
+        }
+        None => {
+            // No person detected: fall back to center cropping.
+            if keep_aspect_ratio {
+                // No bounding box available; return the full image unchanged.
+                image.clone()
+            } else {
+                crop_to_ultrawide_21_9_centered(image)
+                    .with_context(|| "Failed to crop image to centered 21:9")?
+            }
+        }
     };
 
     crop.save(output_path)
@@ -216,19 +250,17 @@ fn save_visualized(
     let w = canvas.width();
     let h = canvas.height();
 
-    // Simple colour palette — cycles by class_id.
-    let palette: &[[u8; 4]] = &[
-        [255, 0, 0, 220],    // red
-        [0, 200, 0, 220],    // green
-        [0, 100, 255, 220],  // blue
-        [255, 165, 0, 220],  // orange
-        [148, 0, 211, 220],  // purple
-        [0, 206, 209, 220],  // teal
-        [255, 20, 147, 220], // pink
-    ];
+    // Class-aware colours: persons (class 0) in bright green, everything else in dark red.
+    // This makes it immediately obvious which detections drove cropping decisions.
+    const VIZ_PERSON_COLOR: [u8; 4] = [0, 255, 0, 220];     // bright green (#00FF00)
+    const VIZ_NON_PERSON_COLOR: [u8; 4] = [128, 0, 0, 220]; // dark red (#800000)
 
     for det in detections {
-        let colour = palette[det.class_id % palette.len()];
+        let colour = if det.class_id == PERSON_CLASS_ID {
+            VIZ_PERSON_COLOR
+        } else {
+            VIZ_NON_PERSON_COLOR
+        };
         let colour_px = Rgba(colour);
 
         let [x1, y1, x2, y2] = det.bbox;
@@ -379,6 +411,9 @@ async fn main() -> Result<()> {
         .filter(|d| d.confidence >= args.confidence)
         .collect();
 
+    // Select the best person detection for cropping (may be None if no person found).
+    let person_for_crop = find_best_person_detection(&detections);
+
     // ── Report results ─────────────────────────────────────────────────────
     if detections.is_empty() {
         if !args.quiet {
@@ -408,20 +443,13 @@ async fn main() -> Result<()> {
     }
 
     // ── Save cropped output ────────────────────────────────────────────────
+    // Always attempt to crop: person_for_crop drives person-centric cropping;
+    // when None, save_crop() falls back to a centered 21:9 frame.
     if let Some(ref output_path) = args.output {
-        if detections.is_empty() {
-            if !args.quiet {
-                println!(
-                    "Skipping --output {:?}: no detections to crop.",
-                    output_path
-                );
-            }
-        } else {
-            let saved = save_crop(&image, &detections, output_path, args.keep_aspect_ratio)
-                .with_context(|| format!("Failed to save crop to {:?}", output_path))?;
-            if saved && !args.quiet {
-                println!("Saved cropped image to {:?}", output_path);
-            }
+        let saved = save_crop(&image, person_for_crop, output_path, args.keep_aspect_ratio)
+            .with_context(|| format!("Failed to save crop to {:?}", output_path))?;
+        if saved && !args.quiet {
+            println!("Saved cropped image to {:?}", output_path);
         }
     }
 
