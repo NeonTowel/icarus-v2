@@ -17,9 +17,10 @@ use clap::Parser;
 use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use icarus_v2::models::load_candle_model;
 use icarus_v2::multi_format_cropping::{
-    BBox, CropRegion, calculate_landscape_21_9_crop, calculate_portrait_9_16_crop,
-    calculate_portrait_9_21_crop, detect_suitable_formats,
+    calculate_landscape_21_9_crop, calculate_portrait_9_16_crop, calculate_portrait_9_21_crop,
+    detect_suitable_formats, BBox, CropRegion,
 };
+use icarus_v2::output_sorting;
 use image::DynamicImage;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -101,6 +102,21 @@ struct Args {
     /// Margins are clamped to photo bounds, so they will never go negative or exceed the photo.
     #[arg(long, default_value_t = 0.0, value_name = "PERCENT")]
     margin: f32,
+
+    /// Organize output images into aspect-ratio subfolders.
+    ///
+    /// When enabled, output images are sorted into:
+    /// - `landscape/`  (21:9 format — ultrawide)
+    /// - `portrait/`   (9:16 format — vertical)
+    /// - `mobile/`     (9:21 format — tall mobile)
+    ///
+    /// Annotated images (from `--visualize`) automatically receive an `_annotated`
+    /// suffix before the format suffix (e.g. `viz_annotated_21_9.jpg`).
+    ///
+    /// Without this flag, output is placed flat in the specified directory, but
+    /// `_annotated` suffix is still automatically applied to visualized images.
+    #[arg(long, default_value_t = false)]
+    sort_output: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +190,7 @@ const PERSON_CLASS_ID: usize = 0;
 /// `Some(&Detection)` if any detection has `class_id == PERSON_CLASS_ID`,
 /// `None` otherwise.
 fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
-    detections
-        .iter()
-        .find(|d| d.class_id == PERSON_CLASS_ID)
+    detections.iter().find(|d| d.class_id == PERSON_CLASS_ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -188,10 +202,7 @@ fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
 ///
 /// When `keep_aspect_ratio` is `false` (the default), falls back to a centered 21:9 crop
 /// of the full image. Pass `true` to return the full image unchanged (no person found).
-fn save_fallback_crop(
-    image: &DynamicImage,
-    output_path: &Path,
-) -> Result<()> {
+fn save_fallback_crop(image: &DynamicImage, output_path: &Path) -> Result<()> {
     let crop = crop_to_ultrawide_21_9_centered(image)
         .with_context(|| "Failed to crop image to centered 21:9")?;
     crop.save(output_path)
@@ -202,11 +213,7 @@ fn save_fallback_crop(
 /// Crop the image to the given `CropRegion` and save to `output_path`.
 ///
 /// The crop coordinates are clamped to photo bounds before saving.
-fn save_crop_region(
-    image: &DynamicImage,
-    crop: &CropRegion,
-    output_path: &Path,
-) -> Result<()> {
+fn save_crop_region(image: &DynamicImage, crop: &CropRegion, output_path: &Path) -> Result<()> {
     let xyxy = crop.to_xyxy_clamped(image.width(), image.height());
     let cropped = crop_image(image, xyxy)
         .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
@@ -219,8 +226,8 @@ fn save_crop_region(
 /// Save detection bounding boxes as a JSON array to `output_path`.
 fn save_detections_json(detections: &[Detection], output_path: &Path) -> Result<()> {
     let records: Vec<DetectionRecord> = detections.iter().map(DetectionRecord::from).collect();
-    let json = serde_json::to_string_pretty(&records)
-        .context("Failed to serialise detections to JSON")?;
+    let json =
+        serde_json::to_string_pretty(&records).context("Failed to serialise detections to JSON")?;
 
     std::fs::write(output_path, json)
         .with_context(|| format!("Failed to write detections JSON to {:?}", output_path))?;
@@ -252,7 +259,7 @@ fn save_visualized(
 
     // Class-aware colours: persons (class 0) in bright green, everything else in dark red.
     // This makes it immediately obvious which detections drove cropping decisions.
-    const VIZ_PERSON_COLOR: [u8; 4] = [0, 255, 0, 220];     // bright green (#00FF00)
+    const VIZ_PERSON_COLOR: [u8; 4] = [0, 255, 0, 220]; // bright green (#00FF00)
     const VIZ_NON_PERSON_COLOR: [u8; 4] = [128, 0, 0, 220]; // dark red (#800000)
 
     for det in detections {
@@ -458,35 +465,120 @@ async fn main() -> Result<()> {
     // fall back to the old behaviour (centered 21:9 of the whole image).
 
     if let Some(ref output_path) = args.output {
+        // Ensure output subdirectories exist when --sort-output is enabled.
+        // This is idempotent: running multiple times is safe.
+        let output_base_dir = output_path.parent().unwrap_or(Path::new("."));
+        output_sorting::ensure_output_dirs(output_base_dir, args.sort_output)
+            .context("Failed to create output subdirectories")?;
+
         if args.keep_aspect_ratio || person_for_crop.is_none() {
             // ── Legacy / keep-aspect-ratio path ───────────────────────────
+            //
+            // When --keep-aspect-ratio is set or no person is detected, we produce
+            // a single output image. With --sort-output, we calculate the actual
+            // aspect ratio of the cropped image and place it in the correct subfolder.
             if person_for_crop.is_none() && !args.quiet {
                 println!("  No person detected — falling back to centered 21:9 crop.");
             }
-            if args.keep_aspect_ratio {
+
+            let cropped_image = if args.keep_aspect_ratio {
                 // Raw bbox crop (no aspect-ratio expansion)
                 if let Some(person) = person_for_crop {
                     let cropped = crop_image(&image, person.bbox)
                         .with_context(|| format!("Failed to crop bbox {:?}", person.bbox))?;
-                    cropped.save(output_path)
-                        .with_context(|| format!("Failed to save to {:?}", output_path))?;
+                    Some(cropped)
                 } else {
-                    image.save(output_path)
-                        .with_context(|| format!("Failed to save to {:?}", output_path))?;
+                    // No person and --keep-aspect-ratio: save the original image
+                    None
                 }
             } else {
-                save_fallback_crop(&image, output_path)
-                    .with_context(|| format!("Failed to save fallback crop to {:?}", output_path))?;
+                // Centered 21:9 fallback crop
+                let cropped = crop_to_ultrawide_21_9_centered(&image)
+                    .with_context(|| "Failed to crop image to centered 21:9")?;
+                Some(cropped)
+            };
+
+            // Determine actual output path (with optional subfolder based on aspect ratio)
+            let actual_output_path = if args.sort_output {
+                let (crop_w, crop_h) = match &cropped_image {
+                    Some(c) => (c.width(), c.height()),
+                    None => (image.width(), image.height()),
+                };
+                let aspect_ratio = crop_w as f32 / crop_h as f32;
+                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
+                let stem = output_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("crop");
+                let ext = output_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true)
+                    .with_context(|| "Failed to build sorted output path")?
+            } else {
+                output_path.clone()
+            };
+
+            // Save the cropped (or original) image
+            match &cropped_image {
+                Some(c) => c
+                    .save(&actual_output_path)
+                    .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
+                None => image
+                    .save(&actual_output_path)
+                    .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
             }
+
             if !args.quiet {
-                println!("Saved cropped image to {:?}", output_path);
+                println!("Saved cropped image to {:?}", actual_output_path);
             }
-            // Single-format visualisation
+
+            // Single-format visualisation (always inject _annotated suffix)
             if let Some(ref viz_path) = args.visualize {
-                save_visualized(&image, &detections, viz_path)
-                    .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
+                let actual_viz_path = if args.sort_output {
+                    // Reuse the format determined above for the sorted crop
+                    let (crop_w, crop_h) = match &cropped_image {
+                        Some(c) => (c.width(), c.height()),
+                        None => (image.width(), image.height()),
+                    };
+                    let aspect_ratio = crop_w as f32 / crop_h as f32;
+                    let format =
+                        output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
+                    let vstem = viz_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("viz");
+                    let vext = viz_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg");
+                    output_sorting::get_annotated_output_path(viz_path, format, vstem, vext, true)
+                        .with_context(|| "Failed to build sorted annotated path")?
+                } else {
+                    // Flat output: inject _annotated suffix into filename only
+                    let vstem = viz_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("viz");
+                    let vext = viz_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg");
+                    let viz_dir = viz_path.parent().unwrap_or(Path::new("."));
+                    let annotated_stem = if vstem.ends_with("_annotated") {
+                        vstem.to_string()
+                    } else {
+                        format!("{}_annotated", vstem)
+                    };
+                    viz_dir.join(format!("{}.{}", annotated_stem, vext))
+                };
+
+                save_visualized(&image, &detections, &actual_viz_path).with_context(|| {
+                    format!("Failed to save visualization to {:?}", actual_viz_path)
+                })?;
                 if !args.quiet {
-                    println!("Saved visualized image to {:?}", viz_path);
+                    println!("Saved visualized image to {:?}", actual_viz_path);
                 }
             }
         } else {
@@ -530,32 +622,30 @@ async fn main() -> Result<()> {
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("jpg");
-                let dir = output_path.parent().unwrap_or(Path::new("."));
 
                 // Visualise path stem for annotated outputs
                 let viz_stem = args.visualize.as_ref().and_then(|p| {
-                    p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+                    p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
                 });
                 let viz_ext = args.visualize.as_ref().and_then(|p| {
-                    p.extension().and_then(|e| e.to_str()).map(|s| s.to_string())
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|s| s.to_string())
                 });
-                let viz_dir = args
-                    .visualize
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(Path::new("."))
-                    .to_path_buf();
 
                 for format in &suitable_formats {
-                    // Derive format-safe filename suffix: "21:9" → "21_9"
-                    let suffix = format.replace(':', "_");
-
                     // Calculate crop region for this format
                     let maybe_crop: Option<CropRegion> = {
                         // Apply margin to get the working bbox (same as detect_suitable_formats)
                         use icarus_v2::multi_format_cropping::apply_margin_to_bbox;
-                        let working_bbox =
-                            apply_margin_to_bbox(&raw_bbox, args.margin, image.width(), image.height());
+                        let working_bbox = apply_margin_to_bbox(
+                            &raw_bbox,
+                            args.margin,
+                            image.width(),
+                            image.height(),
+                        );
                         match format.as_str() {
                             "21:9" => calculate_landscape_21_9_crop(
                                 image.width(),
@@ -592,22 +682,41 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                    // e.g. output/photo_21_9.jpg
-                    let crop_path = dir.join(format!("{}_{}.{}", stem, suffix, ext));
-                    save_crop_region(&image, &crop, &crop_path)
-                        .with_context(|| format!("Failed to save {} crop to {:?}", format, crop_path))?;
+                    // e.g. output/landscape/photo_21_9.jpg  (or flat: output/photo_21_9.jpg)
+                    let crop_path = output_sorting::get_sorted_output_path(
+                        output_path,
+                        format,
+                        stem,
+                        ext,
+                        args.sort_output,
+                    )
+                    .with_context(|| {
+                        format!("Failed to build output path for format {}", format)
+                    })?;
+                    save_crop_region(&image, &crop, &crop_path).with_context(|| {
+                        format!("Failed to save {} crop to {:?}", format, crop_path)
+                    })?;
                     if !args.quiet {
                         println!("  Saved {} crop → {:?}", format, crop_path);
                     }
 
-                    // Annotated visualisation for this format
+                    // Annotated visualisation for this format (always injects _annotated suffix)
                     if let (Some(ref vstem), Some(ref vext)) = (&viz_stem, &viz_ext) {
-                        // e.g. output/photo_annotated_21_9.jpg
-                        let viz_path = viz_dir.join(format!("{}_{}.{}", vstem, suffix, vext));
-                        save_visualized(&image, &detections, &viz_path)
-                            .with_context(|| {
-                                format!("Failed to save {} visualization to {:?}", format, viz_path)
-                            })?;
+                        // e.g. output/landscape/viz_annotated_21_9.jpg
+                        let viz_base = args.visualize.as_deref().unwrap_or(Path::new("viz.jpg"));
+                        let viz_path = output_sorting::get_annotated_output_path(
+                            viz_base,
+                            format,
+                            vstem,
+                            vext,
+                            args.sort_output,
+                        )
+                        .with_context(|| {
+                            format!("Failed to build annotated path for format {}", format)
+                        })?;
+                        save_visualized(&image, &detections, &viz_path).with_context(|| {
+                            format!("Failed to save {} visualization to {:?}", format, viz_path)
+                        })?;
                         if !args.quiet {
                             println!("  Saved {} annotated → {:?}", format, viz_path);
                         }
@@ -641,10 +750,7 @@ async fn main() -> Result<()> {
 
     // ── Final summary line ─────────────────────────────────────────────────
     if !args.quiet {
-        println!(
-            "Done. Found {} object(s).",
-            detections.len(),
-        );
+        println!("Done. Found {} object(s).", detections.len(),);
     }
 
     Ok(())
@@ -654,29 +760,27 @@ async fn main() -> Result<()> {
 fn debug_tensor_inspection() -> anyhow::Result<()> {
     use std::path::Path;
     let weights_path = Path::new("/home/developer/.cache/huggingface/hub/models--facebook--detr-resnet-50/snapshots/1d5f47bd3bdd2c4bbfa585418ffe6da5028b4c0b/model.safetensors");
-    
+
     let data = std::fs::read(weights_path)?;
     let tensors = safetensors::SafeTensors::deserialize(&data)?;
-    
+
     let mut keys: Vec<_> = tensors.names().collect();
     keys.sort();
-    
+
     println!("Total tensors: {}\n", keys.len());
-    
+
     println!("=== ALL KEYS (first 100) ===");
     for (i, key) in keys.iter().take(100).enumerate() {
         println!("{:3}: {}", i, key);
     }
-    
+
     println!("\n\n=== BACKBONE KEYS ===");
-    let backbone_keys: Vec<_> = keys.iter()
-        .filter(|k| k.contains("backbone"))
-        .collect();
-    
+    let backbone_keys: Vec<_> = keys.iter().filter(|k| k.contains("backbone")).collect();
+
     println!("Total backbone keys: {}", backbone_keys.len());
     for key in backbone_keys.iter().take(60) {
         println!("  {}", key);
     }
-    
+
     Ok(())
 }

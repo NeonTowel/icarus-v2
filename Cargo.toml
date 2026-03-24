@@ -36,6 +36,7 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["downloa
 ndarray = "0.16"
 
 [dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 name = "icarus-v2"
