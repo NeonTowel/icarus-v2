@@ -6,3 +6,5 @@ output
 target
 tests
 desired_results
+input-batch
+output-batch

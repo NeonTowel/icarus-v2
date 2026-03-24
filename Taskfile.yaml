@@ -173,4 +173,27 @@ tasks:
                     --confidence {{ .CONFIDENCE }} \
                     --margin {{ .MARGIN }}
 
-#                    --quiet
+    #                    --quiet
+
+    test-input-batch:
+        deps: [build-without-warnings]
+        desc: "Test multi-format cropping using sample batch input photos"
+        silent: true
+        sources:
+            - input-batch/*
+        method: none
+        vars:
+            CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
+        cmds:
+            - for: sources
+              cmd: |-
+                  echo "Processing {{ base .ITEM }}"
+                  time target/debug/icarus-v2 \
+                    --model yolov10 \
+                    --input input-batch/{{ base .ITEM }} \
+                    --output output-batch/{{ base .ITEM }} \
+                    --visualize output-batch/annotated_{{ base .ITEM }} \
+                    --confidence {{ .CONFIDENCE }} \
+                    --margin {{ .MARGIN }}
