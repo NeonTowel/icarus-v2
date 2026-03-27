@@ -8,3 +8,6 @@ tests
 desired_results
 input-batch
 output-batch
+desired_results_finetuning
+input-artboard-samples
+output-artboard-samples

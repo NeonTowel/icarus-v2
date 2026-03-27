@@ -14,11 +14,12 @@
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
+use icarus_v2::config::{load_crop_config, CropConfig};
 use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use icarus_v2::models::load_candle_model;
 use icarus_v2::multi_format_cropping::{
-    calculate_landscape_21_9_crop, calculate_portrait_9_16_crop, calculate_portrait_9_21_crop,
-    detect_suitable_formats, BBox, CropRegion,
+    calculate_compound_bbox, calculate_landscape_21_9_crop, calculate_portrait_9_16_crop,
+    calculate_portrait_9_21_crop, detect_suitable_formats, BBox, CropRegion,
 };
 use icarus_v2::output_sorting;
 use image::DynamicImage;
@@ -117,6 +118,33 @@ struct Args {
     /// `_annotated` suffix is still automatically applied to visualized images.
     #[arg(long, default_value_t = false)]
     sort_output: bool,
+
+    /// Vertical headroom: fraction of crop height placed above the bbox center (0.0–1.0).
+    ///
+    /// `0.40` means the person's bbox center sits 40% from the top of the crop, with
+    /// 60% footroom below — ideal for fashion/entertainment on ultrawide displays.
+    /// Overrides the value from `--crop-config` if both are provided.
+    #[arg(long, value_name = "FLOAT")]
+    headroom_ratio: Option<f32>,
+
+    /// Minimum person visibility for a crop format to be accepted (0.0–100.0, as percent).
+    ///
+    /// If the person would be less than this percentage visible in the proposed crop,
+    /// that format is skipped. Overrides the value from `--crop-config` if both are provided.
+    /// Stored internally as a ratio; pass `50.0` for the default 50% threshold.
+    #[arg(long, value_name = "FLOAT")]
+    visibility_threshold: Option<f32>,
+
+    /// Path to a YAML file containing crop configuration.
+    ///
+    /// Supported fields:
+    ///   headroom_ratio: 0.40        # fraction in [0.0, 1.0]
+    ///   visibility_threshold: 50.0  # percentage in [0.0, 100.0]
+    ///
+    /// CLI flags (`--headroom-ratio`, `--visibility-threshold`) take precedence over
+    /// any values loaded from this file.
+    #[arg(long, value_name = "FILE")]
+    crop_config: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +356,54 @@ async fn main() -> Result<()> {
         );
     }
 
+    // ── Build CropConfig (YAML file → CLI overrides) ───────────────────────
+    //
+    // Priority order (highest → lowest):
+    //   1. CLI flags: --headroom-ratio, --visibility-threshold
+    //   2. YAML file: --crop-config <path>
+    //   3. Built-in defaults: headroom_ratio=0.40, visibility_threshold=0.50
+    let mut crop_config: CropConfig = if let Some(ref config_path) = args.crop_config {
+        if !config_path.exists() {
+            bail!(
+                "Crop config file not found: {:?}\nPlease check the path and try again.",
+                config_path
+            );
+        }
+        load_crop_config(config_path)
+            .with_context(|| format!("Failed to load crop config from {:?}", config_path))?
+    } else {
+        CropConfig::default()
+    };
+
+    // CLI flags override YAML values (or defaults).
+    if let Some(ratio) = args.headroom_ratio {
+        if !(0.0..=1.0).contains(&ratio) {
+            bail!(
+                "--headroom-ratio must be between 0.0 and 1.0, got {}",
+                ratio
+            );
+        }
+        crop_config.headroom_ratio = ratio;
+    }
+    if let Some(pct) = args.visibility_threshold {
+        if !(0.0..=100.0).contains(&pct) {
+            bail!(
+                "--visibility-threshold must be between 0.0 and 100.0, got {}",
+                pct
+            );
+        }
+        // Convert from percentage (CLI) to ratio (internal representation).
+        crop_config.visibility_threshold = pct / 100.0;
+    }
+
+    if !args.quiet {
+        println!(
+            "  Crop config: headroom_ratio={:.2}, visibility_threshold={:.0}%",
+            crop_config.headroom_ratio,
+            crop_config.visibility_threshold * 100.0,
+        );
+    }
+
     // ── Validate model name early ──────────────────────────────────────────
     if !VALID_MODELS.contains(&args.model.as_str()) {
         bail!(
@@ -418,7 +494,50 @@ async fn main() -> Result<()> {
         .filter(|d| d.confidence >= args.confidence)
         .collect();
 
-    // Select the best person detection for cropping (may be None if no person found).
+    // ── Resolve bbox for cropping (single or compound) ────────────────────
+    //
+    // Collect all person detections that passed the confidence filter, then:
+    //   - 0 persons  → no crop bbox (fallback path below)
+    //   - 1 person   → use that detection's bbox directly (backward compatible)
+    //   - 2+ persons → compound bbox encompassing all detected persons
+    //
+    // The compound bbox approach avoids cropping that excludes group members when
+    // multiple people appear in the same photo.
+    let person_detections: Vec<&Detection> = detections
+        .iter()
+        .filter(|d| d.class_id == PERSON_CLASS_ID)
+        .collect();
+
+    let crop_bbox: Option<BBox> = match person_detections.len() {
+        0 => None,
+        1 => {
+            // Single person: use their bbox directly (no compound calculation needed).
+            Some(person_detections[0].bbox.into())
+        }
+        n => {
+            // Multiple persons: build a compound bbox via image_utils::Detection.
+            // We convert back to image_utils::Detection so calculate_compound_bbox
+            // can work with the canonical type.
+            if !args.quiet {
+                println!(
+                    "  Detected {} persons — using compound bbox for cropping.",
+                    n
+                );
+            }
+            let img_utils_detections: Vec<icarus_v2::image_utils::Detection> = person_detections
+                .iter()
+                .map(|d| icarus_v2::image_utils::Detection {
+                    bbox: d.bbox,
+                    confidence: d.confidence,
+                    label: d.label.clone(),
+                    class_id: d.class_id,
+                })
+                .collect();
+            calculate_compound_bbox(&img_utils_detections)
+        }
+    };
+
+    // Keep the legacy helper available for the keep-aspect-ratio / no-person path.
     let person_for_crop = find_best_person_detection(&detections);
 
     // ── Report results ─────────────────────────────────────────────────────
@@ -471,13 +590,13 @@ async fn main() -> Result<()> {
         output_sorting::ensure_output_dirs(output_base_dir, args.sort_output)
             .context("Failed to create output subdirectories")?;
 
-        if args.keep_aspect_ratio || person_for_crop.is_none() {
+        if args.keep_aspect_ratio || crop_bbox.is_none() {
             // ── Legacy / keep-aspect-ratio path ───────────────────────────
             //
             // When --keep-aspect-ratio is set or no person is detected, we produce
             // a single output image. With --sort-output, we calculate the actual
             // aspect ratio of the cropped image and place it in the correct subfolder.
-            if person_for_crop.is_none() && !args.quiet {
+            if crop_bbox.is_none() && !args.quiet {
                 println!("  No person detected — falling back to centered 21:9 crop.");
             }
 
@@ -583,15 +702,20 @@ async fn main() -> Result<()> {
             }
         } else {
             // ── Multi-format intelligent cropping path ─────────────────────
-            let person = person_for_crop.unwrap(); // safe: checked above
-            let raw_bbox: BBox = person.bbox.into();
+            // crop_bbox is Some(...) here — guaranteed by the branch condition above.
+            let raw_bbox: BBox = crop_bbox.unwrap(); // safe: checked by branch condition
 
             if args.margin < 0.0 {
                 bail!("--margin must be ≥ 0, got {}", args.margin);
             }
 
-            let suitable_formats =
-                detect_suitable_formats(image.width(), image.height(), &raw_bbox, args.margin);
+            let suitable_formats = detect_suitable_formats(
+                image.width(),
+                image.height(),
+                &raw_bbox,
+                args.margin,
+                &crop_config,
+            );
 
             if suitable_formats.is_empty() {
                 if !args.quiet {
@@ -651,16 +775,19 @@ async fn main() -> Result<()> {
                                 image.width(),
                                 image.height(),
                                 &working_bbox,
+                                &crop_config,
                             ),
                             "9:21" => calculate_portrait_9_21_crop(
                                 image.width(),
                                 image.height(),
                                 &working_bbox,
+                                &crop_config,
                             ),
                             "9:16" => calculate_portrait_9_16_crop(
                                 image.width(),
                                 image.height(),
                                 &working_bbox,
+                                &crop_config,
                             ),
                             other => {
                                 eprintln!("Warning: unknown format '{}' — skipping.", other);

@@ -7,19 +7,26 @@
 /// # Algorithm Overview
 ///
 /// 1. **Bbox Orientation**: Wide bbox → landscape only; tall/square bbox → try all formats.
-/// 2. **Landscape 21:9 (Face-First)**: Face zone (top 30% of bbox) at upper-third of crop.
-/// 3. **Portrait 9:21 & 9:16 (Balanced Upward)**: Person center at 45% from crop top.
+/// 2. **Landscape 21:9 (Bbox-Center Upward Bias)**: Person bbox center at `headroom_ratio`
+///    from crop top (default 40%), giving 60% footroom — ideal for fashion/ultrawide.
+/// 3. **Portrait 9:21 & 9:16 (Bbox-Center Upward Bias)**: Same configurable ratio.
 /// 4. **Margin**: Optional symmetric padding (percentage of bbox dimensions) before positioning.
-/// 5. **Visibility Gate**: Person must be ≥50% visible in the final crop, or format is skipped.
+/// 5. **Visibility Gate**: Person must be ≥`visibility_threshold` visible in the final crop,
+///    or format is skipped (configurable, default 50%).
 ///
 /// # Example
 /// ```rust,ignore
 /// use icarus_v2::multi_format_cropping::{BBox, detect_suitable_formats};
+/// use icarus_v2::config::CropConfig;
 ///
 /// let bbox = BBox { x1: 100.0, y1: 50.0, x2: 400.0, y2: 900.0 };
-/// let formats = detect_suitable_formats(3000, 4000, &bbox, 5.0);
+/// let config = CropConfig::default();
+/// let formats = detect_suitable_formats(3000, 4000, &bbox, 5.0, &config);
 /// // Returns e.g. ["21:9", "9:21", "9:16"] depending on photo/bbox geometry
 /// ```
+// Re-export CropConfig from config so callers can import it from either path.
+// The canonical definition with serde support lives in `crate::config`.
+pub use crate::config::CropConfig;
 
 /// A rectangular crop region in pixel coordinates (top-left origin, not clamped).
 ///
@@ -149,6 +156,10 @@ pub fn apply_margin_to_bbox(
 /// A format is only considered suitable when the person would be reasonably framed.
 /// This prevents generating crops where the person is barely a sliver on one edge.
 ///
+/// This is a convenience wrapper around [`person_is_reasonably_visible_threshold`] using
+/// the fixed 50% threshold. Prefer [`person_is_reasonably_visible_threshold`] when you
+/// need configurable behaviour.
+///
 /// # Parameters
 /// - `bbox`: Person bounding box (may be margin-expanded).
 /// - `crop`: Proposed crop region.
@@ -156,6 +167,33 @@ pub fn apply_margin_to_bbox(
 pub fn person_is_reasonably_visible(
     bbox: &BBox,
     crop: &CropRegion,
+    _photo_width: u32,
+    _photo_height: u32,
+) -> bool {
+    person_is_reasonably_visible_threshold(bbox, crop, 0.50, _photo_width, _photo_height)
+}
+
+/// Return `true` if at least `threshold` fraction of the person (by bbox area) is visible
+/// inside the crop.
+///
+/// This is the parameterized version of [`person_is_reasonably_visible`], accepting a
+/// configurable visibility threshold instead of the hardcoded 50%.
+///
+/// # Parameters
+/// - `bbox`: Person bounding box (may be margin-expanded).
+/// - `crop`: Proposed crop region.
+/// - `threshold`: Minimum visible fraction required, in `[0.0, 1.0]`.
+///   For example, `0.40` means at least 40% of the person's area must be inside the crop.
+/// - `_photo_width` / `_photo_height`: Unused; reserved for future bounds-checking extension.
+///
+/// # Example
+/// ```rust,ignore
+/// let visible = person_is_reasonably_visible_threshold(&bbox, &crop, 0.40, 1920, 1080);
+/// ```
+pub fn person_is_reasonably_visible_threshold(
+    bbox: &BBox,
+    crop: &CropRegion,
+    threshold: f32,
     _photo_width: u32,
     _photo_height: u32,
 ) -> bool {
@@ -180,34 +218,43 @@ pub fn person_is_reasonably_visible(
     }
 
     let visibility_ratio = visible_area / person_area;
-    visibility_ratio >= 0.50
+    visibility_ratio >= threshold
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 2: Landscape 21:9 Crop (Face-First Vertical Positioning)
+// Milestone 2: Landscape 21:9 Crop (Bbox-Center Upward Bias Positioning)
 // ---------------------------------------------------------------------------
 
-/// Calculate a 21:9 landscape crop region with face-first vertical positioning.
+/// Calculate a 21:9 landscape crop region with configurable bbox-center upward bias.
 ///
 /// **Algorithm:**
 /// 1. Start with `crop_height = photo_height`; derive `crop_width = crop_height × (21/9)`.
 /// 2. If `crop_width > photo_width`, reduce to `photo_width` and recalculate height.
-/// 3. Face zone = top 30% of bbox. Position the face zone bottom at 33% down from crop top.
+/// 3. Position bbox center at `config.headroom_ratio` from crop top (default 40%).
+///    This gives 60% footroom below the center — ideal for fashion/entertainment on ultrawides.
 /// 4. Center person horizontally.
 /// 5. Clamp to photo bounds.
-/// 6. Return `None` if person would be less than 50% visible.
+/// 6. Return `None` if person is less than `config.visibility_threshold` visible.
 ///
 /// # Parameters
 /// - `photo_width` / `photo_height`: Source photo dimensions.
 /// - `bbox`: Person bounding box (should already include margin if applicable).
+/// - `config`: Cropping configuration controlling headroom and visibility threshold.
 ///
 /// # Returns
-/// `Some(CropRegion)` when the person is ≥50% visible in the computed crop,
+/// `Some(CropRegion)` when the person is sufficiently visible in the computed crop,
 /// `None` otherwise.
+///
+/// # Example
+/// ```rust,ignore
+/// let config = CropConfig::default();
+/// let crop = calculate_landscape_21_9_crop(4000, 3000, &bbox, &config);
+/// ```
 pub fn calculate_landscape_21_9_crop(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
+    config: &CropConfig,
 ) -> Option<CropRegion> {
     const ASPECT_RATIO: f32 = 21.0 / 9.0; // ~2.333
 
@@ -224,11 +271,9 @@ pub fn calculate_landscape_21_9_crop(
         crop_height = crop_width / ASPECT_RATIO;
     }
 
-    // Step 3: Face-first vertical positioning.
-    // Face zone = top 30% of bbox. Place the face zone bottom at 33% from crop top.
-    let face_zone_bottom = bbox.y1 + bbox.height() * 0.30;
-    let face_zone_position_in_crop = crop_height * 0.33;
-    let crop_y = face_zone_bottom - face_zone_position_in_crop;
+    // Step 3: Bbox-center upward bias — place bbox center at headroom_ratio from crop top.
+    // headroom_ratio=0.40 → center is at 40% from top, leaving 60% footroom below.
+    let crop_y = bbox.center_y() - (crop_height * config.headroom_ratio);
 
     // Step 4: Center person horizontally.
     let crop_x = bbox.center_x() - (crop_width / 2.0);
@@ -244,8 +289,14 @@ pub fn calculate_landscape_21_9_crop(
         height: crop_height,
     };
 
-    // Step 6: Visibility gate.
-    if person_is_reasonably_visible(bbox, &crop, photo_width, photo_height) {
+    // Step 6: Visibility gate using configurable threshold.
+    if person_is_reasonably_visible_threshold(
+        bbox,
+        &crop,
+        config.visibility_threshold,
+        photo_width,
+        photo_height,
+    ) {
         Some(crop)
     } else {
         None
@@ -253,7 +304,7 @@ pub fn calculate_landscape_21_9_crop(
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 3: Portrait Crops (Balanced Upward Bias Positioning)
+// Milestone 3: Portrait Crops (Configurable Bbox-Center Upward Bias)
 // ---------------------------------------------------------------------------
 
 /// Internal generic portrait crop calculator used by both 9:21 and 9:16 variants.
@@ -261,15 +312,16 @@ pub fn calculate_landscape_21_9_crop(
 /// **Algorithm:**
 /// 1. Start with `crop_width = photo_width`; derive `crop_height = crop_width / aspect_ratio`.
 /// 2. If `crop_height > photo_height`, reduce to `photo_height` and recalculate width.
-/// 3. Position person center at 45% from crop top (biased slightly upward).
+/// 3. Position bbox center at `config.headroom_ratio` from crop top (default 40%).
 /// 4. Center person horizontally.
 /// 5. Clamp to photo bounds.
-/// 6. Return `None` if person visibility < 50%.
+/// 6. Return `None` if person visibility < `config.visibility_threshold`.
 fn calculate_portrait_crop(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
     aspect_ratio: f32, // width/height, e.g. 9.0/21.0 for 9:21
+    config: &CropConfig,
 ) -> Option<CropRegion> {
     let pw = photo_width as f32;
     let ph = photo_height as f32;
@@ -284,8 +336,8 @@ fn calculate_portrait_crop(
         crop_width = crop_height * aspect_ratio;
     }
 
-    // Step 3: Balanced upward bias — person center at 45% from crop top.
-    let crop_y = bbox.center_y() - (crop_height * 0.45);
+    // Step 3: Bbox-center upward bias — place bbox center at headroom_ratio from crop top.
+    let crop_y = bbox.center_y() - (crop_height * config.headroom_ratio);
 
     // Step 4: Center person horizontally.
     let crop_x = bbox.center_x() - (crop_width / 2.0);
@@ -301,42 +353,60 @@ fn calculate_portrait_crop(
         height: crop_height,
     };
 
-    // Step 6: Visibility gate.
-    if person_is_reasonably_visible(bbox, &crop, photo_width, photo_height) {
+    // Step 6: Visibility gate using configurable threshold.
+    if person_is_reasonably_visible_threshold(
+        bbox,
+        &crop,
+        config.visibility_threshold,
+        photo_width,
+        photo_height,
+    ) {
         Some(crop)
     } else {
         None
     }
 }
 
-/// Calculate a 9:21 ultrawide portrait crop with balanced upward bias positioning.
+/// Calculate a 9:21 ultrawide portrait crop with configurable bbox-center upward bias.
 ///
 /// See [`calculate_portrait_crop`] for the full algorithm description.
 ///
+/// # Parameters
+/// - `photo_width` / `photo_height`: Source photo dimensions.
+/// - `bbox`: Person bounding box (should already include margin if applicable).
+/// - `config`: Cropping configuration controlling headroom and visibility threshold.
+///
 /// # Returns
-/// `Some(CropRegion)` when the person is ≥50% visible, `None` otherwise.
+/// `Some(CropRegion)` when the person is sufficiently visible, `None` otherwise.
 pub fn calculate_portrait_9_21_crop(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
+    config: &CropConfig,
 ) -> Option<CropRegion> {
     const ASPECT_RATIO: f32 = 9.0 / 21.0; // ~0.4286 (width/height)
-    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO)
+    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO, config)
 }
 
-/// Calculate a 9:16 standard portrait crop with balanced upward bias positioning.
+/// Calculate a 9:16 standard portrait crop with configurable bbox-center upward bias.
 ///
 /// See [`calculate_portrait_crop`] for the full algorithm description.
 ///
+/// # Parameters
+/// - `photo_width` / `photo_height`: Source photo dimensions.
+/// - `bbox`: Person bounding box (should already include margin if applicable).
+/// - `config`: Cropping configuration controlling headroom and visibility threshold.
+///
 /// # Returns
-/// `Some(CropRegion)` when the person is ≥50% visible, `None` otherwise.
+/// `Some(CropRegion)` when the person is sufficiently visible, `None` otherwise.
 pub fn calculate_portrait_9_16_crop(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
+    config: &CropConfig,
 ) -> Option<CropRegion> {
     const ASPECT_RATIO: f32 = 9.0 / 16.0; // 0.5625 (width/height)
-    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO)
+    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,11 +420,13 @@ pub fn calculate_portrait_9_16_crop(
 /// - Otherwise (tall/square person): landscape 21:9 always + portrait 9:21 and 9:16 if suitable.
 ///
 /// Margin is applied symmetrically to the bbox before any calculations.
+/// Cropping behaviour (headroom, visibility threshold) is governed by `config`.
 ///
 /// # Parameters
 /// - `photo_width` / `photo_height`: Source photo dimensions in pixels.
 /// - `bbox`: Raw detected bounding box in `[x1, y1, x2, y2]` pixel coordinates.
 /// - `margin_percent`: Optional padding around bbox as percentage of bbox size (0 = no margin).
+/// - `config`: Cropping configuration controlling headroom ratio and visibility threshold.
 ///
 /// # Returns
 /// A `Vec<String>` of format names (`"21:9"`, `"9:21"`, `"9:16"`) that are viable.
@@ -363,7 +435,8 @@ pub fn calculate_portrait_9_16_crop(
 /// # Example
 /// ```rust,ignore
 /// let bbox = BBox { x1: 200.0, y1: 50.0, x2: 500.0, y2: 1900.0 };
-/// let formats = detect_suitable_formats(3024, 4032, &bbox, 5.0);
+/// let config = CropConfig::default();
+/// let formats = detect_suitable_formats(3024, 4032, &bbox, 5.0, &config);
 /// // likely ["21:9", "9:21", "9:16"] for a tall portrait person in a portrait photo
 /// ```
 pub fn detect_suitable_formats(
@@ -371,6 +444,7 @@ pub fn detect_suitable_formats(
     photo_height: u32,
     bbox: &BBox,
     margin_percent: f32,
+    config: &CropConfig,
 ) -> Vec<String> {
     let working_bbox = apply_margin_to_bbox(bbox, margin_percent, photo_width, photo_height);
 
@@ -379,21 +453,82 @@ pub fn detect_suitable_formats(
     let mut suitable: Vec<String> = Vec::new();
 
     // Landscape 21:9 is always attempted regardless of bbox orientation.
-    if calculate_landscape_21_9_crop(photo_width, photo_height, &working_bbox).is_some() {
+    if calculate_landscape_21_9_crop(photo_width, photo_height, &working_bbox, config).is_some() {
         suitable.push("21:9".to_string());
     }
 
     // Portrait formats are only attempted when the person's bbox is portrait-oriented.
     if !bbox_is_wide {
-        if calculate_portrait_9_21_crop(photo_width, photo_height, &working_bbox).is_some() {
+        if calculate_portrait_9_21_crop(photo_width, photo_height, &working_bbox, config).is_some()
+        {
             suitable.push("9:21".to_string());
         }
-        if calculate_portrait_9_16_crop(photo_width, photo_height, &working_bbox).is_some() {
+        if calculate_portrait_9_16_crop(photo_width, photo_height, &working_bbox, config).is_some()
+        {
             suitable.push("9:16".to_string());
         }
     }
 
     suitable
+}
+
+// ---------------------------------------------------------------------------
+// Multi-person: Compound Bounding Box
+// ---------------------------------------------------------------------------
+
+/// Calculate a single compound bounding box that encompasses all provided detections.
+///
+/// When multiple people are detected in a photo, this function produces a single
+/// bbox that tightly wraps all of them. The resulting compound bbox can then be
+/// passed to any of the cropping functions to produce a crop that frames the whole
+/// group rather than just the highest-confidence individual.
+///
+/// # Parameters
+/// - `detections`: Slice of detections, each carrying a `bbox: [x1, y1, x2, y2]` field.
+///
+/// # Returns
+/// - `Some(BBox)` encompassing all detections if the slice is non-empty.
+/// - `None` if `detections` is empty (no bbox to compute).
+///
+/// # Example
+/// ```rust,ignore
+/// let detections = vec![det_a, det_b, det_c];
+/// if let Some(compound) = calculate_compound_bbox(&detections) {
+///     let crop = calculate_landscape_21_9_crop(w, h, &compound, &config);
+/// }
+/// ```
+pub fn calculate_compound_bbox(detections: &[crate::image_utils::Detection]) -> Option<BBox> {
+    if detections.is_empty() {
+        return None;
+    }
+
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+
+    for det in detections {
+        let [x1, y1, x2, y2] = det.bbox;
+        if x1 < min_x {
+            min_x = x1;
+        }
+        if y1 < min_y {
+            min_y = y1;
+        }
+        if x2 > max_x {
+            max_x = x2;
+        }
+        if y2 > max_y {
+            max_y = y2;
+        }
+    }
+
+    Some(BBox {
+        x1: min_x,
+        y1: min_y,
+        x2: max_x,
+        y2: max_y,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +683,8 @@ mod tests {
             x2: 2400.0,
             y2: 2800.0,
         };
-        let result = calculate_landscape_21_9_crop(4000, 3000, &bbox);
+        let config = CropConfig::default();
+        let result = calculate_landscape_21_9_crop(4000, 3000, &bbox, &config);
         assert!(result.is_some(), "Expected Some for visible person");
         let crop = result.unwrap();
         // Aspect ratio should be close to 21:9
@@ -572,7 +708,8 @@ mod tests {
             x2: 200.0,
             y2: 800.0,
         };
-        let result = calculate_landscape_21_9_crop(1920, 1080, &bbox);
+        let config = CropConfig::default();
+        let result = calculate_landscape_21_9_crop(1920, 1080, &bbox, &config);
         if let Some(crop) = result {
             assert!(crop.x >= 0.0);
             assert!(crop.y >= 0.0);
@@ -588,7 +725,8 @@ mod tests {
         let photo_w = 3024u32;
         let photo_h = 4032u32;
         let bbox = tall_person_bbox();
-        let result = calculate_portrait_9_21_crop(photo_w, photo_h, &bbox);
+        let config = CropConfig::default();
+        let result = calculate_portrait_9_21_crop(photo_w, photo_h, &bbox, &config);
         assert!(
             result.is_some(),
             "Expected Some for visible tall person in portrait photo"
@@ -609,7 +747,8 @@ mod tests {
         let photo_w = 3024u32;
         let photo_h = 4032u32;
         let bbox = tall_person_bbox();
-        let result = calculate_portrait_9_16_crop(photo_w, photo_h, &bbox);
+        let config = CropConfig::default();
+        let result = calculate_portrait_9_16_crop(photo_w, photo_h, &bbox, &config);
         assert!(
             result.is_some(),
             "Expected Some for visible tall person in portrait photo"
@@ -628,7 +767,8 @@ mod tests {
     #[test]
     fn test_wide_bbox_returns_only_landscape() {
         let bbox = wide_person_bbox();
-        let formats = detect_suitable_formats(1920, 1080, &bbox, 0.0);
+        let config = CropConfig::default();
+        let formats = detect_suitable_formats(1920, 1080, &bbox, 0.0, &config);
         // Wide bbox → portrait formats must be skipped
         assert!(!formats.contains(&"9:21".to_string()));
         assert!(!formats.contains(&"9:16".to_string()));
@@ -639,7 +779,8 @@ mod tests {
         let photo_w = 3024u32;
         let photo_h = 4032u32;
         let bbox = tall_person_bbox();
-        let formats = detect_suitable_formats(photo_w, photo_h, &bbox, 0.0);
+        let config = CropConfig::default();
+        let formats = detect_suitable_formats(photo_w, photo_h, &bbox, 0.0, &config);
         // A 3600px-tall person in a 4032px photo fills most of the frame.
         // The 21:9 landscape crop is only ~1296px tall, so the person's 3600px height
         // cannot be 50%+ visible → landscape is correctly skipped.
@@ -656,8 +797,9 @@ mod tests {
         let photo_w = 3024u32;
         let photo_h = 4032u32;
         let bbox = tall_person_bbox();
+        let config = CropConfig::default();
         // With margin, the bbox expands; portrait formats should still be viable
-        let formats_with_margin = detect_suitable_formats(photo_w, photo_h, &bbox, 10.0);
+        let formats_with_margin = detect_suitable_formats(photo_w, photo_h, &bbox, 10.0, &config);
         assert!(
             !formats_with_margin.is_empty(),
             "Expected at least one suitable format with 10% margin, got: {:?}",
@@ -684,7 +826,8 @@ mod tests {
             x2: 1160.0,
             y2: 840.0,
         };
-        let formats = detect_suitable_formats(1920, 1080, &bbox, 0.0);
+        let config = CropConfig::default();
+        let formats = detect_suitable_formats(1920, 1080, &bbox, 0.0, &config);
         assert!(
             formats.contains(&"21:9".to_string()),
             "Landscape format should be viable for this photo/person: {:?}",
