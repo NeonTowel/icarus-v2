@@ -10,7 +10,7 @@ pub mod candle_backend;
 pub mod implementations;
 
 pub use candle_backend::{BBox, Detection, Model};
-pub use implementations::{YoloV11xFaceOrt, YOLOv10Ort};
+pub use implementations::{YOLOv10Ort, YoloV11xFaceOrt};
 
 use candle_core::Device;
 

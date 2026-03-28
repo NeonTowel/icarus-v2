@@ -144,13 +144,19 @@ impl Default for CropConfig {
 
 /// Strategy for selecting the dominant face when multiple faces are detected.
 ///
-/// Used by [`ArtisticCropConfig::face_selection_strategy`] to control how the
-/// primary face centroid is determined from a multi-face scene.
+/// # Deprecation Notice
+/// This enum is deprecated. Face selection is now always `MostCentral` (closest
+/// face centroid to image center). Use [`ArtisticMode`] to control aggressiveness.
 ///
 /// # Example
 /// ```rust,ignore
-/// let strategy = FaceSelectionStrategy::WeightedScore;
+/// let strategy = FaceSelectionStrategy::MostCentral;
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Face selection is now always MostCentral. Use ArtisticMode to control aggressiveness."
+)]
+#[allow(deprecated)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FaceSelectionStrategy {
@@ -165,6 +171,7 @@ pub enum FaceSelectionStrategy {
     WeightedScore,
 }
 
+#[allow(deprecated)]
 impl FromStr for FaceSelectionStrategy {
     type Err = anyhow::Error;
 
@@ -183,23 +190,25 @@ impl FromStr for FaceSelectionStrategy {
     }
 }
 
-/// Controls how aggressively the crop is composed around the face centroid.
+/// Controls how aggressively face-aware crop adjustment is applied.
 ///
-/// - **Conservative**: Minimal face bias; generous body/context composition. Safe for
-///   editorial content where environmental context matters.
-/// - **Balanced**: Equal weight on face framing and body visibility. Default for
-///   fashion and entertainment.
-/// - **Aggressive**: Maximum face prominence; tighter crop with face near center.
-///   Ideal for headshots and profile images.
+/// - **Conservative**: Larger safety margin (20px) around face; minimal adjustment.
+///   Best for editorial content where environmental context matters.
+/// - **Balanced**: Medium safety margin (15px). Default for fashion and entertainment.
+/// - **Aggressive**: Smaller safety margin (10px); more shift budget used for face
+///   visibility. Ideal for headshots and profile images.
+///
+/// The mode is the only user-facing parameter — all internal tuning values
+/// are derived from it via [`ArtisticCropConfig::from_mode`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtisticMode {
-    /// Minimal face bias; body and context preserved.
+    /// Larger safety margin, less aggressive face adjustment.
     Conservative,
     /// Balanced face framing and body visibility (default).
     #[default]
     Balanced,
-    /// Maximum face prominence; tight crop centred on face.
+    /// Smaller margin, tighter framing around the dominant face.
     Aggressive,
 }
 
@@ -221,9 +230,13 @@ impl FromStr for ArtisticMode {
 
 /// Derived margins and bias values for each [`ArtisticMode`].
 ///
-/// These are the internal values computed from the mode and used by the cropping
-/// algorithm. Callers should use [`ArtisticCropConfig::effective_params`] rather
-/// than constructing this directly.
+/// # Deprecation Notice
+/// This struct is deprecated. Parameters are now embedded in [`ArtisticCropConfig`]
+/// via [`ArtisticCropConfig::from_mode`].
+#[deprecated(
+    since = "2.1.0",
+    note = "Use ArtisticCropConfig::from_mode() to get the new config with embedded parameters."
+)]
 #[derive(Debug, Clone)]
 pub struct ArtisticModeParams {
     /// Bias of the crop center toward the face centroid (0.0 = no bias, 1.0 = full).
@@ -234,122 +247,142 @@ pub struct ArtisticModeParams {
     pub min_body_visibility: f32,
 }
 
-/// Runtime configuration for the artistic face-centric cropping algorithm.
+/// Runtime configuration for the face-aware crop adjustment algorithm.
 ///
-/// Controls face detection usage, face selection strategy, and artistic composition
-/// parameters. Instances can be constructed programmatically or supplied via CLI flags.
+/// Controls the artistic composition mode, face safety margin, and shift budget.
+/// Face detection is always enabled. The user-facing API has exactly two knobs:
+/// the [`ArtisticMode`] (via CLI `--artistic-mode`) and the `--visualize` flag
+/// (handled in `main.rs`, not stored here).
+///
+/// # Construction
+/// Prefer [`ArtisticCropConfig::from_mode`] over manual construction:
+///
+/// ```rust,ignore
+/// let config = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
+/// assert_eq!(config.face_safety_margin_px, 15);
+/// ```
 ///
 /// # Defaults
-/// All fields have sensible defaults matching the "balanced" artistic mode:
-/// - Face detection enabled.
-/// - 20 px face margin.
-/// - 0.5 head-to-body ratio.
-/// - Weighted-score face selection.
-/// - Balanced artistic mode.
-///
-/// # Example
-/// ```rust,ignore
-/// let config = ArtisticCropConfig::default();
-/// let params = config.effective_params();
-/// ```
+/// `ArtisticCropConfig::default()` is equivalent to `from_mode(ArtisticMode::Balanced)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtisticCropConfig {
-    /// Enable face detection in the two-stage pipeline (default: true).
-    #[serde(default = "default_use_face_detection")]
-    pub use_face_detection: bool,
-
-    /// Pixel margin to add around detected face bounding boxes before composing the crop.
-    ///
-    /// Valid range: 10–30 px. Default: 20 px.
-    #[serde(default = "default_face_margin_px")]
-    pub face_margin_px: u32,
-
-    /// Fraction of the crop height dedicated to the head region.
-    ///
-    /// `0.5` means the head occupies 50% of the crop height, leaving 50% for body/context.
-    /// Valid range: 0.3–0.7. Default: 0.5.
-    #[serde(default = "default_head_to_body_ratio")]
-    pub head_to_body_ratio: f32,
-
-    /// Face selection strategy when multiple faces are detected (default: weighted_score).
-    #[serde(default)]
-    pub face_selection_strategy: FaceSelectionStrategy,
-
-    /// Artistic composition mode (default: balanced).
+    /// Artistic composition mode controlling face margin and shift budget.
     #[serde(default)]
     pub artistic_mode: ArtisticMode,
+
+    /// Maximum fraction of crop dimension allowed for face adjustment shift.
+    ///
+    /// Shift budget in X = `crop_width  * max_shift_fraction`.
+    /// Shift budget in Y = `crop_height * max_shift_fraction`.
+    /// Default: 0.10 (10%).
+    #[serde(default = "default_max_shift_fraction")]
+    pub max_shift_fraction: f32,
+
+    /// Pixel safety margin around the detected face bbox that must be inside the crop.
+    ///
+    /// Derived from `artistic_mode` by default:
+    /// - Conservative → 20 px
+    /// - Balanced     → 15 px
+    /// - Aggressive   → 10 px
+    #[serde(default = "default_face_safety_margin_px")]
+    pub face_safety_margin_px: u32,
 }
 
-fn default_use_face_detection() -> bool {
-    true
+fn default_max_shift_fraction() -> f32 {
+    0.10
 }
 
-fn default_face_margin_px() -> u32 {
-    20
-}
-
-fn default_head_to_body_ratio() -> f32 {
-    0.5
+fn default_face_safety_margin_px() -> u32 {
+    15 // Balanced default
 }
 
 impl Default for ArtisticCropConfig {
     fn default() -> Self {
-        Self {
-            use_face_detection: default_use_face_detection(),
-            face_margin_px: default_face_margin_px(),
-            head_to_body_ratio: default_head_to_body_ratio(),
-            face_selection_strategy: FaceSelectionStrategy::default(),
-            artistic_mode: ArtisticMode::default(),
-        }
+        Self::from_mode(ArtisticMode::Balanced)
     }
 }
 
 impl ArtisticCropConfig {
-    /// Derive the effective algorithmic parameters for the current [`ArtisticMode`].
+    /// Create a config from an [`ArtisticMode`] with default shift fraction (10%).
     ///
-    /// The returned [`ArtisticModeParams`] encapsulates the numeric values that the
-    /// cropping algorithm uses, derived from the high-level mode selection.
-    ///
-    /// | Mode         | face_centroid_bias | margin_multiplier | min_body_visibility |
-    /// |------------- |--------------------|-------------------|---------------------|
-    /// | Conservative | 0.3                | 1.5               | 0.6                 |
-    /// | Balanced     | 0.6                | 1.0               | 0.4                 |
-    /// | Aggressive   | 0.9                | 0.7               | 0.2                 |
+    /// | Mode         | face_safety_margin_px | max_shift_fraction |
+    /// |--------------|----------------------|-------------------|
+    /// | Conservative | 20 px                | 10%               |
+    /// | Balanced     | 15 px                | 10%               |
+    /// | Aggressive   | 10 px                | 10%               |
     ///
     /// # Example
     /// ```rust,ignore
-    /// let config = ArtisticCropConfig::default();
-    /// let params = config.effective_params();
-    /// assert!((params.face_centroid_bias - 0.6).abs() < 0.01);
+    /// let config = ArtisticCropConfig::from_mode(ArtisticMode::Conservative);
+    /// assert_eq!(config.face_safety_margin_px, 20);
+    /// assert!((config.max_shift_fraction - 0.10).abs() < 0.01);
     /// ```
-    pub fn effective_params(&self) -> ArtisticModeParams {
-        match self.artistic_mode {
-            ArtisticMode::Conservative => ArtisticModeParams {
-                face_centroid_bias: 0.3,
-                margin_multiplier: 1.5,
-                min_body_visibility: 0.6,
-            },
-            ArtisticMode::Balanced => ArtisticModeParams {
-                face_centroid_bias: 0.6,
-                margin_multiplier: 1.0,
-                min_body_visibility: 0.4,
-            },
-            ArtisticMode::Aggressive => ArtisticModeParams {
-                face_centroid_bias: 0.9,
-                margin_multiplier: 0.7,
-                min_body_visibility: 0.2,
-            },
+    pub fn from_mode(mode: ArtisticMode) -> Self {
+        let margin = match mode {
+            ArtisticMode::Conservative => 20,
+            ArtisticMode::Balanced => 15,
+            ArtisticMode::Aggressive => 10,
+        };
+        Self {
+            artistic_mode: mode,
+            max_shift_fraction: 0.10,
+            face_safety_margin_px: margin,
         }
     }
+}
 
-    /// Validated face margin in pixels, clamped to the allowed range [10, 30].
-    pub fn clamped_face_margin_px(&self) -> u32 {
-        self.face_margin_px.clamp(10, 30)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_mode_conservative() {
+        let config = ArtisticCropConfig::from_mode(ArtisticMode::Conservative);
+        assert_eq!(config.face_safety_margin_px, 20);
+        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
+        assert_eq!(config.artistic_mode, ArtisticMode::Conservative);
     }
 
-    /// Validated head-to-body ratio, clamped to the allowed range [0.3, 0.7].
-    pub fn clamped_head_to_body_ratio(&self) -> f32 {
-        self.head_to_body_ratio.clamp(0.3, 0.7)
+    #[test]
+    fn test_from_mode_balanced() {
+        let config = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
+        assert_eq!(config.face_safety_margin_px, 15);
+        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_from_mode_aggressive() {
+        let config = ArtisticCropConfig::from_mode(ArtisticMode::Aggressive);
+        assert_eq!(config.face_safety_margin_px, 10);
+        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_default_is_balanced() {
+        let default = ArtisticCropConfig::default();
+        let balanced = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
+        assert_eq!(
+            default.face_safety_margin_px,
+            balanced.face_safety_margin_px
+        );
+        assert_eq!(default.artistic_mode, ArtisticMode::Balanced);
+    }
+
+    #[test]
+    fn test_artistic_mode_fromstr() {
+        assert_eq!(
+            "conservative".parse::<ArtisticMode>().unwrap(),
+            ArtisticMode::Conservative
+        );
+        assert_eq!(
+            "balanced".parse::<ArtisticMode>().unwrap(),
+            ArtisticMode::Balanced
+        );
+        assert_eq!(
+            "aggressive".parse::<ArtisticMode>().unwrap(),
+            ArtisticMode::Aggressive
+        );
+        assert!("unknown".parse::<ArtisticMode>().is_err());
     }
 }
 

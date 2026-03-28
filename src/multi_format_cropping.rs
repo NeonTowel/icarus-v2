@@ -540,6 +540,10 @@ pub fn calculate_compound_bbox(detections: &[crate::image_utils::Detection]) -> 
 /// Represents a single face that was detected within a person's bounding box,
 /// along with the metadata needed for dominant-face selection and crop computation.
 ///
+/// # Deprecation Notice
+/// This type is deprecated. The new face-aware pipeline uses `multi_format_cropping::BBox`
+/// directly for both face and person bboxes.
+///
 /// # Example
 /// ```rust,ignore
 /// let pairs = correlate_faces_to_persons(&faces, &persons);
@@ -547,6 +551,10 @@ pub fn calculate_compound_bbox(detections: &[crate::image_utils::Detection]) -> 
 ///     let crop = compute_artistic_crop(img_w, img_h, &dominant, &persons, &config, base_config);
 /// }
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Use multi_format_cropping::BBox directly with face_aware_cropping functions."
+)]
 #[derive(Debug, Clone)]
 pub struct FacePersonPair {
     /// Zero-based index of the person detection this face belongs to.
@@ -561,6 +569,7 @@ pub struct FacePersonPair {
     pub person_bbox: BBox,
 }
 
+#[allow(deprecated)]
 impl FacePersonPair {
     /// Returns the centroid (cx, cy) of the face bounding box in pixel coordinates.
     #[inline]
@@ -580,8 +589,9 @@ impl FacePersonPair {
 /// For each face, checks whether it falls fully inside any person bounding box.
 /// A face is assigned to the **first** person whose bbox fully contains it.
 ///
-/// Faces that are not contained in any person bbox are silently discarded (they
-/// are likely false positives at image edges or background detections).
+/// # Deprecation Notice
+/// This function is deprecated. The new pipeline passes face bboxes directly to
+/// [`crate::face_aware_cropping::apply_face_aware_adjustment`] without correlation.
 ///
 /// # Arguments
 /// * `faces`   — All face detections (from the YOLOv11x-Face model).
@@ -595,6 +605,11 @@ impl FacePersonPair {
 /// let pairs = correlate_faces_to_persons(&face_detections, &person_bboxes);
 /// assert!(pairs.iter().all(|p| p.person_id < persons.len()));
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Pass face bboxes directly to face_aware_cropping::apply_face_aware_adjustment()."
+)]
+#[allow(deprecated)]
 pub fn correlate_faces_to_persons(
     faces: &[crate::models::Detection],
     persons: &[BBox],
@@ -712,9 +727,9 @@ pub fn expand_bbox_px(bbox: &BBox, margin_px: u32, photo_width: u32, photo_heigh
 ///
 /// When `pairs` is empty, returns `None`.
 ///
-/// For group shots (multiple persons detected), the strategy operates over all correlated
-/// faces across all persons. The caller is responsible for deciding whether to compute
-/// a per-person crop or a unified group crop after selection.
+/// # Deprecation Notice
+/// This function is deprecated. Use [`crate::face_aware_cropping::find_dominant_face`]
+/// which works directly with `BBox` slices and always uses the `MostCentral` strategy.
 ///
 /// # Arguments
 /// * `pairs`      — Correlated face-person pairs (from [`correlate_faces_to_persons`]).
@@ -728,8 +743,13 @@ pub fn expand_bbox_px(bbox: &BBox, margin_px: u32, photo_width: u32, photo_heigh
 /// # Example
 /// ```rust,ignore
 /// use icarus_v2::config::FaceSelectionStrategy;
-/// let dominant = select_dominant_face(&pairs, &FaceSelectionStrategy::WeightedScore, 1920, 1080);
+/// let dominant = select_dominant_face(&pairs, &FaceSelectionStrategy::MostCentral, 1920, 1080);
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Use face_aware_cropping::find_dominant_face() which uses MostCentral strategy."
+)]
+#[allow(deprecated)]
 pub fn select_dominant_face<'a>(
     pairs: &'a [FacePersonPair],
     strategy: &crate::config::FaceSelectionStrategy,
@@ -802,18 +822,12 @@ pub fn select_dominant_face<'a>(
 ///
 /// Positions the crop to satisfy three competing objectives simultaneously:
 /// 1. **Face visibility**: The face (plus margin) must be entirely inside the crop.
-/// 2. **Body composition**: The person bbox is included proportionally per `head_to_body_ratio`.
+/// 2. **Body composition**: The person bbox is included proportionally per a fixed head-to-body ratio.
 /// 3. **Artistic framing**: The face centroid is biased toward the crop center based on `mode`.
 ///
-/// # Algorithm
-/// 1. Expand the face bbox by `face_margin_px` (pixel absolute margin).
-/// 2. Compute the "face zone" — the region the crop must include at minimum.
-/// 3. Derive the target crop size for `aspect_ratio` from the photo dimensions.
-/// 4. Position the crop so the face centroid is at `face_centroid_bias` from the top,
-///    biased by the artistic mode.
-/// 5. Blend with the person bbox using `head_to_body_ratio` to retain body context.
-/// 6. Clamp to photo bounds.
-/// 7. Verify the face zone is fully visible; return `None` if not.
+/// # Deprecation Notice
+/// This function is deprecated. Use [`crate::face_aware_cropping::apply_face_aware_adjustment`]
+/// instead, which provides cleaner separation of concerns and always returns a valid `CropRegion`.
 ///
 /// # Arguments
 /// * `photo_w` / `photo_h` — Source photo dimensions.
@@ -831,6 +845,11 @@ pub fn select_dominant_face<'a>(
 ///     3024, 4032, &dominant_face, 9.0 / 16.0, &artistic_config, &crop_config
 /// );
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Use face_aware_cropping::apply_face_aware_adjustment() instead."
+)]
+#[allow(deprecated)]
 pub fn compute_artistic_crop(
     photo_w: u32,
     photo_h: u32,
@@ -842,9 +861,20 @@ pub fn compute_artistic_crop(
     let pw = photo_w as f32;
     let ph = photo_h as f32;
 
-    let params = artistic.effective_params();
-    let face_margin = artistic.clamped_face_margin_px();
-    let head_to_body = artistic.clamped_head_to_body_ratio();
+    // Derive legacy params from the new config fields.
+    let (face_centroid_bias, margin_multiplier, min_body_visibility) = match artistic.artistic_mode
+    {
+        crate::config::ArtisticMode::Conservative => (0.3f32, 1.5f32, 0.6f32),
+        crate::config::ArtisticMode::Balanced => (0.6, 1.0, 0.4),
+        crate::config::ArtisticMode::Aggressive => (0.9, 0.7, 0.2),
+    };
+    let face_margin = artistic.face_safety_margin_px;
+    // Fixed head-to-body ratio (was configurable in old code, now mode-derived).
+    let head_to_body = match artistic.artistic_mode {
+        crate::config::ArtisticMode::Conservative => 0.4f32,
+        crate::config::ArtisticMode::Balanced => 0.5,
+        crate::config::ArtisticMode::Aggressive => 0.6,
+    };
     // Step 1: Expand the face bbox by the pixel margin (used for visibility check below).
 
     // Step 2: Compute the target crop dimensions for this aspect ratio.
@@ -888,14 +918,12 @@ pub fn compute_artistic_crop(
     // face_centroid_bias controls where in the crop the face centroid lands:
     // 0.0 → face at top of crop, 1.0 → face at bottom.
     // We target: crop_y = anchor_cy - (crop_h * headroom_position)
-    let headroom_position = base_config.headroom_ratio * (1.0 - params.face_centroid_bias)
-        + 0.35 * params.face_centroid_bias;
+    let headroom_position =
+        base_config.headroom_ratio * (1.0 - face_centroid_bias) + 0.35 * face_centroid_bias;
 
     // Apply centroid bias: blend anchor_cx toward face_cx by centroid_bias.
-    let biased_cx =
-        anchor_cx * (1.0 - params.face_centroid_bias) + face_cx * params.face_centroid_bias;
-    let biased_cy =
-        anchor_cy * (1.0 - params.face_centroid_bias) + face_cy * params.face_centroid_bias;
+    let biased_cx = anchor_cx * (1.0 - face_centroid_bias) + face_cx * face_centroid_bias;
+    let biased_cy = anchor_cy * (1.0 - face_centroid_bias) + face_cy * face_centroid_bias;
 
     let crop_x_raw = biased_cx - (crop_w / 2.0);
     let crop_y_raw = biased_cy - (crop_h * headroom_position);
@@ -912,7 +940,7 @@ pub fn compute_artistic_crop(
     };
 
     // Step 7: Verify the face zone is fully visible with margins (face must never be cut).
-    let effective_margin = (face_margin as f32 * params.margin_multiplier) as u32;
+    let effective_margin = (face_margin as f32 * margin_multiplier) as u32;
     let required_face_zone =
         expand_bbox_px(&dominant_face.face_bbox, effective_margin, photo_w, photo_h);
 
@@ -924,7 +952,7 @@ pub fn compute_artistic_crop(
     if !person_is_reasonably_visible_threshold(
         &dominant_face.person_bbox,
         &crop,
-        params.min_body_visibility,
+        min_body_visibility,
         photo_w,
         photo_h,
     ) {
@@ -957,6 +985,9 @@ pub fn is_region_visible(zone: &BBox, crop: &CropRegion) -> bool {
 /// compound face bbox that encompasses all correlated faces, then use that as
 /// the framing anchor.
 ///
+/// # Deprecation Notice
+/// This function is deprecated.
+///
 /// # Arguments
 /// * `pairs` — All face-person correlation pairs.
 ///
@@ -967,6 +998,8 @@ pub fn is_region_visible(zone: &BBox, crop: &CropRegion) -> bool {
 /// ```rust,ignore
 /// let group_bbox = compound_face_bbox(&pairs);
 /// ```
+#[deprecated(since = "2.1.0", note = "Use merge_bboxes() on BBox slices directly.")]
+#[allow(deprecated)]
 pub fn compound_face_bbox(pairs: &[FacePersonPair]) -> Option<BBox> {
     if pairs.is_empty() {
         return None;
@@ -987,8 +1020,9 @@ pub fn compound_face_bbox(pairs: &[FacePersonPair]) -> Option<BBox> {
 /// face detections are available, the crop is positioned using [`compute_artistic_crop`]
 /// rather than the person-bbox-only algorithm.
 ///
-/// When `face_pairs` is empty (no faces detected or face detection disabled),
-/// falls back to the standard person-bbox-based format detection.
+/// # Deprecation Notice
+/// This function is deprecated. Use [`crate::face_aware_cropping::apply_face_aware_adjustment`]
+/// combined with [`detect_suitable_formats`] instead.
 ///
 /// # Arguments
 /// * `photo_w` / `photo_h` — Source photo dimensions.
@@ -1007,6 +1041,11 @@ pub fn compound_face_bbox(pairs: &[FacePersonPair]) -> Option<BBox> {
 ///     3024, 4032, &person_bbox, &pairs, 0.0, &artistic_config, &base_config
 /// );
 /// ```
+#[deprecated(
+    since = "2.1.0",
+    note = "Use detect_suitable_formats() + face_aware_cropping::apply_face_aware_adjustment() instead."
+)]
+#[allow(deprecated)]
 pub fn detect_suitable_formats_with_faces(
     photo_w: u32,
     photo_h: u32,
@@ -1016,14 +1055,19 @@ pub fn detect_suitable_formats_with_faces(
     artistic: &crate::config::ArtisticCropConfig,
     base_config: &CropConfig,
 ) -> Vec<String> {
-    if face_pairs.is_empty() || !artistic.use_face_detection {
+    if face_pairs.is_empty() {
         // Fall back to person-bbox-only format detection.
         return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
     }
 
-    // Select the dominant face.
-    let strategy = &artistic.face_selection_strategy;
-    let dominant = select_dominant_face(face_pairs, strategy, photo_w, photo_h);
+    // Select the dominant face using MostCentral strategy (always, per new design).
+    #[allow(deprecated)]
+    let dominant = select_dominant_face(
+        face_pairs,
+        &crate::config::FaceSelectionStrategy::MostCentral,
+        photo_w,
+        photo_h,
+    );
 
     let Some(dominant) = dominant else {
         return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
@@ -1039,8 +1083,11 @@ pub fn detect_suitable_formats_with_faces(
     candidate_ratios
         .iter()
         .filter_map(|(name, ratio)| {
-            compute_artistic_crop(photo_w, photo_h, dominant, *ratio, artistic, base_config)
-                .map(|_| name.to_string())
+            #[allow(deprecated)]
+            let result =
+                compute_artistic_crop(photo_w, photo_h, dominant, *ratio, artistic, base_config)
+                    .map(|_| name.to_string());
+            result
         })
         .collect()
 }

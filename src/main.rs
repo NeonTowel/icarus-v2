@@ -1,8 +1,8 @@
 /// Icarus-v2 CLI Entry Point
 ///
 /// AI image cropping system. Runs YOLOv10 object detection on an input image via
-/// ONNX Runtime for person detection, then optionally runs YOLOv11x-Face via ONNX
-/// Runtime for face detection within detected persons, producing face-centric artistic crops.
+/// ONNX Runtime for person detection, then runs YOLOv11x-Face via ONNX Runtime for
+/// face detection, and applies face-aware crop adjustment to all output formats.
 ///
 /// Both models are downloaded from HuggingFace Hub on first use and cached locally
 /// in `~/.cache/huggingface/hub/`.
@@ -10,20 +10,20 @@
 /// # Example
 /// ```
 /// icarus-v2 --input photo.jpg --output crop.jpg --model yolov10 --confidence 0.3
-/// icarus-v2 --input photo.jpg --output crop.jpg --use-face-detection --artistic-mode balanced
+/// icarus-v2 --input photo.jpg --output crop.jpg --artistic-mode balanced --visualize viz.jpg
 /// ```
 use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
-use icarus_v2::config::{
-    load_crop_config, ArtisticCropConfig, ArtisticMode, CropConfig, FaceSelectionStrategy,
-};
+use icarus_v2::config::{load_crop_config, ArtisticCropConfig, ArtisticMode, CropConfig};
+use icarus_v2::face_aware_cropping::apply_face_aware_adjustment;
+use icarus_v2::face_detection::{detect_faces, load_face_detector};
 use icarus_v2::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
-use icarus_v2::models::{load_candle_model, Model, YoloV11xFaceOrt};
+use icarus_v2::models::load_candle_model;
 use icarus_v2::multi_format_cropping::{
-    calculate_compound_bbox, calculate_landscape_21_9_crop, calculate_portrait_9_16_crop,
-    calculate_portrait_9_21_crop, correlate_faces_to_persons, detect_suitable_formats,
-    detect_suitable_formats_with_faces, select_dominant_face, BBox, CropRegion,
+    apply_margin_to_bbox, calculate_compound_bbox, calculate_landscape_21_9_crop,
+    calculate_portrait_9_16_crop, calculate_portrait_9_21_crop, detect_suitable_formats, BBox,
+    CropRegion,
 };
 use icarus_v2::output_sorting;
 use image::DynamicImage;
@@ -45,7 +45,8 @@ const VALID_MODELS: &[&str] = &[
     about = "AI Image Cropping System",
     long_about = "Detect objects in images using YOLOv10 via ONNX Runtime. \
                   Supports saving cropped regions, annotated images, and raw detection JSON. \
-                  The YOLOv10n ONNX model (~9 MB) is downloaded from HuggingFace Hub on first use.",
+                  The YOLOv10n ONNX model (~9 MB) and YOLOv11x-Face model (~60 MB) are \
+                  downloaded from HuggingFace Hub on first use.",
     version
 )]
 struct Args {
@@ -78,7 +79,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     output_boxes: Option<PathBuf>,
 
-    /// Draw detection boxes on image and save to this path (alias: --annotate)
+    /// Draw detection boxes on image and save to this path (alias: --annotate).
+    ///
+    /// When set, draws green person boxes, cyan face boxes, and red crop regions.
+    /// Face detection is always shown when this flag is set.
     #[arg(long, alias = "annotate", value_name = "FILE")]
     visualize: Option<PathBuf>,
 
@@ -150,52 +154,16 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     crop_config: Option<PathBuf>,
 
-    // ── Face detection options ─────────────────────────────────────────────
-
-    /// Enable stage-2 YOLOv11x-Face detection for face-centric artistic cropping.
+    // ── Face detection and artistic options ────────────────────────────────
+    /// Artistic composition mode controlling face margin and shift budget.
     ///
-    /// When enabled, Icarus-v2 runs a second detection pass with YOLOv11x-Face to
-    /// locate faces within detected persons, then composes crops around the face
-    /// centroid with artistic margins. Falls back to person-only cropping when no
-    /// faces are detected.
-    #[arg(long, default_value_t = true)]
-    use_face_detection: bool,
-
-    /// Pixel margin added around detected face bounding boxes before crop composition.
-    ///
-    /// Prevents faces from appearing clipped at crop edges. Valid range: 10–30 px.
-    /// Clamped automatically if out of range.
-    #[arg(long, default_value_t = 20, value_name = "PX")]
-    face_margin_px: u32,
-
-    /// Fraction of crop height dedicated to the head region (0.3–0.7).
-    ///
-    /// Higher values keep more head/face in the crop at the expense of body context.
-    /// `0.5` is the default balanced setting.
-    #[arg(long, default_value_t = 0.5, value_name = "FLOAT")]
-    head_to_body_ratio: f32,
-
-    /// Strategy for selecting the primary face when multiple faces are detected.
-    ///
-    /// Options: largest, highest_confidence, most_central, weighted_score (default).
-    #[arg(long, default_value = "weighted_score", value_name = "STRATEGY")]
-    face_selection_strategy: String,
-
-    /// Artistic composition mode controlling face-centroid bias and body inclusion.
-    ///
-    /// Options:
-    ///   conservative — Minimal face bias; generous body/context composition.
-    ///   balanced     — Equal weight on face framing and body (default).
-    ///   aggressive   — Maximum face prominence; tightest crop around face.
+    /// Face detection is always on. This mode controls how aggressively face
+    /// visibility is prioritised when adjusting crop placement:
+    ///   conservative — Larger safety margin (20px); minimal crop adjustment.
+    ///   balanced     — Medium safety margin (15px); default for most photos.
+    ///   aggressive   — Smaller margin (10px); tighter framing around the face.
     #[arg(long, default_value = "balanced", value_name = "MODE")]
     artistic_mode: String,
-
-    /// Visualise face detection bounding boxes on the annotated output image.
-    ///
-    /// Face boxes are drawn in cyan to distinguish them from person boxes (green).
-    /// Requires `--visualize` to be set.
-    #[arg(long, default_value_t = false)]
-    show_face_detection: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +200,7 @@ impl From<icarus_v2::models::Detection> for Detection {
 // Serialisable detection output
 // ---------------------------------------------------------------------------
 
-/// JSON-serialisable form of a single detection (used by the legacy JSON path).
-///
-/// Retained for potential use in simple single-detection JSON output;
-/// the full two-stage output uses `save_detections_json_with_faces` directly.
+/// JSON-serialisable form of a single detection.
 #[allow(dead_code)]
 #[derive(Serialize)]
 struct DetectionRecord {
@@ -246,7 +211,6 @@ struct DetectionRecord {
     bbox: [f32; 4],
 }
 
-#[allow(dead_code)]
 impl From<&Detection> for DetectionRecord {
     fn from(d: &Detection) -> Self {
         Self {
@@ -281,11 +245,7 @@ fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
 // Output helpers
 // ---------------------------------------------------------------------------
 
-/// Save a raw bounding-box crop (fallback when `--keep-aspect-ratio` is specified or no
-/// multi-format output path is configured).
-///
-/// When `keep_aspect_ratio` is `false` (the default), falls back to a centered 21:9 crop
-/// of the full image. Pass `true` to return the full image unchanged (no person found).
+/// Save a centered 21:9 fallback crop when no person was detected.
 fn save_fallback_crop(image: &DynamicImage, output_path: &Path) -> Result<()> {
     let crop = crop_to_ultrawide_21_9_centered(image)
         .with_context(|| "Failed to crop image to centered 21:9")?;
@@ -308,37 +268,9 @@ fn save_crop_region(image: &DynamicImage, crop: &CropRegion, output_path: &Path)
 }
 
 /// Save detection bounding boxes as a JSON array to `output_path`.
-///
-/// Retained for single-detection-type output; for the two-stage pipeline use
-/// [`save_detections_json_with_faces`] instead.
-#[allow(dead_code)]
-fn save_detections_json(detections: &[Detection], output_path: &Path) -> Result<()> {
-    let records: Vec<DetectionRecord> = detections.iter().map(DetectionRecord::from).collect();
-    let json =
-        serde_json::to_string_pretty(&records).context("Failed to serialise detections to JSON")?;
-
-    std::fs::write(output_path, json)
-        .with_context(|| format!("Failed to write detections JSON to {:?}", output_path))?;
-
-    Ok(())
-}
-
-/// Save person detections and face detections together as a combined JSON output.
-///
-/// Produces a JSON object with two keys:
-/// - `"persons"`: array of person detection records.
-/// - `"faces"`: array of face detection records, each annotated with the correlated
-///   `person_id` when a face-person association was found.
-///
-/// # Arguments
-/// * `detections`      — Person detections from stage-1 YOLOv10.
-/// * `face_detections` — Face detections from stage-2 YOLOv11x-Face (may be empty).
-/// * `face_pairs`      — Correlated face-person pairs for `person_id` annotation.
-/// * `output_path`     — Destination file path.
-fn save_detections_json_with_faces(
+fn save_detections_json(
     detections: &[Detection],
-    face_detections: &[icarus_v2::models::Detection],
-    face_pairs: &[icarus_v2::multi_format_cropping::FacePersonPair],
+    face_bboxes: &[BBox],
     output_path: &Path,
 ) -> Result<()> {
     use serde_json::json;
@@ -357,20 +289,13 @@ fn save_detections_json_with_faces(
         })
         .collect();
 
-    let face_records: Vec<serde_json::Value> = face_detections
+    let face_records: Vec<serde_json::Value> = face_bboxes
         .iter()
         .enumerate()
-        .map(|(face_id, f)| {
-            // Find person_id for this face via the correlation pairs.
-            let person_id = face_pairs
-                .iter()
-                .find(|p| p.face_id == face_id)
-                .map(|p| p.person_id);
+        .map(|(i, f)| {
             json!({
-                "face_id": face_id,
-                "confidence": f.confidence,
-                "bbox": [f.bbox.x_min, f.bbox.y_min, f.bbox.x_max, f.bbox.y_max],
-                "person_id": person_id,
+                "face_id": i,
+                "bbox": [f.x1, f.y1, f.x2, f.y2],
             })
         })
         .collect();
@@ -391,35 +316,21 @@ fn save_detections_json_with_faces(
 
 /// Draw bounding boxes on a copy of `image` and save to `output_path`.
 ///
-/// Delegates to [`save_visualized_with_faces`] with an empty face detection list,
-/// producing the same output as the original single-stage visualisation.
+/// Colour coding:
+/// - Persons (class 0): bright green (#00FF00)
+/// - Other classes: dark red (#800000)
+/// - Faces: cyan (#00FFFF)
 ///
 /// # Limitations
 /// Text rendering is rasterised as white pixels only (no font support without
 /// external dependencies). Labels are best inspected in the JSON output.
 // TODO: Replace with a proper font-rendering solution (e.g., `imageproc` + `rusttype`)
 //       once the dependency budget allows it.
-#[allow(dead_code)]
-fn save_visualized(
-    image: &DynamicImage,
-    detections: &[Detection],
-    output_path: &Path,
-) -> Result<()> {
-    save_visualized_with_faces(image, detections, &[], output_path)
-}
-
-/// Draw person and (optionally) face bounding boxes on a copy of `image`.
-///
-/// Colour coding:
-/// - Persons (class 0): bright green (#00FF00)
-/// - Other classes: dark red (#800000)
-/// - Faces: cyan (#00FFFF)
-///
-/// The face boxes are drawn on top of person boxes so they remain visible.
 fn save_visualized_with_faces(
     image: &DynamicImage,
     detections: &[Detection],
-    face_detections: &[icarus_v2::models::Detection],
+    face_bboxes: &[BBox],
+    crop_regions: &[CropRegion],
     output_path: &Path,
 ) -> Result<()> {
     use image::{Rgba, RgbaImage};
@@ -432,6 +343,7 @@ fn save_visualized_with_faces(
     const VIZ_PERSON_COLOR: [u8; 4] = [0, 255, 0, 220]; // bright green (#00FF00)
     const VIZ_NON_PERSON_COLOR: [u8; 4] = [128, 0, 0, 220]; // dark red (#800000)
     const VIZ_FACE_COLOR: [u8; 4] = [0, 255, 255, 220]; // cyan (#00FFFF)
+    const VIZ_CROP_COLOR: [u8; 4] = [255, 0, 0, 220]; // red (#FF0000)
 
     /// Draw a 2-pixel-wide axis-aligned rectangle.
     fn draw_rect(canvas: &mut RgbaImage, x1u: u32, y1u: u32, x2u: u32, y2u: u32, colour: Rgba<u8>) {
@@ -480,14 +392,28 @@ fn save_visualized_with_faces(
     }
 
     // Draw face detections on top (cyan).
-    for face in face_detections {
+    for face in face_bboxes {
         draw_rect(
             &mut canvas,
-            (face.bbox.x_min as u32).min(w.saturating_sub(1)),
-            (face.bbox.y_min as u32).min(h.saturating_sub(1)),
-            (face.bbox.x_max as u32).min(w.saturating_sub(1)),
-            (face.bbox.y_max as u32).min(h.saturating_sub(1)),
+            (face.x1 as u32).min(w.saturating_sub(1)),
+            (face.y1 as u32).min(h.saturating_sub(1)),
+            (face.x2 as u32).min(w.saturating_sub(1)),
+            (face.y2 as u32).min(h.saturating_sub(1)),
             Rgba(VIZ_FACE_COLOR),
+        );
+    }
+
+    // Draw crop regions (red).
+    for crop in crop_regions {
+        let x2 = crop.x + crop.width;
+        let y2 = crop.y + crop.height;
+        draw_rect(
+            &mut canvas,
+            (crop.x as u32).min(w.saturating_sub(1)),
+            (crop.y as u32).min(h.saturating_sub(1)),
+            (x2 as u32).min(w.saturating_sub(1)),
+            (y2 as u32).min(h.saturating_sub(1)),
+            Rgba(VIZ_CROP_COLOR),
         );
     }
 
@@ -574,17 +500,6 @@ async fn main() -> Result<()> {
     }
 
     // ── Build ArtisticCropConfig from CLI flags ────────────────────────────
-    let face_selection_strategy = args
-        .face_selection_strategy
-        .parse::<FaceSelectionStrategy>()
-        .with_context(|| {
-            format!(
-                "Invalid --face-selection-strategy '{}'. \
-                 Options: largest, highest_confidence, most_central, weighted_score",
-                args.face_selection_strategy
-            )
-        })?;
-
     let artistic_mode = args
         .artistic_mode
         .parse::<ArtisticMode>()
@@ -595,13 +510,7 @@ async fn main() -> Result<()> {
             )
         })?;
 
-    let artistic_config = ArtisticCropConfig {
-        use_face_detection: args.use_face_detection,
-        face_margin_px: args.face_margin_px.clamp(10, 30),
-        head_to_body_ratio: args.head_to_body_ratio.clamp(0.3, 0.7),
-        face_selection_strategy,
-        artistic_mode,
-    };
+    let artistic_config = ArtisticCropConfig::from_mode(artistic_mode);
 
     // ── Warn if --model-path was supplied (no longer used) ─────────────────
     if let Some(ref p) = args.model_path {
@@ -652,10 +561,20 @@ async fn main() -> Result<()> {
         println!("  Confidence threshold: {}", args.confidence);
     }
 
-    // ── Load person detection model (stage 1) ──────────────────────────────
+    // ── Load ALL models at startup ─────────────────────────────────────────
+    // Both models stay in memory for the entire run. Fatal if either fails.
     let model = load_candle_model(&args.model, &device)
         .await
         .with_context(|| format!("Failed to load model '{}'", args.model))?;
+
+    if !args.quiet {
+        println!("  Loading face detection model (YOLOv11x-Face)…");
+    }
+
+    // Load face detector in a blocking task (HF Hub download is synchronous).
+    let face_detector = tokio::task::spawn_blocking(load_face_detector)
+        .await
+        .map_err(|e| anyhow::anyhow!("face model load task panicked: {e}"))??;
 
     if !args.quiet {
         println!("  Running stage-1 inference (person detection)…");
@@ -675,9 +594,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Postprocessing failed for '{}': {e}", args.model))?;
 
     // Convert from candle_backend::Detection to the CLI's Detection type, then
-    // apply the user-supplied confidence threshold (the model already applies its
-    // own internal threshold at inference time; this allows users to tighten it
-    // further via --confidence without recompiling).
+    // apply the user-supplied confidence threshold.
     let detections: Vec<Detection> = raw_detections
         .into_iter()
         .map(Detection::from)
@@ -690,9 +607,6 @@ async fn main() -> Result<()> {
     //   - 0 persons  → no crop bbox (fallback path below)
     //   - 1 person   → use that detection's bbox directly (backward compatible)
     //   - 2+ persons → compound bbox encompassing all detected persons
-    //
-    // The compound bbox approach avoids cropping that excludes group members when
-    // multiple people appear in the same photo.
     let person_detections: Vec<&Detection> = detections
         .iter()
         .filter(|d| d.class_id == PERSON_CLASS_ID)
@@ -706,8 +620,6 @@ async fn main() -> Result<()> {
         }
         n => {
             // Multiple persons: build a compound bbox via image_utils::Detection.
-            // We convert back to image_utils::Detection so calculate_compound_bbox
-            // can work with the canonical type.
             if !args.quiet {
                 println!(
                     "  Detected {} persons — using compound bbox for cropping.",
@@ -730,79 +642,39 @@ async fn main() -> Result<()> {
     // Keep the legacy helper available for the keep-aspect-ratio / no-person path.
     let person_for_crop = find_best_person_detection(&detections);
 
-    // ── Stage 2: Face detection via YOLOv11x-Face (when enabled) ─────────
+    // ── Stage 2: Face detection via YOLOv11x-Face (always runs) ──────────
     //
-    // The face model runs on the same full image as the person model rather than
-    // per-person crops. This avoids re-encoding overhead and keeps the pipeline
-    // linear. Face-to-person correlation is done in software by checking which
-    // faces fall within each person's bounding box.
-    //
-    // The model is loaded fresh each run from the HF Hub cache (~100 ms after
-    // first download). If the download or ONNX parse fails, the error propagates
-    // explicitly — there is no silent fallback.
-    let face_detections: Vec<icarus_v2::models::Detection> =
-        if artistic_config.use_face_detection && crop_bbox.is_some() {
-            if !args.quiet {
-                println!("  Running stage-2 inference (face detection via YOLOv11x-Face)…");
+    // Face detection is default behavior. If inference fails, we log a warning
+    // and continue with an empty face list (graceful degradation).
+    if !args.quiet {
+        println!("  Running stage-2 inference (face detection via YOLOv11x-Face)…");
+    }
+
+    let face_bboxes: Vec<BBox> = match detect_faces(&image, &face_detector) {
+        Ok(faces) => {
+            if !args.quiet && !faces.is_empty() {
+                println!("  Face detections: {}", faces.len());
+                for (i, f) in faces.iter().enumerate() {
+                    println!(
+                        "    [{:2}] face  bbox=[{:.0},{:.0},{:.0},{:.0}]",
+                        i + 1,
+                        f.x1,
+                        f.y1,
+                        f.x2,
+                        f.y2
+                    );
+                }
             }
-
-            // Load the face model. We use spawn_blocking so the synchronous HF Hub
-            // call doesn't block the Tokio executor.
-            let device_clone = device.clone();
-            let face_model = tokio::task::spawn_blocking(move || {
-                YoloV11xFaceOrt::from_hub(&device_clone)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("face model load task panicked: {e}"))??;
-
-            // Run face detection on the full image (same input as person detection).
-            let face_tensor = face_model
-                .preprocess(std::slice::from_ref(&image))
-                .map_err(|e| anyhow::anyhow!("Face preprocess failed: {e}"))?;
-
-            let (face_logits, face_boxes) = face_model
-                .forward(&face_tensor)
-                .map_err(|e| anyhow::anyhow!("Face forward failed: {e}"))?;
-
-            face_model
-                .postprocess(face_logits, face_boxes)
-                .map_err(|e| anyhow::anyhow!("Face postprocess failed: {e}"))?
-        } else {
-            vec![]
-        };
-
-    if !args.quiet && !face_detections.is_empty() {
-        println!("  Face detections: {}", face_detections.len());
-        for (i, f) in face_detections.iter().enumerate() {
-            println!(
-                "    [{:2}] face  conf={:.3}  bbox=[{:.0},{:.0},{:.0},{:.0}]",
-                i + 1,
-                f.confidence,
-                f.bbox.x_min,
-                f.bbox.y_min,
-                f.bbox.x_max,
-                f.bbox.y_max
-            );
+            faces
         }
-    }
-
-    // ── Correlate faces to persons ─────────────────────────────────────────
-    // Collect the person bboxes in multi_format_cropping::BBox format for correlation.
-    let person_bboxes_for_correlation: Vec<BBox> = person_detections
-        .iter()
-        .map(|d| BBox {
-            x1: d.bbox[0],
-            y1: d.bbox[1],
-            x2: d.bbox[2],
-            y2: d.bbox[3],
-        })
-        .collect();
-
-    let face_pairs = correlate_faces_to_persons(&face_detections, &person_bboxes_for_correlation);
-
-    if !args.quiet && !face_pairs.is_empty() {
-        println!("  Correlated {}/{} faces to persons.", face_pairs.len(), face_detections.len());
-    }
+        Err(e) => {
+            eprintln!(
+                "Warning: face detection failed ({}). Continuing without faces.",
+                e
+            );
+            vec![]
+        }
+    };
 
     // ── Report results ─────────────────────────────────────────────────────
     if detections.is_empty() {
@@ -839,13 +711,18 @@ async fn main() -> Result<()> {
     //
     //   1. Detect suitable formats (21:9, 9:21, 9:16) based on bbox orientation
     //      and visibility checks.
-    //   2. For each suitable format, calculate the crop region and save a
-    //      format-suffixed file (e.g. photo_21_9.jpg).
-    //   3. If --visualize is also supplied, save a per-format annotated image
-    //      (e.g. photo_21_9_annotated.jpg).
+    //   2. For each suitable format:
+    //      A. Original algorithm calculates initial crop (person-bbox driven).
+    //      B. Face-aware adjustment nudges the crop (within shift budget) so the
+    //         dominant face is not clipped.
+    //   3. Save each format-suffixed output file.
+    //   4. If --visualize is also supplied, save an annotated image per format.
     //
     // Fallback: when no person is detected OR --keep-aspect-ratio is set, we
     // fall back to the old behaviour (centered 21:9 of the whole image).
+
+    // Track all crop regions produced for visualization.
+    let mut all_crop_regions: Vec<CropRegion> = Vec::new();
 
     if let Some(ref output_path) = args.output {
         // Ensure output subdirectories exist when --sort-output is enabled.
@@ -957,15 +834,11 @@ async fn main() -> Result<()> {
                     viz_dir.join(format!("{}.{}", annotated_stem, vext))
                 };
 
-                let viz_face_dets = if args.show_face_detection {
-                    face_detections.as_slice()
-                } else {
-                    &[]
-                };
                 save_visualized_with_faces(
                     &image,
                     &detections,
-                    viz_face_dets,
+                    &face_bboxes,
+                    &all_crop_regions,
                     &actual_viz_path,
                 )
                 .with_context(|| {
@@ -978,41 +851,23 @@ async fn main() -> Result<()> {
         } else {
             // ── Multi-format intelligent cropping path ─────────────────────
             // crop_bbox is Some(...) here — guaranteed by the branch condition above.
-            let raw_bbox: BBox = crop_bbox.unwrap(); // safe: checked by branch condition
+            let raw_bbox: BBox = crop_bbox.clone().unwrap(); // safe: checked by branch condition
 
             if args.margin < 0.0 {
                 bail!("--margin must be ≥ 0, got {}", args.margin);
             }
 
-            // Use face-aware format detection when face pairs are available;
-            // fall back to person-bbox-only detection otherwise.
-            let suitable_formats = if !face_pairs.is_empty() {
-                if !args.quiet {
-                    println!(
-                        "  Using face-centric artistic cropping \
-                         ({} face(s) correlated, mode: {:?}).",
-                        face_pairs.len(),
-                        artistic_config.artistic_mode,
-                    );
-                }
-                detect_suitable_formats_with_faces(
-                    image.width(),
-                    image.height(),
-                    &raw_bbox,
-                    &face_pairs,
-                    args.margin,
-                    &artistic_config,
-                    &crop_config,
-                )
-            } else {
-                detect_suitable_formats(
-                    image.width(),
-                    image.height(),
-                    &raw_bbox,
-                    args.margin,
-                    &crop_config,
-                )
-            };
+            // Get the person bbox (for passing to face-aware adjustment).
+            let person_bbox_for_adjustment: Option<BBox> = crop_bbox;
+
+            // Detect suitable formats using the standard person-bbox algorithm.
+            let suitable_formats = detect_suitable_formats(
+                image.width(),
+                image.height(),
+                &raw_bbox,
+                args.margin,
+                &crop_config,
+            );
 
             if suitable_formats.is_empty() {
                 if !args.quiet {
@@ -1031,6 +886,13 @@ async fn main() -> Result<()> {
             } else {
                 if !args.quiet {
                     println!("  Suitable formats: {}", suitable_formats.join(", "));
+                    if !face_bboxes.is_empty() {
+                        println!(
+                            "  Applying face-aware adjustment ({} face(s), mode: {:?}).",
+                            face_bboxes.len(),
+                            artistic_config.artistic_mode,
+                        );
+                    }
                 }
 
                 // Build the output stem + extension so we can construct per-format paths.
@@ -1057,80 +919,35 @@ async fn main() -> Result<()> {
                 });
 
                 for format in &suitable_formats {
-                    // Calculate crop region for this format.
-                    // When face pairs are available, use artistic face-centric positioning;
-                    // otherwise fall back to the standard person-bbox algorithm.
-                    let maybe_crop: Option<CropRegion> = {
-                        use icarus_v2::multi_format_cropping::{
-                            apply_margin_to_bbox, compute_artistic_crop,
-                        };
-
-                        // Try face-centric crop first when we have correlated faces.
-                        let face_crop = if !face_pairs.is_empty() {
-                            let dominant = select_dominant_face(
-                                &face_pairs,
-                                &artistic_config.face_selection_strategy,
-                                image.width(),
-                                image.height(),
-                            );
-                            dominant.and_then(|d| {
-                                let ratio = match format.as_str() {
-                                    "21:9" => 21.0 / 9.0,
-                                    "16:9" => 16.0 / 9.0,
-                                    "1:1" => 1.0,
-                                    "9:16" => 9.0 / 16.0,
-                                    "9:21" => 9.0 / 21.0,
-                                    _ => return None,
-                                };
-                                compute_artistic_crop(
-                                    image.width(),
-                                    image.height(),
-                                    d,
-                                    ratio,
-                                    &artistic_config,
-                                    &crop_config,
-                                )
-                            })
-                        } else {
+                    // Step A: Original algorithm calculates initial crop (person-bbox driven).
+                    let working_bbox =
+                        apply_margin_to_bbox(&raw_bbox, args.margin, image.width(), image.height());
+                    let maybe_original_crop: Option<CropRegion> = match format.as_str() {
+                        "21:9" => calculate_landscape_21_9_crop(
+                            image.width(),
+                            image.height(),
+                            &working_bbox,
+                            &crop_config,
+                        ),
+                        "9:21" => calculate_portrait_9_21_crop(
+                            image.width(),
+                            image.height(),
+                            &working_bbox,
+                            &crop_config,
+                        ),
+                        "9:16" => calculate_portrait_9_16_crop(
+                            image.width(),
+                            image.height(),
+                            &working_bbox,
+                            &crop_config,
+                        ),
+                        other => {
+                            eprintln!("Warning: unknown format '{}' — skipping.", other);
                             None
-                        };
-
-                        // Fall back to person-bbox algorithm if face crop wasn't produced.
-                        face_crop.or_else(|| {
-                            let working_bbox = apply_margin_to_bbox(
-                                &raw_bbox,
-                                args.margin,
-                                image.width(),
-                                image.height(),
-                            );
-                            match format.as_str() {
-                                "21:9" => calculate_landscape_21_9_crop(
-                                    image.width(),
-                                    image.height(),
-                                    &working_bbox,
-                                    &crop_config,
-                                ),
-                                "9:21" => calculate_portrait_9_21_crop(
-                                    image.width(),
-                                    image.height(),
-                                    &working_bbox,
-                                    &crop_config,
-                                ),
-                                "9:16" => calculate_portrait_9_16_crop(
-                                    image.width(),
-                                    image.height(),
-                                    &working_bbox,
-                                    &crop_config,
-                                ),
-                                other => {
-                                    eprintln!("Warning: unknown format '{}' — skipping.", other);
-                                    None
-                                }
-                            }
-                        })
+                        }
                     };
 
-                    let crop = match maybe_crop {
+                    let original_crop = match maybe_original_crop {
                         Some(c) => c,
                         None => {
                             if !args.quiet {
@@ -1143,7 +960,22 @@ async fn main() -> Result<()> {
                         }
                     };
 
-                    // e.g. output/landscape/photo_21_9.jpg  (or flat: output/photo_21_9.jpg)
+                    // Step B: Face-aware adjustment (secondary, additive).
+                    // Nudges the crop minimally to ensure the dominant face is not clipped.
+                    // Returns the original crop if adjustment is impossible or unnecessary.
+                    let adjusted_crop = apply_face_aware_adjustment(
+                        &original_crop,
+                        person_bbox_for_adjustment.as_ref(),
+                        &face_bboxes,
+                        &artistic_config,
+                        image_width,
+                        image_height,
+                    );
+
+                    // Track the final crop for visualization.
+                    all_crop_regions.push(adjusted_crop.clone());
+
+                    // Step C: Save the (adjusted) crop.
                     let crop_path = output_sorting::get_sorted_output_path(
                         output_path,
                         format,
@@ -1154,7 +986,7 @@ async fn main() -> Result<()> {
                     .with_context(|| {
                         format!("Failed to build output path for format {}", format)
                     })?;
-                    save_crop_region(&image, &crop, &crop_path).with_context(|| {
+                    save_crop_region(&image, &adjusted_crop, &crop_path).with_context(|| {
                         format!("Failed to save {} crop to {:?}", format, crop_path)
                     })?;
                     if !args.quiet {
@@ -1175,15 +1007,11 @@ async fn main() -> Result<()> {
                         .with_context(|| {
                             format!("Failed to build annotated path for format {}", format)
                         })?;
-                        let fmt_face_dets = if args.show_face_detection {
-                            face_detections.as_slice()
-                        } else {
-                            &[]
-                        };
                         save_visualized_with_faces(
                             &image,
                             &detections,
-                            fmt_face_dets,
+                            &face_bboxes,
+                            std::slice::from_ref(&adjusted_crop),
                             &viz_path,
                         )
                         .with_context(|| {
@@ -1199,13 +1027,14 @@ async fn main() -> Result<()> {
     } else {
         // No --output supplied; still emit the visualisation if requested.
         if let Some(ref viz_path) = args.visualize {
-            let no_output_face_dets = if args.show_face_detection {
-                face_detections.as_slice()
-            } else {
-                &[]
-            };
-            save_visualized_with_faces(&image, &detections, no_output_face_dets, viz_path)
-                .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
+            save_visualized_with_faces(
+                &image,
+                &detections,
+                &face_bboxes,
+                &all_crop_regions,
+                viz_path,
+            )
+            .with_context(|| format!("Failed to save visualization to {:?}", viz_path))?;
             if !args.quiet {
                 println!("Saved visualized image to {:?}", viz_path);
             }
@@ -1214,13 +1043,16 @@ async fn main() -> Result<()> {
 
     // ── Save detection JSON ────────────────────────────────────────────────
     if let Some(ref boxes_path) = args.output_boxes {
-        save_detections_json_with_faces(&detections, &face_detections, &face_pairs, boxes_path)
+        save_detections_json(&detections, &face_bboxes, boxes_path)
             .with_context(|| format!("Failed to save detections JSON to {:?}", boxes_path))?;
         if !args.quiet {
             println!(
                 "Saved {} person + {} face detection(s) to {:?}",
-                detections.len(),
-                face_detections.len(),
+                detections
+                    .iter()
+                    .filter(|d| d.class_id == PERSON_CLASS_ID)
+                    .count(),
+                face_bboxes.len(),
                 boxes_path
             );
         }
@@ -1230,38 +1062,12 @@ async fn main() -> Result<()> {
     if !args.quiet {
         println!(
             "Done. Found {} person(s), {} face(s).",
-            detections.iter().filter(|d| d.class_id == PERSON_CLASS_ID).count(),
-            face_detections.len(),
+            detections
+                .iter()
+                .filter(|d| d.class_id == PERSON_CLASS_ID)
+                .count(),
+            face_bboxes.len(),
         );
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "debug_tensors")]
-fn debug_tensor_inspection() -> anyhow::Result<()> {
-    use std::path::Path;
-    let weights_path = Path::new("/home/developer/.cache/huggingface/hub/models--facebook--detr-resnet-50/snapshots/1d5f47bd3bdd2c4bbfa585418ffe6da5028b4c0b/model.safetensors");
-
-    let data = std::fs::read(weights_path)?;
-    let tensors = safetensors::SafeTensors::deserialize(&data)?;
-
-    let mut keys: Vec<_> = tensors.names().collect();
-    keys.sort();
-
-    println!("Total tensors: {}\n", keys.len());
-
-    println!("=== ALL KEYS (first 100) ===");
-    for (i, key) in keys.iter().take(100).enumerate() {
-        println!("{:3}: {}", i, key);
-    }
-
-    println!("\n\n=== BACKBONE KEYS ===");
-    let backbone_keys: Vec<_> = keys.iter().filter(|k| k.contains("backbone")).collect();
-
-    println!("Total backbone keys: {}", backbone_keys.len());
-    for key in backbone_keys.iter().take(60) {
-        println!("  {}", key);
     }
 
     Ok(())
