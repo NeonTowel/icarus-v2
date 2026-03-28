@@ -158,7 +158,7 @@ impl Model for YOLOv10Ort {
         // Each detection: [x1, y1, x2, y2, score, class_id] in 640×640 space.
         let scale_x = orig_w as f32 / MODEL_W as f32;
         let scale_y = orig_h as f32 / MODEL_H as f32;
-        let values: Vec<f32> = raw.iter().copied().collect();
+        let values: Vec<f32> = raw.to_vec();
 
         let detections = values
             .chunks_exact(6)

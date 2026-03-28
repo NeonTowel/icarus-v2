@@ -532,6 +532,520 @@ pub fn calculate_compound_bbox(detections: &[crate::image_utils::Detection]) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Face-aware artistic cropping
+// ---------------------------------------------------------------------------
+
+/// A (face, person) correlation pair produced by [`correlate_faces_to_persons`].
+///
+/// Represents a single face that was detected within a person's bounding box,
+/// along with the metadata needed for dominant-face selection and crop computation.
+///
+/// # Example
+/// ```rust,ignore
+/// let pairs = correlate_faces_to_persons(&faces, &persons);
+/// if let Some(dominant) = select_dominant_face(&pairs, &strategy, img_w, img_h) {
+///     let crop = compute_artistic_crop(img_w, img_h, &dominant, &persons, &config, base_config);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct FacePersonPair {
+    /// Zero-based index of the person detection this face belongs to.
+    pub person_id: usize,
+    /// Zero-based index within the original face detection list.
+    pub face_id: usize,
+    /// Detection confidence of the face (from the face model output).
+    pub confidence: f32,
+    /// Face bounding box in original image pixel coordinates (XYXY).
+    pub face_bbox: BBox,
+    /// Person bounding box in original image pixel coordinates (XYXY).
+    pub person_bbox: BBox,
+}
+
+impl FacePersonPair {
+    /// Returns the centroid (cx, cy) of the face bounding box in pixel coordinates.
+    #[inline]
+    pub fn face_centroid(&self) -> (f32, f32) {
+        (self.face_bbox.center_x(), self.face_bbox.center_y())
+    }
+
+    /// Returns the area of the face bounding box in square pixels.
+    #[inline]
+    pub fn face_area(&self) -> f32 {
+        self.face_bbox.width() * self.face_bbox.height()
+    }
+}
+
+/// Correlate detected faces with detected persons using bounding-box containment.
+///
+/// For each face, checks whether it falls fully inside any person bounding box.
+/// A face is assigned to the **first** person whose bbox fully contains it.
+///
+/// Faces that are not contained in any person bbox are silently discarded (they
+/// are likely false positives at image edges or background detections).
+///
+/// # Arguments
+/// * `faces`   — All face detections (from the YOLOv11x-Face model).
+/// * `persons` — All person detections (from the YOLOv10 model), in XYXY pixel coords.
+///
+/// # Returns
+/// A list of [`FacePersonPair`] sorted by (person_id, face confidence descending).
+///
+/// # Example
+/// ```rust,ignore
+/// let pairs = correlate_faces_to_persons(&face_detections, &person_bboxes);
+/// assert!(pairs.iter().all(|p| p.person_id < persons.len()));
+/// ```
+pub fn correlate_faces_to_persons(
+    faces: &[crate::models::Detection],
+    persons: &[BBox],
+) -> Vec<FacePersonPair> {
+    let mut pairs: Vec<FacePersonPair> = vec![];
+
+    for (face_id, face) in faces.iter().enumerate() {
+        let face_bbox = BBox {
+            x1: face.bbox.x_min,
+            y1: face.bbox.y_min,
+            x2: face.bbox.x_max,
+            y2: face.bbox.y_max,
+        };
+
+        // Assign to the first person bbox that fully contains this face.
+        for (person_id, person_bbox) in persons.iter().enumerate() {
+            if is_bbox_within(
+                face_bbox.x1,
+                face_bbox.y1,
+                face_bbox.x2,
+                face_bbox.y2,
+                person_bbox,
+            ) {
+                pairs.push(FacePersonPair {
+                    person_id,
+                    face_id,
+                    confidence: face.confidence,
+                    face_bbox: face_bbox.clone(),
+                    person_bbox: person_bbox.clone(),
+                });
+                break; // Each face is assigned to at most one person.
+            }
+        }
+    }
+
+    // Sort: primary by person_id (ascending), secondary by confidence (descending).
+    pairs.sort_by(|a, b| {
+        a.person_id.cmp(&b.person_id).then_with(|| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    pairs
+}
+
+/// Return `true` if the rectangle `(x1, y1, x2, y2)` is fully contained within `container`.
+///
+/// "Fully contained" means all four corners of the inner rectangle are inside (or
+/// on the boundary of) the container. This is a strict containment check — faces
+/// that straddle a person's boundary are excluded to avoid false correlations.
+///
+/// # Example
+/// ```rust,ignore
+/// let person = BBox { x1: 0.0, y1: 0.0, x2: 200.0, y2: 400.0 };
+/// assert!(is_bbox_within(50.0, 10.0, 150.0, 100.0, &person));
+/// assert!(!is_bbox_within(-10.0, 10.0, 150.0, 100.0, &person));
+/// ```
+pub fn is_bbox_within(x1: f32, y1: f32, x2: f32, y2: f32, container: &BBox) -> bool {
+    x1 >= container.x1 && y1 >= container.y1 && x2 <= container.x2 && y2 <= container.y2
+}
+
+/// Merge two bounding boxes into their smallest enclosing rectangle.
+///
+/// The resulting bbox is the minimum bounding rectangle that contains both inputs.
+///
+/// # Example
+/// ```rust,ignore
+/// let merged = merge_bboxes(
+///     &BBox { x1: 10.0, y1: 10.0, x2: 100.0, y2: 200.0 },
+///     &BBox { x1: 80.0, y1: 50.0, x2: 180.0, y2: 250.0 },
+/// );
+/// assert_eq!(merged.x1, 10.0);
+/// assert_eq!(merged.x2, 180.0);
+/// ```
+pub fn merge_bboxes(a: &BBox, b: &BBox) -> BBox {
+    BBox {
+        x1: a.x1.min(b.x1),
+        y1: a.y1.min(b.y1),
+        x2: a.x2.max(b.x2),
+        y2: a.y2.max(b.y2),
+    }
+}
+
+/// Expand a bounding box by a fixed pixel margin in all four directions.
+///
+/// Unlike the percentage-based [`apply_margin_to_bbox`], this function uses an
+/// absolute pixel margin suitable for face-region expansion (faces vary less in
+/// size relative to the image than full-body person bboxes).
+///
+/// The result is clamped to `(0, 0, photo_width, photo_height)`.
+///
+/// # Arguments
+/// * `bbox`         — Source bounding box.
+/// * `margin_px`    — Margin in pixels to add on each side.
+/// * `photo_width`  — Image width (clamp limit).
+/// * `photo_height` — Image height (clamp limit).
+///
+/// # Example
+/// ```rust,ignore
+/// let expanded = expand_bbox_px(&face_bbox, 20, 1920, 1080);
+/// ```
+pub fn expand_bbox_px(bbox: &BBox, margin_px: u32, photo_width: u32, photo_height: u32) -> BBox {
+    let m = margin_px as f32;
+    BBox {
+        x1: (bbox.x1 - m).max(0.0),
+        y1: (bbox.y1 - m).max(0.0),
+        x2: (bbox.x2 + m).min(photo_width as f32),
+        y2: (bbox.y2 + m).min(photo_height as f32),
+    }
+}
+
+/// Select the dominant face from a list of face-person pairs using the given strategy.
+///
+/// When `pairs` is empty, returns `None`.
+///
+/// For group shots (multiple persons detected), the strategy operates over all correlated
+/// faces across all persons. The caller is responsible for deciding whether to compute
+/// a per-person crop or a unified group crop after selection.
+///
+/// # Arguments
+/// * `pairs`      — Correlated face-person pairs (from [`correlate_faces_to_persons`]).
+/// * `strategy`   — Selection algorithm.
+/// * `img_w`      — Image width in pixels (used for centrality calculation).
+/// * `img_h`      — Image height in pixels (used for centrality calculation).
+///
+/// # Returns
+/// Reference to the dominant [`FacePersonPair`], or `None` if `pairs` is empty.
+///
+/// # Example
+/// ```rust,ignore
+/// use icarus_v2::config::FaceSelectionStrategy;
+/// let dominant = select_dominant_face(&pairs, &FaceSelectionStrategy::WeightedScore, 1920, 1080);
+/// ```
+pub fn select_dominant_face<'a>(
+    pairs: &'a [FacePersonPair],
+    strategy: &crate::config::FaceSelectionStrategy,
+    img_w: u32,
+    img_h: u32,
+) -> Option<&'a FacePersonPair> {
+    use crate::config::FaceSelectionStrategy;
+
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let img_cx = img_w as f32 / 2.0;
+    let img_cy = img_h as f32 / 2.0;
+    let max_dist = ((img_cx * img_cx) + (img_cy * img_cy)).sqrt();
+
+    match strategy {
+        FaceSelectionStrategy::Largest => pairs.iter().max_by(|a, b| {
+            a.face_area()
+                .partial_cmp(&b.face_area())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+
+        FaceSelectionStrategy::HighestConfidence => pairs.iter().max_by(|a, b| {
+            a.confidence
+                .partial_cmp(&b.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+
+        FaceSelectionStrategy::MostCentral => pairs.iter().min_by(|a, b| {
+            let (ax, ay) = a.face_centroid();
+            let (bx, by) = b.face_centroid();
+            let da = ((ax - img_cx).powi(2) + (ay - img_cy).powi(2)).sqrt();
+            let db = ((bx - img_cx).powi(2) + (by - img_cy).powi(2)).sqrt();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+
+        FaceSelectionStrategy::WeightedScore => {
+            // Compute per-pair score: 50% size + 30% confidence + 20% centrality.
+            // All three components are normalised to [0, 1].
+            let max_area = pairs
+                .iter()
+                .map(|p| p.face_area())
+                .fold(0.0f32, f32::max)
+                .max(1.0); // avoid division by zero
+
+            pairs.iter().max_by(|a, b| {
+                let score = |p: &FacePersonPair| {
+                    let size_score = p.face_area() / max_area;
+                    let conf_score = p.confidence; // already in [0,1]
+                    let (px, py) = p.face_centroid();
+                    let dist = ((px - img_cx).powi(2) + (py - img_cy).powi(2)).sqrt();
+                    let central_score = if max_dist > 0.0 {
+                        1.0 - (dist / max_dist)
+                    } else {
+                        1.0
+                    };
+                    0.5 * size_score + 0.3 * conf_score + 0.2 * central_score
+                };
+
+                score(a)
+                    .partial_cmp(&score(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        }
+    }
+}
+
+/// Compute a face-centric artistic crop region for the given aspect ratio.
+///
+/// Positions the crop to satisfy three competing objectives simultaneously:
+/// 1. **Face visibility**: The face (plus margin) must be entirely inside the crop.
+/// 2. **Body composition**: The person bbox is included proportionally per `head_to_body_ratio`.
+/// 3. **Artistic framing**: The face centroid is biased toward the crop center based on `mode`.
+///
+/// # Algorithm
+/// 1. Expand the face bbox by `face_margin_px` (pixel absolute margin).
+/// 2. Compute the "face zone" — the region the crop must include at minimum.
+/// 3. Derive the target crop size for `aspect_ratio` from the photo dimensions.
+/// 4. Position the crop so the face centroid is at `face_centroid_bias` from the top,
+///    biased by the artistic mode.
+/// 5. Blend with the person bbox using `head_to_body_ratio` to retain body context.
+/// 6. Clamp to photo bounds.
+/// 7. Verify the face zone is fully visible; return `None` if not.
+///
+/// # Arguments
+/// * `photo_w` / `photo_h` — Source photo dimensions.
+/// * `dominant_face` — The selected dominant face-person pair.
+/// * `aspect_ratio` — Target crop width/height ratio (e.g. 21.0/9.0).
+/// * `artistic`     — Artistic crop configuration.
+/// * `base_config`  — Base crop config (visibility threshold, headroom ratio).
+///
+/// # Returns
+/// `Some(CropRegion)` when all constraints are met, `None` otherwise.
+///
+/// # Example
+/// ```rust,ignore
+/// let crop = compute_artistic_crop(
+///     3024, 4032, &dominant_face, 9.0 / 16.0, &artistic_config, &crop_config
+/// );
+/// ```
+pub fn compute_artistic_crop(
+    photo_w: u32,
+    photo_h: u32,
+    dominant_face: &FacePersonPair,
+    aspect_ratio: f32, // width / height
+    artistic: &crate::config::ArtisticCropConfig,
+    base_config: &CropConfig,
+) -> Option<CropRegion> {
+    let pw = photo_w as f32;
+    let ph = photo_h as f32;
+
+    let params = artistic.effective_params();
+    let face_margin = artistic.clamped_face_margin_px();
+    let head_to_body = artistic.clamped_head_to_body_ratio();
+    // Step 1: Expand the face bbox by the pixel margin (used for visibility check below).
+
+    // Step 2: Compute the target crop dimensions for this aspect ratio.
+    // Prefer using the full photo width (portrait-like) or height (landscape-like).
+    let (crop_w, crop_h) = if aspect_ratio >= 1.0 {
+        // Landscape: start with full photo width.
+        let cw = pw;
+        let ch = cw / aspect_ratio;
+        if ch <= ph {
+            (cw, ch)
+        } else {
+            let ch2 = ph;
+            (ch2 * aspect_ratio, ch2)
+        }
+    } else {
+        // Portrait: start with full photo width.
+        let cw = pw;
+        let ch = cw / aspect_ratio;
+        if ch <= ph {
+            (cw, ch)
+        } else {
+            let ch2 = ph;
+            (ch2 * aspect_ratio, ch2)
+        }
+    };
+
+    // Step 3: Determine the face centroid.
+    let (face_cx, face_cy) = dominant_face.face_centroid();
+
+    // Step 4: Compute the person-body anchor point.
+    // Blend face centroid with person bbox center using head_to_body_ratio.
+    let person_cx = dominant_face.person_bbox.center_x();
+    let person_cy = dominant_face.person_bbox.center_y();
+
+    // Anchor Y: blend face cy and person cy. When head_to_body = 0.5, the anchor
+    // sits halfway between the face centroid and the person center (body-aware).
+    let anchor_cx = face_cx * head_to_body + person_cx * (1.0 - head_to_body);
+    let anchor_cy = face_cy * head_to_body + person_cy * (1.0 - head_to_body);
+
+    // Step 5: Position the crop.
+    // face_centroid_bias controls where in the crop the face centroid lands:
+    // 0.0 → face at top of crop, 1.0 → face at bottom.
+    // We target: crop_y = anchor_cy - (crop_h * headroom_position)
+    let headroom_position = base_config.headroom_ratio * (1.0 - params.face_centroid_bias)
+        + 0.35 * params.face_centroid_bias;
+
+    // Apply centroid bias: blend anchor_cx toward face_cx by centroid_bias.
+    let biased_cx =
+        anchor_cx * (1.0 - params.face_centroid_bias) + face_cx * params.face_centroid_bias;
+    let biased_cy =
+        anchor_cy * (1.0 - params.face_centroid_bias) + face_cy * params.face_centroid_bias;
+
+    let crop_x_raw = biased_cx - (crop_w / 2.0);
+    let crop_y_raw = biased_cy - (crop_h * headroom_position);
+
+    // Step 6: Clamp to photo bounds.
+    let crop_x = crop_x_raw.max(0.0).min((pw - crop_w).max(0.0));
+    let crop_y = crop_y_raw.max(0.0).min((ph - crop_h).max(0.0));
+
+    let crop = CropRegion {
+        x: crop_x,
+        y: crop_y,
+        width: crop_w,
+        height: crop_h,
+    };
+
+    // Step 7: Verify the face zone is fully visible with margins (face must never be cut).
+    let effective_margin = (face_margin as f32 * params.margin_multiplier) as u32;
+    let required_face_zone =
+        expand_bbox_px(&dominant_face.face_bbox, effective_margin, photo_w, photo_h);
+
+    if !is_region_visible(&required_face_zone, &crop) {
+        return None;
+    }
+
+    // Step 8: Check person body visibility against the mode's minimum threshold.
+    if !person_is_reasonably_visible_threshold(
+        &dominant_face.person_bbox,
+        &crop,
+        params.min_body_visibility,
+        photo_w,
+        photo_h,
+    ) {
+        return None;
+    }
+
+    Some(crop)
+}
+
+/// Returns `true` if the bounding box `zone` is fully contained within the `crop` region.
+///
+/// Used to verify face visibility after crop positioning.
+///
+/// # Example
+/// ```rust,ignore
+/// let face_zone = BBox { x1: 100.0, y1: 100.0, x2: 200.0, y2: 200.0 };
+/// let crop = CropRegion { x: 50.0, y: 50.0, width: 500.0, height: 400.0 };
+/// assert!(is_region_visible(&face_zone, &crop));
+/// ```
+pub fn is_region_visible(zone: &BBox, crop: &CropRegion) -> bool {
+    let crop_x2 = crop.x + crop.width;
+    let crop_y2 = crop.y + crop.height;
+
+    zone.x1 >= crop.x && zone.y1 >= crop.y && zone.x2 <= crop_x2 && zone.y2 <= crop_y2
+}
+
+/// Build the compound bounding box spanning all detected faces (for group shots).
+///
+/// In group shots, rather than selecting a single dominant face, we compute a
+/// compound face bbox that encompasses all correlated faces, then use that as
+/// the framing anchor.
+///
+/// # Arguments
+/// * `pairs` — All face-person correlation pairs.
+///
+/// # Returns
+/// `Some(BBox)` spanning all face bboxes, or `None` if `pairs` is empty.
+///
+/// # Example
+/// ```rust,ignore
+/// let group_bbox = compound_face_bbox(&pairs);
+/// ```
+pub fn compound_face_bbox(pairs: &[FacePersonPair]) -> Option<BBox> {
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let merged = pairs
+        .iter()
+        .map(|p| &p.face_bbox)
+        .cloned()
+        .reduce(|acc, b| merge_bboxes(&acc, &b));
+
+    merged
+}
+
+/// Detect which output formats support face-centric framing for this photo.
+///
+/// Extends [`detect_suitable_formats`] with face-aware crop positioning. When
+/// face detections are available, the crop is positioned using [`compute_artistic_crop`]
+/// rather than the person-bbox-only algorithm.
+///
+/// When `face_pairs` is empty (no faces detected or face detection disabled),
+/// falls back to the standard person-bbox-based format detection.
+///
+/// # Arguments
+/// * `photo_w` / `photo_h` — Source photo dimensions.
+/// * `person_bbox`  — Compound or single person bounding box.
+/// * `face_pairs`   — Correlated face-person pairs (may be empty).
+/// * `margin_pct`   — Percentage margin for person bbox expansion.
+/// * `artistic`     — Artistic crop configuration.
+/// * `base_config`  — Base crop configuration.
+///
+/// # Returns
+/// List of format name strings that produce valid face-centric crops.
+///
+/// # Example
+/// ```rust,ignore
+/// let formats = detect_suitable_formats_with_faces(
+///     3024, 4032, &person_bbox, &pairs, 0.0, &artistic_config, &base_config
+/// );
+/// ```
+pub fn detect_suitable_formats_with_faces(
+    photo_w: u32,
+    photo_h: u32,
+    person_bbox: &BBox,
+    face_pairs: &[FacePersonPair],
+    margin_pct: f32,
+    artistic: &crate::config::ArtisticCropConfig,
+    base_config: &CropConfig,
+) -> Vec<String> {
+    if face_pairs.is_empty() || !artistic.use_face_detection {
+        // Fall back to person-bbox-only format detection.
+        return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
+    }
+
+    // Select the dominant face.
+    let strategy = &artistic.face_selection_strategy;
+    let dominant = select_dominant_face(face_pairs, strategy, photo_w, photo_h);
+
+    let Some(dominant) = dominant else {
+        return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
+    };
+
+    // Attempt each candidate aspect ratio.
+    let candidate_ratios: &[(&str, f32)] = &[
+        ("21:9", 21.0 / 9.0),
+        ("9:16", 9.0 / 16.0),
+        ("9:21", 9.0 / 21.0),
+    ];
+
+    candidate_ratios
+        .iter()
+        .filter_map(|(name, ratio)| {
+            compute_artistic_crop(photo_w, photo_h, dominant, *ratio, artistic, base_config)
+                .map(|_| name.to_string())
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Unit Tests
 // ---------------------------------------------------------------------------
 

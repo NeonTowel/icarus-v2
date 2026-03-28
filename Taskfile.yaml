@@ -224,3 +224,31 @@ tasks:
                     --sort-output \
                     --confidence {{ .CONFIDENCE }} \
                     --margin {{ .MARGIN }}
+
+    test-artboard-samples-v2:
+        deps: [build-without-warnings]
+        desc: "Test artistic flair cropping against artboard design samples with face detection"
+        silent: true
+        sources:
+            - input-artboard-samples/*
+        method: none
+        vars:
+            CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
+        cmds:
+            - for: sources
+              cmd: |-
+                  echo "Processing {{ base .ITEM }}"
+                  time target/debug/icarus-v2 \
+                    --quiet \
+                    --model yolov10 \
+                    --use-face-detection \
+                    --artistic-mode balanced \
+                    --show-face-detection \
+                    --input input-artboard-samples/{{ base .ITEM }} \
+                    --output output-artboard-samples-v2/{{ base .ITEM }} \
+                    --visualize output-artboard-samples-v2/{{ base .ITEM }} \
+                    --sort-output \
+                    --confidence {{ .CONFIDENCE }} \
+                    --margin {{ .MARGIN }}
