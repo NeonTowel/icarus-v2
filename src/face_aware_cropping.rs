@@ -134,13 +134,16 @@ pub fn apply_face_aware_adjustment(
     }
     // ── END HEAD-PRIORITY ─────────────────────────────────────────────────────
 
-    // Compute the "required zone" — the face bbox expanded by the safety margin.
-    let required_zone = compute_required_zone(
-        dominant_face,
-        config.face_safety_margin_px,
-        image_width,
-        image_height,
-    );
+    // ── PHASE 2: Dynamic margin ───────────────────────────────────────────────
+    // Scale the safety margin up when the face is within 5% of the crop edge.
+    // Centered faces use the base margin from config; cramped faces get more room.
+    let dynamic_margin =
+        compute_dynamic_face_margin(dominant_face, crop, config.face_safety_margin_px);
+
+    // Compute the "required zone" — the face bbox expanded by the dynamic safety margin.
+    let required_zone =
+        compute_required_zone(dominant_face, dynamic_margin, image_width, image_height);
+    // ── END DYNAMIC MARGIN ────────────────────────────────────────────────────
 
     // Compute the shift budget in pixels.
     let budget_x = crop.width * config.max_shift_fraction;
@@ -341,6 +344,51 @@ fn is_face_forward_pose(person_bbox: &BBox, face_bbox: &BBox) -> bool {
     // Calibrated from artboard sample set; separates standing (0.10–0.25)
     // from sitting (0.35–0.55) with acceptable overlap zone at 0.35–0.40.
     face_y_relative < 0.40
+}
+
+/// Compute a context-aware face safety margin that scales up near crop edges.
+///
+/// Centered faces use the base margin (typically 15px for Balanced mode).
+/// When a face is within 5% of the crop height from any vertical edge, the
+/// margin increases to prevent the "cramped head" visual artefact — the feeling
+/// that the subject's head is squeezed against the frame boundary.
+///
+/// The margin never decreases below `base_margin_px` regardless of the face position.
+///
+/// # Arguments
+/// * `face_bbox`      — The dominant face bounding box.
+/// * `crop`           — The current crop region (before any shift).
+/// * `base_margin_px` — The mode-derived base margin (10/15/20px).
+///
+/// # Returns
+/// A pixel margin value `>= base_margin_px`. When the face is near an edge,
+/// the returned value is `max((crop.height * 0.05 * 1.5) as u32, base_margin_px)`.
+///
+/// # Example
+/// ```rust,ignore
+/// let margin = compute_dynamic_face_margin(&face, &crop, 15);
+/// // If face is near top edge: margin > 15
+/// // If face is well-centered: margin == 15
+/// ```
+fn compute_dynamic_face_margin(face_bbox: &BBox, crop: &CropRegion, base_margin_px: u32) -> u32 {
+    // 5% of crop height defines the "too close to edge" breathing room threshold.
+    // Photography best practice: 5–10% headroom between subject and frame boundary.
+    let min_breathing_room = crop.height * 0.05;
+
+    // Measure vertical distance from face edges to crop edges.
+    let distance_to_top = (face_bbox.y1 - crop.y).max(0.0);
+    let distance_to_bottom = ((crop.y + crop.height) - face_bbox.y2).max(0.0);
+
+    // If either vertical distance falls below the breathing room threshold,
+    // the face is "cramped" and needs a larger margin.
+    // The 1.5x multiplier produces ~7.5% of crop height as clear space,
+    // within professional framing norms.
+    if distance_to_top < min_breathing_room || distance_to_bottom < min_breathing_room {
+        // max() guard ensures we never return less than base even if crop is tiny.
+        ((min_breathing_room * 1.5) as u32).max(base_margin_px)
+    } else {
+        base_margin_px
+    }
 }
 
 /// Attempt to shift the crop minimally to contain the required zone.
@@ -778,5 +826,57 @@ mod tests {
         let zone = compute_required_zone(&face, 20, 1920, 1080);
         assert_eq!(zone.x1, 0.0, "x1 clamped to 0");
         assert_eq!(zone.y1, 0.0, "y1 clamped to 0");
+    }
+
+    // --- compute_dynamic_face_margin ---
+
+    #[test]
+    fn test_dynamic_margin_increases_when_face_near_top_edge() {
+        // Face top at y1=50, crop top at y=40 → distance_to_top = 10px.
+        // min_breathing_room = 400 * 0.05 = 20px.
+        // 10 < 20 → face is cramped at top → margin scales up from base 15.
+        let face = make_bbox(100.0, 50.0, 200.0, 150.0);
+        let crop = make_crop(0.0, 40.0, 1000.0, 400.0);
+        let margin = compute_dynamic_face_margin(&face, &crop, 15);
+        assert!(
+            margin > 15,
+            "face near top edge should increase margin above base 15, got {}",
+            margin
+        );
+        // Expected: (20.0 * 1.5) as u32 = 30, which is > 15.
+        assert_eq!(margin, 30, "scaled margin should be (20 * 1.5) = 30");
+    }
+
+    #[test]
+    fn test_dynamic_margin_stays_base_when_face_centered() {
+        // Face (400..600) well inside crop (0..1000).
+        // distance_to_top = 400 - 0 = 400px.
+        // distance_to_bottom = 1000 - 600 = 400px.
+        // min_breathing_room = 1000 * 0.05 = 50px.
+        // 400 > 50 AND 400 > 50 → face is well-centered → return base margin.
+        let face = make_bbox(400.0, 300.0, 600.0, 500.0);
+        let crop = make_crop(0.0, 0.0, 1000.0, 1000.0);
+        let margin = compute_dynamic_face_margin(&face, &crop, 15);
+        assert_eq!(
+            margin, 15,
+            "centered face should return base margin unchanged"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_margin_never_decreases_below_base() {
+        // Even with a very tiny crop (e.g., 50px height), the margin should never
+        // drop below base_margin_px regardless of the scaled value.
+        // min_breathing_room = 50 * 0.05 = 2.5px.
+        // Scaled: (2.5 * 1.5) as u32 = 3, which is less than base_margin_px=15.
+        // max() guard must ensure we return 15.
+        let face = make_bbox(100.0, 0.0, 200.0, 50.0); // spans entire tiny crop height
+        let crop = make_crop(0.0, 0.0, 500.0, 50.0); // 50px tall crop
+        let margin = compute_dynamic_face_margin(&face, &crop, 15);
+        assert!(
+            margin >= 15,
+            "margin must never go below base_margin_px=15, got {}",
+            margin
+        );
     }
 }
