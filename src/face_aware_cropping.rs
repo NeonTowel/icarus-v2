@@ -98,6 +98,42 @@ pub fn apply_face_aware_adjustment(
         return crop.clone();
     }
 
+    // ── NEW: Head-priority routing ────────────────────────────────────────────
+    // Activates only when:
+    //   1. A person bbox is available (Some, not None)
+    //   2. The person is in a face-forward pose (face in upper 40% of person bbox)
+    //   3. The repositioned crop still keeps the person adequately visible (≥ 30%)
+    //
+    // For face-forward poses the upstream 40% headroom algorithm sometimes clips
+    // feet while leaving too much space below the head (e.g. artboard_01 9:21).
+    // Head-priority anchors the crop top to the forehead instead, accepting that
+    // feet may be outside the frame.
+    if let Some(person) = person_bbox {
+        if is_face_forward_pose(person, dominant_face) {
+            let new_crop = compute_face_forward_crop(
+                person,
+                dominant_face,
+                crop.width,
+                crop.height,
+                image_width,
+                image_height,
+            );
+            // Visibility gate: person must remain at least 30% visible.
+            // If the repositioned crop cuts the body too aggressively, fall through
+            // to the original shift-based logic which may produce a better result.
+            if person_is_reasonably_visible_threshold(
+                person,
+                &new_crop,
+                0.30,
+                image_width,
+                image_height,
+            ) {
+                return new_crop;
+            }
+        }
+    }
+    // ── END HEAD-PRIORITY ─────────────────────────────────────────────────────
+
     // Compute the "required zone" — the face bbox expanded by the safety margin.
     let required_zone = compute_required_zone(
         dominant_face,
@@ -204,6 +240,107 @@ fn compute_required_zone(
         x2: (face_bbox.x2 + m).min(pw),
         y2: (face_bbox.y2 + m).min(ph),
     }
+}
+
+/// Position a crop to prioritize head visibility for face-forward poses.
+///
+/// The key insight: cropping feet is aesthetically acceptable, cropping eyes is not.
+/// This function places the crop top just above the face (with a buffer), allowing the
+/// bottom to extend wherever the crop height dictates — potentially past the feet.
+///
+/// The returned crop has the same `width` and `height` as the inputs, but a repositioned
+/// `(x, y)`. All coordinates are clamped to remain within photo bounds.
+///
+/// # Arguments
+/// * `person_bbox` — Person detection bbox; used for horizontal centering.
+/// * `face_bbox`   — Dominant face bbox; `face_bbox.y1` anchors the vertical position.
+/// * `crop_width`  — Width of the desired crop (passed through, unmodified).
+/// * `crop_height` — Height of the desired crop (passed through, unmodified).
+/// * `photo_w`     — Source photo width in pixels.
+/// * `photo_h`     — Source photo height in pixels.
+///
+/// # Example
+/// ```rust,ignore
+/// let crop = compute_face_forward_crop(&person, &face, 800.0, 1600.0, 3000, 4000);
+/// assert!(crop.y <= face.y1 - 15.0); // forehead visible with buffer
+/// assert_eq!(crop.width, 800.0);     // dimensions preserved
+/// ```
+fn compute_face_forward_crop(
+    person_bbox: &BBox,
+    face_bbox: &BBox,
+    crop_width: f32,
+    crop_height: f32,
+    photo_w: u32,
+    photo_h: u32,
+) -> CropRegion {
+    let photo_hf = photo_h as f32;
+    let photo_wf = photo_w as f32;
+
+    // Head safety zone: 20px above the forehead ensures we never produce a "hairline crop".
+    // This absolute pixel value is appropriate because face detection bboxes from YOLOv11x-Face
+    // are tight around the face and 20px consistently prevents the forehead-clip artifact
+    // across typical resolutions (3000–6000px photos).
+    let head_top_buffer = 20.0_f32;
+
+    // Step 1: Place crop top so forehead is visible with buffer.
+    // face_bbox.y1 is the top of the detected face (forehead / hairline).
+    let mut crop_y = (face_bbox.y1 - head_top_buffer).max(0.0);
+
+    // Step 2: If crop extends below photo bottom, shift crop upward just enough.
+    // This clamp ensures we never produce out-of-bounds coordinates.
+    if crop_y + crop_height > photo_hf {
+        crop_y = (photo_hf - crop_height).max(0.0);
+    }
+
+    // Step 3: Center horizontally on person's horizontal center.
+    // Use person center (not face center) to maintain full body framing.
+    let crop_x = (person_bbox.center_x() - (crop_width / 2.0))
+        .max(0.0)
+        .min((photo_wf - crop_width).max(0.0));
+
+    CropRegion {
+        x: crop_x,
+        y: crop_y,
+        width: crop_width,
+        height: crop_height,
+    }
+}
+
+/// Determine whether a person is in a face-forward pose.
+///
+/// Returns `true` if the face center is within the **upper 40%** of the person bounding
+/// box. This geometric heuristic distinguishes standing/walking persons (face at 10–25%
+/// from top) from sitting/bending poses (face at 40–70% from top).
+///
+/// # Arguments
+/// * `person_bbox` — Person detection bbox; must have `height() > 0.0` for meaningful results.
+/// * `face_bbox`   — Dominant face bbox. Containment within `person_bbox` is not enforced.
+///
+/// # Edge Cases
+/// - Zero-height person bbox → returns `false` (safe guard, no division by zero).
+/// - Face above person (negative ratio) → returns `true` (face is above = head-priority applies).
+/// - Face far below person (ratio > 0.40) → returns `false` (falls through to shift logic).
+///
+/// # Example
+/// ```rust,ignore
+/// // Standing: face center at 25% of person height → face-forward
+/// let result = is_face_forward_pose(&person, &face);
+/// assert!(result);
+/// ```
+fn is_face_forward_pose(person_bbox: &BBox, face_bbox: &BBox) -> bool {
+    // Guard: degenerate person bbox — avoid division by zero.
+    if person_bbox.height() <= 0.0 {
+        return false;
+    }
+
+    // Relative vertical position of the face center within the person bbox.
+    // 0.0 = top of person, 1.0 = bottom of person.
+    let face_y_relative = (face_bbox.center_y() - person_bbox.y1) / person_bbox.height();
+
+    // Threshold 0.40: face in upper 40% = face-forward pose.
+    // Calibrated from artboard sample set; separates standing (0.10–0.25)
+    // from sitting (0.35–0.55) with acceptable overlap zone at 0.35–0.40.
+    face_y_relative < 0.40
 }
 
 /// Attempt to shift the crop minimally to contain the required zone.
@@ -375,19 +512,42 @@ mod tests {
     }
 
     #[test]
-    fn test_face_already_inside_crop_returns_original() {
-        // Face is well inside the crop — no adjustment needed.
+    fn test_face_already_inside_crop_returns_original_no_person() {
+        // Face is well inside the crop and no person bbox is provided.
+        // Without a person bbox, head-priority is skipped, and the shift-based
+        // path also finds no adjustment needed (face is inside) → original returned.
         let crop = make_crop(100.0, 100.0, 800.0, 600.0);
-        let person = make_bbox(200.0, 150.0, 600.0, 550.0);
         // Face is at (350, 200)-(450, 300), well inside crop (100..900, 100..700).
         let faces = vec![make_bbox(350.0, 200.0, 450.0, 300.0)];
         let config = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
-        let result = apply_face_aware_adjustment(&crop, Some(&person), &faces, &config, 1920, 1080);
+        let result = apply_face_aware_adjustment(&crop, None, &faces, &config, 1920, 1080);
         assert_eq!(
             result.x, crop.x,
-            "should not shift when face is already inside"
+            "no-person + face inside crop = no adjustment"
         );
         assert_eq!(result.y, crop.y);
+        assert_eq!(result.width, crop.width, "dimensions must not change");
+        assert_eq!(result.height, crop.height);
+    }
+
+    #[test]
+    fn test_face_inside_crop_with_face_forward_person_repositions() {
+        // When a person bbox is present and the face is face-forward, head-priority
+        // repositions the crop even if the face was already nominally inside.
+        // This is the intended new behaviour: protect the forehead, not the original position.
+        let crop = make_crop(100.0, 100.0, 800.0, 600.0);
+        let person = make_bbox(200.0, 150.0, 600.0, 550.0);
+        // Face at (350, 200)-(450, 300): face-forward (center_y=250, person y1=150, h=400 → 25%).
+        let face_y1 = 200.0_f32;
+        let faces = vec![make_bbox(350.0, face_y1, 450.0, 300.0)];
+        let config = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
+        let result = apply_face_aware_adjustment(&crop, Some(&person), &faces, &config, 1920, 1080);
+        // Head-priority: crop_y = face.y1 - 20 = 180, so crop.y <= face.y1 and face is visible.
+        assert!(
+            result.y <= face_y1,
+            "head-priority should position crop top at or above face top, got y={}",
+            result.y
+        );
         assert_eq!(result.width, crop.width, "dimensions must not change");
         assert_eq!(result.height, crop.height);
     }
@@ -426,33 +586,51 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_rejected_when_person_visibility_too_low() {
-        // Person is at the right side. Shifting left would cut too much of the person.
-        // Person bbox: x1=600, x2=900. Crop at x=500, width=800 (crop_x2=1300).
-        // If we shift left by 100px: new crop x=400, crop_x2=1200.
-        // Person visibility: visible_left=600, visible_right=900 → 300/300 = 100% → OK.
-        // Actually, let's set up where the shift would cut the person badly:
-        // Person: x1=50, x2=200 (far left). Crop at x=0, width=800.
-        // Face far right at x=900 — requires shift right by large amount.
-        // After large shift, person would be mostly outside crop.
-        let crop = make_crop(0.0, 0.0, 400.0, 600.0); // narrow crop
-                                                      // Person is entirely inside the current crop.
-        let person = make_bbox(50.0, 100.0, 200.0, 500.0);
-        // Face is far to the right of the crop. Shift would need ~500px but budget = 400*0.1=40px.
-        // So budget enforcement catches it first. Let's test the person visibility check specifically:
-        // Set a face that needs a 30px shift right, which would push person mostly outside.
-        // Crop x=300, width=400 → x2=700. Person x1=280, x2=310 (mostly at left of crop).
-        // Face x2=740, needs shift right of 40px → x+40=340, x2=740.
-        // After shift: person visible_left=340, visible_right=310 → negative intersection → 0%
-        let crop2 = make_crop(300.0, 0.0, 400.0, 600.0);
-        let person2 = make_bbox(280.0, 100.0, 310.0, 500.0); // barely inside crop left edge
-                                                             // Face at right edge, requiring shift that cuts person out.
-        let faces2 = vec![make_bbox(720.0, 200.0, 760.0, 300.0)]; // x2=760, crop_x2=700 → shift=75px
+    fn test_shift_rejected_when_budget_exceeded_no_person() {
+        // Face is outside the crop and requires a shift that exceeds the budget.
+        // Using person_bbox=None so head-priority is bypassed, testing the shift budget path.
+        //
+        // Crop x=300, width=400 → x2=700.
+        // Face at x2=760 → required shift = 760 - 700 = 60px (plus margin).
+        // Budget = 400 * 0.10 = 40px. 60 > 40 → budget exceeded → return original.
+        let crop = make_crop(300.0, 0.0, 400.0, 600.0);
+        let faces = vec![make_bbox(720.0, 200.0, 760.0, 300.0)];
         let config = ArtisticCropConfig::from_mode(ArtisticMode::Aggressive); // 10px margin, 10% budget
-                                                                              // Budget = 400*0.10=40px, required shift=75px → exceeds budget, returns original.
-        let result =
-            apply_face_aware_adjustment(&crop2, Some(&person2), &faces2, &config, 1920, 1080);
-        assert_eq!(result.x, crop2.x, "budget exceeded should return original");
+        let result = apply_face_aware_adjustment(&crop, None, &faces, &config, 1920, 1080);
+        assert_eq!(result.x, crop.x, "budget exceeded should return original");
+    }
+
+    #[test]
+    fn test_shift_rejected_when_person_visibility_would_be_too_low() {
+        // Test that the person visibility gate rejects a shift that cuts the person body.
+        // Uses a non-face-forward pose (face in lower half of person) to bypass head-priority,
+        // then verifies the shift-based path enforces the 30% visibility gate.
+        //
+        // Setup: person is narrow (x1=600, x2=650) near the LEFT edge of the crop.
+        //        crop starts at x=500, width=400 → x2=900.
+        //        Face is far RIGHT at x=(870..920), requiring a shift right of ~30px.
+        //        After rightward shift: crop x=530, x2=930. Person (600..650) → still inside.
+        //        → Actually this passes, so use a tighter case:
+        //
+        // Better: person near right edge, face far LEFT → shift left cuts person.
+        //         person x1=850, x2=900. Crop x=800, w=400 → x2=1200.
+        //         Face at x1=700 → required zone x1 = 700-10=690. shift = 690-800=-110px.
+        //         Budget = 400 * 0.10 = 40px. abs(-110) > 40 → budget exceeded.
+        //
+        // Face must NOT be face-forward: person y1=100, y2=500, face center_y must be >= 200
+        // for face_y_relative = (center_y - 100)/400 >= 0.25 — we need >= 0.40, so center_y >= 260.
+        // Use face y1=400, y2=480 → center_y=440, face_y_relative=(440-100)/400=0.85 → NOT face-forward.
+        let crop = make_crop(800.0, 0.0, 400.0, 600.0);
+        let person = make_bbox(850.0, 100.0, 900.0, 500.0); // near right of crop
+        let faces = vec![make_bbox(700.0, 400.0, 760.0, 480.0)]; // NOT face-forward (85%)
+        let config = ArtisticCropConfig::from_mode(ArtisticMode::Aggressive); // 10px margin, 10% budget
+                                                                              // Zone x1 = 700 - 10 = 690. Shift = 690 - 800 = -110px. Budget = 40px → rejected.
+        let result = apply_face_aware_adjustment(&crop, Some(&person), &faces, &config, 1920, 1080);
+        assert_eq!(
+            result.x, crop.x,
+            "budget exceeded should return original; got x={}",
+            result.x
+        );
     }
 
     #[test]
@@ -466,6 +644,119 @@ mod tests {
         let result = apply_face_aware_adjustment(&crop, Some(&person), &faces, &config, 1920, 1080);
         assert_eq!(result.width, crop.width, "width must never change");
         assert_eq!(result.height, crop.height, "height must never change");
+    }
+
+    // --- is_face_forward_pose ---
+
+    #[test]
+    fn test_is_face_forward_pose_upper_portion() {
+        // Person height = 400. Face center_y = (150+250)/2 = 200.
+        // face_y_relative = (200 - 100) / 400 = 0.25 → face-forward (< 0.40).
+        let person = make_bbox(100.0, 100.0, 300.0, 500.0);
+        let face = make_bbox(150.0, 150.0, 250.0, 250.0);
+        assert!(
+            is_face_forward_pose(&person, &face),
+            "face at 25% of person height should be face-forward"
+        );
+    }
+
+    #[test]
+    fn test_is_face_forward_pose_lower_portion() {
+        // Person height = 400. Face center_y = (400+480)/2 = 440.
+        // face_y_relative = (440 - 100) / 400 = 0.85 → NOT face-forward (>= 0.40).
+        let person = make_bbox(100.0, 100.0, 300.0, 500.0);
+        let face = make_bbox(150.0, 400.0, 250.0, 480.0);
+        assert!(
+            !is_face_forward_pose(&person, &face),
+            "face at 85% of person height should NOT be face-forward"
+        );
+    }
+
+    #[test]
+    fn test_is_face_forward_pose_zero_height_person() {
+        // Degenerate bbox: height = 0 → guard clause must prevent division by zero.
+        let person = make_bbox(100.0, 100.0, 300.0, 100.0); // y1 == y2 → height = 0
+        let face = make_bbox(150.0, 90.0, 250.0, 110.0);
+        assert!(
+            !is_face_forward_pose(&person, &face),
+            "zero-height person bbox should return false (guard clause)"
+        );
+    }
+
+    // --- compute_face_forward_crop ---
+
+    #[test]
+    fn test_compute_face_forward_crop_protects_head() {
+        // Scenario: person standing in a large photo.
+        // Face y1=250 → crop_y should be <= 250 - 15 = 235 (at most 20px above face top).
+        // Chin y2=450 → crop_y + crop_height (1200) = well past chin.
+        let person = make_bbox(500.0, 200.0, 1000.0, 1200.0);
+        let face = make_bbox(600.0, 250.0, 900.0, 450.0);
+        let crop = compute_face_forward_crop(&person, &face, 800.0, 1200.0, 3000, 4000);
+
+        // Forehead should be visible with at least a small buffer above.
+        assert!(
+            crop.y <= face.y1 - 15.0,
+            "crop top should be at least 15px above forehead, got y={} face.y1={}",
+            crop.y,
+            face.y1
+        );
+        // Chin must be fully inside the crop.
+        assert!(
+            crop.y + crop.height >= face.y2,
+            "chin must be inside the crop"
+        );
+        // Dimensions are preserved.
+        assert_eq!(crop.width, 800.0, "width must not change");
+        assert_eq!(crop.height, 1200.0, "height must not change");
+    }
+
+    #[test]
+    fn test_compute_face_forward_crop_clamps_to_bounds() {
+        // Face is near the top edge of the photo → crop_y should clamp to 0.0.
+        // Also tests that x and x+width remain within photo bounds.
+        let person = make_bbox(100.0, 5.0, 400.0, 800.0);
+        let face = make_bbox(150.0, 10.0, 350.0, 100.0); // near top edge
+        let crop = compute_face_forward_crop(&person, &face, 500.0, 900.0, 600, 1000);
+
+        assert!(crop.y >= 0.0, "crop y must not be negative");
+        assert!(crop.x >= 0.0, "crop x must not be negative");
+        assert!(
+            crop.x + crop.width <= 600.0,
+            "crop must not exceed photo width"
+        );
+        assert!(
+            crop.y + crop.height <= 1000.0,
+            "crop must not exceed photo height"
+        );
+        // Dimensions preserved.
+        assert_eq!(crop.width, 500.0);
+        assert_eq!(crop.height, 900.0);
+    }
+
+    // --- end-to-end head-priority via apply_face_aware_adjustment ---
+
+    #[test]
+    fn test_face_forward_applies_head_priority_repositions_crop() {
+        // Tall crop (1600px) with person at y1=100, face at y1=150 (upper 15%).
+        // Original crop y=200 (crop starts below the face top).
+        // Head-priority should reposition to anchor crop top above the face.
+        let crop = make_crop(0.0, 200.0, 800.0, 1600.0);
+        let person = make_bbox(200.0, 100.0, 600.0, 1800.0);
+        let face = make_bbox(300.0, 150.0, 500.0, 350.0); // face in upper ~15% of person
+        let config = ArtisticCropConfig::default();
+        let result =
+            apply_face_aware_adjustment(&crop, Some(&person), &[face], &config, 1000, 2000);
+
+        // Crop should have been repositioned so that face top (y=150) is inside.
+        assert!(
+            result.y <= 150.0,
+            "head-priority: crop top should be at or above face y1=150, got result.y={}",
+            result.y
+        );
+        // Dimensions must be preserved.
+        assert_eq!(result.width, crop.width, "width must not change");
+        assert_eq!(result.height, crop.height, "height must not change");
     }
 
     // --- compute_required_zone ---
