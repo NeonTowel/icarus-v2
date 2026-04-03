@@ -286,6 +286,67 @@ pub struct ArtisticCropConfig {
     /// - Aggressive   → 10 px
     #[serde(default = "default_face_safety_margin_px")]
     pub face_safety_margin_px: u32,
+
+    // ===== PHASE 3: Aspect-ratio-specific breathing room =====
+    /// Breathing room above forehead for mobile (9:21) crops.
+    ///
+    /// Expressed as a percentage of crop height. A value of 12.5 means
+    /// 12.5% of the crop height is reserved as empty space above the
+    /// forehead. Tight by design: mobile frames are tall, so headroom
+    /// competes with body visibility.
+    ///
+    /// Valid range: 10.0..=15.0. Default: 12.5.
+    #[serde(default = "default_breathing_room_mobile")]
+    pub breathing_room_percent_mobile: f32,
+
+    /// Breathing room above forehead for portrait (9:16) crops.
+    ///
+    /// Balanced between head comfort and body visibility.
+    ///
+    /// Valid range: 15.0..=25.0. Default: 20.0.
+    #[serde(default = "default_breathing_room_portrait")]
+    pub breathing_room_percent_portrait: f32,
+
+    /// Breathing room above forehead for landscape (21:9) crops.
+    ///
+    /// Generous: landscape frames are wide and short, so head breathing
+    /// room improves the visual weight above the subject.
+    ///
+    /// Valid range: 20.0..=30.0. Default: 25.0.
+    #[serde(default = "default_breathing_room_landscape")]
+    pub breathing_room_percent_landscape: f32,
+
+    // ===== PHASE 3: Aspect-ratio-specific face bbox penetration =====
+    /// Max percentage of face bbox height the crop edge may penetrate (mobile).
+    ///
+    /// "Penetration" is how far the crop top edge is allowed to cut into
+    /// the face bounding box from above (forehead zone only). The protected
+    /// eye zone (30–65% of face height) is always preserved regardless of
+    /// this value.
+    ///
+    /// Mobile gets the highest penetration to show maximum body below the
+    /// face in the tall 9:21 frame.
+    ///
+    /// Valid range: 15.0..=20.0. Default: 18.0.
+    #[serde(default = "default_penetration_mobile")]
+    pub max_face_bbox_penetration_percent_mobile: f32,
+
+    /// Max face bbox penetration for portrait (9:16) crops.
+    ///
+    /// Moderate: balanced body visibility vs. comfortable head framing.
+    ///
+    /// Valid range: 12.0..=15.0. Default: 14.0.
+    #[serde(default = "default_penetration_portrait")]
+    pub max_face_bbox_penetration_percent_portrait: f32,
+
+    /// Max face bbox penetration for landscape (21:9) crops.
+    ///
+    /// Conservative: landscape frames show torso + arms by horizontal
+    /// extension; minimal vertical penetration is appropriate.
+    ///
+    /// Valid range: 10.0..=12.0. Default: 11.0.
+    #[serde(default = "default_penetration_landscape")]
+    pub max_face_bbox_penetration_percent_landscape: f32,
 }
 
 fn default_max_shift_fraction() -> f32 {
@@ -294,6 +355,30 @@ fn default_max_shift_fraction() -> f32 {
 
 fn default_face_safety_margin_px() -> u32 {
     15 // Balanced default
+}
+
+fn default_breathing_room_mobile() -> f32 {
+    12.5
+}
+
+fn default_breathing_room_portrait() -> f32 {
+    20.0
+}
+
+fn default_breathing_room_landscape() -> f32 {
+    25.0
+}
+
+fn default_penetration_mobile() -> f32 {
+    18.0
+}
+
+fn default_penetration_portrait() -> f32 {
+    14.0
+}
+
+fn default_penetration_landscape() -> f32 {
+    11.0
 }
 
 impl Default for ArtisticCropConfig {
@@ -327,6 +412,14 @@ impl ArtisticCropConfig {
             artistic_mode: mode,
             max_shift_fraction: 0.10,
             face_safety_margin_px: margin,
+            // Phase 3 defaults are mode-independent: per-aspect-ratio
+            // differentiation replaces mode-based differentiation here.
+            breathing_room_percent_mobile: 12.5,
+            breathing_room_percent_portrait: 20.0,
+            breathing_room_percent_landscape: 25.0,
+            max_face_bbox_penetration_percent_mobile: 18.0,
+            max_face_bbox_penetration_percent_portrait: 14.0,
+            max_face_bbox_penetration_percent_landscape: 11.0,
         }
     }
 }
@@ -383,6 +476,44 @@ mod tests {
             ArtisticMode::Aggressive
         );
         assert!("unknown".parse::<ArtisticMode>().is_err());
+    }
+
+    #[test]
+    fn test_phase3_defaults_present() {
+        // Phase 3 fields must be present with the approved default values
+        // regardless of whether the config is constructed via default() or
+        // from_mode().
+        let config = ArtisticCropConfig::default();
+        assert!(
+            (config.breathing_room_percent_mobile - 12.5).abs() < 0.01,
+            "mobile breathing room default should be 12.5, got {}",
+            config.breathing_room_percent_mobile
+        );
+        assert!(
+            (config.breathing_room_percent_portrait - 20.0).abs() < 0.01,
+            "portrait breathing room default should be 20.0, got {}",
+            config.breathing_room_percent_portrait
+        );
+        assert!(
+            (config.breathing_room_percent_landscape - 25.0).abs() < 0.01,
+            "landscape breathing room default should be 25.0, got {}",
+            config.breathing_room_percent_landscape
+        );
+        assert!(
+            (config.max_face_bbox_penetration_percent_mobile - 18.0).abs() < 0.01,
+            "mobile penetration default should be 18.0, got {}",
+            config.max_face_bbox_penetration_percent_mobile
+        );
+        assert!(
+            (config.max_face_bbox_penetration_percent_portrait - 14.0).abs() < 0.01,
+            "portrait penetration default should be 14.0, got {}",
+            config.max_face_bbox_penetration_percent_portrait
+        );
+        assert!(
+            (config.max_face_bbox_penetration_percent_landscape - 11.0).abs() < 0.01,
+            "landscape penetration default should be 11.0, got {}",
+            config.max_face_bbox_penetration_percent_landscape
+        );
     }
 }
 

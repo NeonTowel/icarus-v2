@@ -4,6 +4,16 @@
 /// crop region (produced by the original person-bbox algorithm in
 /// [`crate::multi_format_cropping`]) to ensure the dominant face is fully visible.
 ///
+/// # Phases
+///
+/// - **Phase 1** (head-priority): For face-forward poses, anchors the crop top
+///   just above the detected forehead using a fixed 20px buffer.
+/// - **Phase 2** (dynamic margin): Scales the face safety margin when the face
+///   is close to a crop edge; uses a minimal-shift strategy.
+/// - **Phase 3** (aspect-ratio-aware): Replaces the fixed Phase 1 buffer with
+///   per-aspect breathing room and face-bbox penetration tolerance, yielding
+///   better body visibility (mobile: knees; portrait: waist; landscape: torso).
+///
 /// # Design Principles
 ///
 /// - **Additive, not primary.** The original crop algorithm is the authority on
@@ -42,17 +52,375 @@ use crate::config::ArtisticCropConfig;
 use crate::multi_format_cropping::{person_is_reasonably_visible_threshold, BBox, CropRegion};
 
 // ---------------------------------------------------------------------------
+// Phase 3: Aspect-ratio types and helpers
+// ---------------------------------------------------------------------------
+
+/// Target aspect ratio category for crop-specific Phase 3 behaviour.
+///
+/// Used to select breathing room and face penetration tolerance values from
+/// [`ArtisticCropConfig`]. The variant is determined from crop dimensions via
+/// [`determine_aspect_ratio`], not from format-name strings.
+///
+/// # Variants
+/// - `Mobile`   — 9:21 (≈0.4286 ratio). Tall, narrow; maximise body visibility.
+/// - `Portrait` — 9:16 (≈0.5625 ratio). Balanced; classic portrait composition.
+/// - `Landscape`— 21:9 (≈2.333 ratio). Wide, short; shoulders + context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AspectRatio {
+    /// Mobile vertical: 9:21. Crop tall and narrow; show body to knees.
+    Mobile,
+    /// Portrait standard: 9:16. Balanced composition; show body to waist.
+    Portrait,
+    /// Landscape: 21:9. Wide frame; show shoulders, arms, and context.
+    Landscape,
+}
+
+/// Isolation level of a detected face relative to the crop edges.
+///
+/// Drives the aggressiveness of the Phase 3 body-showing strategy.
+/// "Isolated" means the face bbox has comfortable clearance from all
+/// four crop edges; "constrained" means one or more edges are too close.
+///
+/// See [`assess_face_isolation`] for the classification algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceIsolation {
+    /// Face is ≥ `edge_margin` from ALL four crop edges.
+    /// Strategy: aggressive body showing at 100% of max penetration.
+    FullyIsolated,
+    /// Face is within `edge_margin` of exactly ONE crop edge.
+    /// Strategy: moderate body showing at 70% of max penetration.
+    ModerateConstraint,
+    /// Face is within `edge_margin` of TWO or more crop edges.
+    /// Strategy: conservative body showing at 40% of max penetration.
+    EdgeConstraint,
+}
+
+/// Determine the aspect ratio category from crop dimensions.
+///
+/// Uses width/height ratio with tolerance bands wide enough to handle
+/// floating-point imprecision in crop dimension calculations:
+///
+/// | Ratio range | Variant   | Example format |
+/// |-------------|-----------|----------------|
+/// | ≤ 0.50      | Mobile    | 9:21 (0.4286)  |
+/// | 0.50–0.65   | Portrait  | 9:16 (0.5625)  |
+/// | > 0.65      | Landscape | 21:9 (2.333)   |
+///
+/// # Arguments
+/// * `crop_width`  — Width of the crop region in pixels.
+/// * `crop_height` — Height of the crop region in pixels.
+///
+/// # Returns
+/// Always returns a valid [`AspectRatio`] variant. For degenerate inputs
+/// (zero or negative height), returns `Landscape` as a safe default.
+///
+/// # Example
+/// ```rust,ignore
+/// assert_eq!(determine_aspect_ratio(900.0, 2100.0), AspectRatio::Mobile);
+/// assert_eq!(determine_aspect_ratio(900.0, 1600.0), AspectRatio::Portrait);
+/// assert_eq!(determine_aspect_ratio(2100.0, 900.0), AspectRatio::Landscape);
+/// ```
+pub fn determine_aspect_ratio(crop_width: f32, crop_height: f32) -> AspectRatio {
+    if crop_height <= 0.0 {
+        // Degenerate input: return a safe default rather than panic on division.
+        return AspectRatio::Landscape;
+    }
+    let ratio = crop_width / crop_height;
+    if ratio <= 0.50 {
+        AspectRatio::Mobile // 9:21 = 0.4286
+    } else if ratio <= 0.65 {
+        AspectRatio::Portrait // 9:16 = 0.5625
+    } else {
+        AspectRatio::Landscape // 21:9 = 2.333 and anything wider
+    }
+}
+
+/// Return the breathing-room percentage for the given aspect ratio.
+///
+/// "Breathing room" is the vertical space between the top of the person's
+/// head and the top edge of the crop, expressed as a percentage of crop
+/// height. Higher values give the subject more air above the forehead.
+///
+/// # Arguments
+/// * `aspect` — Target aspect ratio category.
+/// * `config` — Artistic crop config containing per-aspect values.
+///
+/// # Returns
+/// A percentage value (e.g. `12.5` means 12.5% of crop height).
+///
+/// # Example
+/// ```rust,ignore
+/// let config = ArtisticCropConfig::default();
+/// let br = get_breathing_room_for_aspect(AspectRatio::Mobile, &config);
+/// assert!((br - 12.5).abs() < 0.01);
+/// ```
+pub fn get_breathing_room_for_aspect(aspect: AspectRatio, config: &ArtisticCropConfig) -> f32 {
+    match aspect {
+        AspectRatio::Mobile => config.breathing_room_percent_mobile,
+        AspectRatio::Portrait => config.breathing_room_percent_portrait,
+        AspectRatio::Landscape => config.breathing_room_percent_landscape,
+    }
+}
+
+/// Return the max face-bbox penetration percentage for the given aspect ratio.
+///
+/// "Penetration" is how far (as a percentage of face bbox height) the crop
+/// edge is allowed to cut into the face bounding box from above (forehead
+/// zone). The protected zone — eyes, nose, mouth (30–65% of face height from
+/// the top) — must NEVER be penetrated regardless of this value.
+///
+/// # Arguments
+/// * `aspect` — Target aspect ratio category.
+/// * `config` — Artistic crop config containing per-aspect values.
+///
+/// # Returns
+/// A percentage value (e.g. `18.0` means up to 18% of face height).
+///
+/// # Example
+/// ```rust,ignore
+/// let config = ArtisticCropConfig::default();
+/// let pen = get_max_penetration_for_aspect(AspectRatio::Mobile, &config);
+/// assert!((pen - 18.0).abs() < 0.01);
+/// ```
+pub fn get_max_penetration_for_aspect(aspect: AspectRatio, config: &ArtisticCropConfig) -> f32 {
+    match aspect {
+        AspectRatio::Mobile => config.max_face_bbox_penetration_percent_mobile,
+        AspectRatio::Portrait => config.max_face_bbox_penetration_percent_portrait,
+        AspectRatio::Landscape => config.max_face_bbox_penetration_percent_landscape,
+    }
+}
+
+/// Assess how constrained a face is relative to the crop edges.
+///
+/// A face is "isolated" when it has comfortable clearance from all crop edges.
+/// The clearance threshold is `edge_margin_frac` (a fraction, e.g. `0.05` for 5%)
+/// multiplied by the crop width (for left/right edges) or height (for top/bottom).
+///
+/// Faces partially or fully outside the crop are treated as near-edge contacts
+/// because the overflowing edge coordinate naturally satisfies the `<` or `>`
+/// inequalities in the margin check.
+///
+/// # Arguments
+/// * `face_bbox`        — Detected face bounding box.
+/// * `crop`             — Current crop region.
+/// * `edge_margin_frac` — Fraction of crop dimension considered "near edge".
+///   Default value used by Phase 3: `0.05` (5%).
+///
+/// # Returns
+/// A [`FaceIsolation`] variant indicating the constraint level:
+/// - 0 near edges → [`FaceIsolation::FullyIsolated`]
+/// - 1 near edge  → [`FaceIsolation::ModerateConstraint`]
+/// - 2+ near edges→ [`FaceIsolation::EdgeConstraint`]
+///
+/// # Edge Cases
+/// - Zero-size crop: both width and height margins are 0; all four conditions
+///   likely true → [`FaceIsolation::EdgeConstraint`].
+/// - Face filling the entire crop: all four edges are "near" → `EdgeConstraint`.
+pub fn assess_face_isolation(
+    face_bbox: &BBox,
+    crop: &CropRegion,
+    edge_margin_frac: f32,
+) -> FaceIsolation {
+    let margin_x = crop.width * edge_margin_frac;
+    let margin_y = crop.height * edge_margin_frac;
+
+    let crop_left = crop.x;
+    let crop_right = crop.x + crop.width;
+    let crop_top = crop.y;
+    let crop_bottom = crop.y + crop.height;
+
+    // Count how many crop edges the face bbox is "near" (within margin),
+    // including cases where the face overflows past the crop edge.
+    let mut near_edge_count: u8 = 0;
+
+    if face_bbox.x1 < crop_left + margin_x {
+        near_edge_count += 1; // near or past left edge
+    }
+    if face_bbox.x2 > crop_right - margin_x {
+        near_edge_count += 1; // near or past right edge
+    }
+    if face_bbox.y1 < crop_top + margin_y {
+        near_edge_count += 1; // near or past top edge
+    }
+    if face_bbox.y2 > crop_bottom - margin_y {
+        near_edge_count += 1; // near or past bottom edge
+    }
+
+    match near_edge_count {
+        0 => FaceIsolation::FullyIsolated,
+        1 => FaceIsolation::ModerateConstraint,
+        _ => FaceIsolation::EdgeConstraint,
+    }
+}
+
+/// Apply aspect-ratio-aware face cropping adjustments (Phase 3).
+///
+/// This is the Phase 3 decision tree. It takes the full person bbox, the
+/// detected face bbox, the target crop from the base algorithm, and the
+/// aspect-ratio-specific config to produce an adjusted crop that balances
+/// head breathing room with body visibility.
+///
+/// # Decision Tree
+///
+/// 1. If `face_bbox` is `None`: return `target_crop` unchanged (fallback to
+///    the original 40% headroom algorithm from the base pass).
+/// 2. Determine aspect ratio from crop dimensions.
+/// 3. Look up breathing room and penetration tolerance per aspect.
+/// 4. Assess face isolation level ([`assess_face_isolation`]).
+/// 5. Apply isolation-dependent penetration scaling:
+///    - [`FaceIsolation::FullyIsolated`]      → 100% of max penetration
+///    - [`FaceIsolation::ModerateConstraint`] → 70% of max penetration
+///    - [`FaceIsolation::EdgeConstraint`]     → 40% of max penetration
+/// 6. Compute adjusted crop `y` with breathing room and penetration limits.
+/// 7. Validate eye safety: the protected zone (30–65% of face height from
+///    the top) must be fully inside the returned crop.
+/// 8. Clamp all coordinates to image bounds.
+///
+/// # Guarantees
+/// - Always returns a valid `CropRegion` (never panics).
+/// - Crop dimensions (width, height) are always preserved exactly.
+/// - Eyes are always preserved: if the protected zone would be clipped,
+///   falls back to returning `target_crop` unchanged.
+///
+/// # Arguments
+/// * `person_bbox`   — Full person bounding box (for horizontal centering).
+/// * `face_bbox`     — Optional face bounding box. `None` → returns `target_crop`.
+/// * `target_crop`   — Crop region from the base algorithm.
+/// * `config`        — Artistic crop config with Phase 3 fields.
+/// * `image_width`   — Source image width in pixels.
+/// * `image_height`  — Source image height in pixels.
+///
+/// # Example
+/// ```rust,ignore
+/// let result = apply_aspect_aware_face_cropping(
+///     &person, Some(&face), &crop, &config, 3024, 4032,
+/// );
+/// assert_eq!(result.width, crop.width);  // dimensions never change
+/// ```
+pub fn apply_aspect_aware_face_cropping(
+    person_bbox: &BBox,
+    face_bbox: Option<&BBox>,
+    target_crop: &CropRegion,
+    config: &ArtisticCropConfig,
+    image_width: u32,
+    image_height: u32,
+) -> CropRegion {
+    // Step 0: No face → return original crop (Phase 1-2 fallback).
+    let face = match face_bbox {
+        Some(f) => f,
+        None => return target_crop.clone(),
+    };
+
+    // Step 1: Determine aspect ratio from crop dimensions.
+    let aspect = determine_aspect_ratio(target_crop.width, target_crop.height);
+
+    // Step 2: Look up aspect-specific parameters.
+    let breathing_room_pct = get_breathing_room_for_aspect(aspect, config);
+    let max_penetration_pct = get_max_penetration_for_aspect(aspect, config);
+
+    // Step 3: Assess face isolation.
+    let isolation = assess_face_isolation(face, target_crop, 0.05);
+
+    // Step 4: Scale penetration by isolation level.
+    let effective_penetration_pct = match isolation {
+        FaceIsolation::FullyIsolated => max_penetration_pct,
+        FaceIsolation::ModerateConstraint => max_penetration_pct * 0.7,
+        FaceIsolation::EdgeConstraint => max_penetration_pct * 0.4,
+    };
+
+    // Step 5: Convert percentages to pixels.
+    // max_penetration_px: how far the crop top may enter the face bbox from above.
+    let face_height = face.height();
+    let max_penetration_px = face_height * (effective_penetration_pct / 100.0);
+
+    // breathing_room_px: empty space to leave above the forehead.
+    let breathing_room_px = target_crop.height * (breathing_room_pct / 100.0);
+
+    // Step 6: Eye safety limits.
+    // Protected zone: 30–65% of face height from the top.
+    // The crop top must be at or above the protected zone's top boundary.
+    // We add a 15px absolute safety buffer to guard against subpixel rounding.
+    let eye_safety_px = 15.0_f32;
+    let eye_zone_top = face.y1 + (0.30 * face_height);
+    let crop_y_eye_limit = eye_zone_top - eye_safety_px;
+
+    // The penetration limit: how far down the crop top may sit.
+    let crop_y_penetration_limit = face.y1 + max_penetration_px;
+
+    // The effective upper bound for crop_y is the more conservative of the two.
+    let crop_y_max = crop_y_penetration_limit.min(crop_y_eye_limit);
+
+    // Step 7: Ideal crop_y with full breathing room above the forehead.
+    let crop_y_ideal = face.y1 - breathing_room_px;
+
+    // Clamp to non-negative (face near top of image).
+    let mut crop_y = crop_y_ideal.max(0.0);
+
+    // Step 8: Shift crop down to show more body when possible.
+    // "More body" means a larger crop_y (crop frame starts lower in the image).
+    // We push crop_y down by however much body overflows below the current frame,
+    // but never past crop_y_max (which protects the eyes and forehead zone).
+    let person_bottom = person_bbox.y2;
+    let current_crop_bottom = crop_y + target_crop.height;
+    let body_overflow = person_bottom - current_crop_bottom;
+
+    if body_overflow > 0.0 {
+        let shift_down = body_overflow.min((crop_y_max - crop_y).max(0.0));
+        crop_y += shift_down;
+    }
+
+    // Step 9: Clamp crop_y to image bounds.
+    let photo_hf = image_height as f32;
+    let photo_wf = image_width as f32;
+    if crop_y + target_crop.height > photo_hf {
+        crop_y = (photo_hf - target_crop.height).max(0.0);
+    }
+    crop_y = crop_y.max(0.0);
+
+    // Step 10: Final eye safety check.
+    // After all adjustments, verify that the protected zone (30–65% of face height)
+    // is fully inside the crop. If not, fall back to the original crop.
+    let protected_top = face.y1 + 0.30 * face_height;
+    let protected_bottom = face.y1 + 0.65 * face_height;
+    let final_crop_top = crop_y;
+    let final_crop_bottom = crop_y + target_crop.height;
+
+    if protected_top < final_crop_top || protected_bottom > final_crop_bottom {
+        // Eye safety violated — fall back to original crop unchanged.
+        return target_crop.clone();
+    }
+
+    // Step 11: Horizontal positioning.
+    // Center on person's horizontal center (same as Phase 1 strategy).
+    let crop_x = (person_bbox.center_x() - target_crop.width / 2.0)
+        .max(0.0)
+        .min((photo_wf - target_crop.width).max(0.0));
+
+    CropRegion {
+        x: crop_x,
+        y: crop_y,
+        width: target_crop.width,
+        height: target_crop.height,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Apply face-aware adjustment to an already-computed crop region.
 ///
-/// This is the primary entry point. It:
-/// 1. Selects the dominant face (closest centroid to image center).
-/// 2. Checks if the face (plus safety margin) is already inside the crop.
-/// 3. If not, computes the minimal shift needed.
-/// 4. Enforces the shift budget from `config.max_shift_fraction`.
-/// 5. Validates that the person bbox is not excessively cut off (if provided).
+/// This is the primary entry point. It orchestrates all three phases:
+/// 1. **Phase 3** (aspect-ratio-aware): For face-forward poses, adjusts crop
+///    position using per-aspect breathing room and face penetration tolerance.
+/// 2. **Phase 1** (head-priority fallback): If Phase 3 is rejected by the
+///    person visibility gate, tries the fixed 20px head-buffer strategy.
+/// 3. **Phase 2** (dynamic margin + shift): Scales the safety margin near
+///    edges and applies a minimal crop shift within the shift budget.
+///
+/// For each phase, a 30% person visibility gate decides whether the result is
+/// acceptable. The first phase that passes is returned; if all fail, the
+/// original crop is returned unchanged.
 ///
 /// # Guarantees
 /// - Always returns a valid `CropRegion` (never panics, never returns `None`).
@@ -98,19 +466,41 @@ pub fn apply_face_aware_adjustment(
         return crop.clone();
     }
 
-    // ── NEW: Head-priority routing ────────────────────────────────────────────
+    // ── Phase 3 → Phase 1 head-priority routing ──────────────────────────────
     // Activates only when:
     //   1. A person bbox is available (Some, not None)
     //   2. The person is in a face-forward pose (face in upper 40% of person bbox)
     //   3. The repositioned crop still keeps the person adequately visible (≥ 30%)
     //
-    // For face-forward poses the upstream 40% headroom algorithm sometimes clips
-    // feet while leaving too much space below the head (e.g. artboard_01 9:21).
-    // Head-priority anchors the crop top to the forehead instead, accepting that
-    // feet may be outside the frame.
+    // Phase 3 replaces the fixed 20px head buffer of Phase 1 with per-aspect
+    // breathing room and face penetration tolerance, yielding better body
+    // visibility for mobile crops without sacrificing forehead framing.
+    // If Phase 3 is rejected by the visibility gate, Phase 1 is tried next.
     if let Some(person) = person_bbox {
         if is_face_forward_pose(person, dominant_face) {
-            let new_crop = compute_face_forward_crop(
+            // ── Phase 3: aspect-ratio-aware crop ──────────────────────────────
+            let phase3_crop = apply_aspect_aware_face_cropping(
+                person,
+                Some(dominant_face),
+                crop,
+                config,
+                image_width,
+                image_height,
+            );
+            // Visibility gate: person must remain at least 30% visible.
+            if person_is_reasonably_visible_threshold(
+                person,
+                &phase3_crop,
+                0.30,
+                image_width,
+                image_height,
+            ) {
+                return phase3_crop;
+            }
+
+            // ── Phase 1 fallback: fixed 20px head buffer ───────────────────
+            // Phase 3 was too aggressive. Try the simpler Phase 1 strategy.
+            let phase1_crop = compute_face_forward_crop(
                 person,
                 dominant_face,
                 crop.width,
@@ -118,21 +508,19 @@ pub fn apply_face_aware_adjustment(
                 image_width,
                 image_height,
             );
-            // Visibility gate: person must remain at least 30% visible.
-            // If the repositioned crop cuts the body too aggressively, fall through
-            // to the original shift-based logic which may produce a better result.
             if person_is_reasonably_visible_threshold(
                 person,
-                &new_crop,
+                &phase1_crop,
                 0.30,
                 image_width,
                 image_height,
             ) {
-                return new_crop;
+                return phase1_crop;
             }
+            // Both Phase 3 and Phase 1 rejected: fall through to Phase 2.
         }
     }
-    // ── END HEAD-PRIORITY ─────────────────────────────────────────────────────
+    // ── END HEAD-PRIORITY (Phase 3 + Phase 1 fallback) ────────────────────────
 
     // ── PHASE 2: Dynamic margin ───────────────────────────────────────────────
     // Scale the safety margin up when the face is within 5% of the crop edge.
@@ -510,6 +898,408 @@ mod tests {
         BBox { x1, y1, x2, y2 }
     }
 
+    // =========================================================================
+    // Phase 3 test fixtures
+    // =========================================================================
+
+    // Simulates a 3024×4032 portrait photo (common smartphone resolution).
+    const PHOTO_W: u32 = 3024;
+    const PHOTO_H: u32 = 4032;
+
+    /// Standing person: face near the top, body extending to near the bottom.
+    fn standing_person() -> BBox {
+        make_bbox(1000.0, 200.0, 2000.0, 3800.0)
+    }
+
+    /// Face for standing_person: upper portion of the frame.
+    fn standing_face() -> BBox {
+        make_bbox(1200.0, 300.0, 1800.0, 700.0)
+    }
+
+    /// 9:21 mobile crop dimensions derived from PHOTO_W/PHOTO_H.
+    ///
+    /// crop_width = PHOTO_H * (9/21) ~= 1728; crop_height = PHOTO_H = 4032.
+    fn mobile_crop() -> CropRegion {
+        make_crop(648.0, 0.0, 1728.0, 4032.0)
+    }
+
+    /// 9:16 portrait crop dimensions derived from PHOTO_H.
+    ///
+    /// crop_height = PHOTO_H = 4032; crop_width = 4032 * (9/16) = 2268.
+    fn portrait_crop() -> CropRegion {
+        make_crop(378.0, 0.0, 2268.0, 4032.0)
+    }
+
+    /// 21:9 landscape crop dimensions derived from PHOTO_W.
+    ///
+    /// crop_width = PHOTO_W = 3024; crop_height = 3024 / (21/9) ~= 1296.
+    fn landscape_crop() -> CropRegion {
+        make_crop(0.0, 500.0, 3024.0, 1296.0)
+    }
+
+    // =========================================================================
+    // Phase 3 unit tests
+    // =========================================================================
+
+    /// Verify that determine_aspect_ratio classifies standard formats correctly.
+    #[test]
+    fn test_determine_aspect_ratio_classification() {
+        // 9:21 mobile — ratio 900/2100 ≈ 0.4286
+        assert_eq!(
+            determine_aspect_ratio(900.0, 2100.0),
+            AspectRatio::Mobile,
+            "9:21 should be Mobile"
+        );
+        // 9:16 portrait — ratio 900/1600 = 0.5625
+        assert_eq!(
+            determine_aspect_ratio(900.0, 1600.0),
+            AspectRatio::Portrait,
+            "9:16 should be Portrait"
+        );
+        // 21:9 landscape — ratio 2100/900 ≈ 2.333
+        assert_eq!(
+            determine_aspect_ratio(2100.0, 900.0),
+            AspectRatio::Landscape,
+            "21:9 should be Landscape"
+        );
+        // Degenerate zero-size crop — safe default is Landscape
+        assert_eq!(
+            determine_aspect_ratio(0.0, 0.0),
+            AspectRatio::Landscape,
+            "degenerate (0,0) should return Landscape"
+        );
+    }
+
+    /// Mobile 9:21 with face centered and isolated.
+    ///
+    /// Phase 3 should use 12.5% breathing room and 18% penetration.
+    /// The crop should show more body than Phase 1 (which uses 20px).
+    #[test]
+    fn test_mobile_fully_isolated_face() {
+        let person = standing_person();
+        let face = standing_face(); // y1=300, y2=700, height=400
+        let crop = mobile_crop(); // width=1728, height=4032
+        let config = ArtisticCropConfig::default();
+
+        let result = apply_aspect_aware_face_cropping(
+            &person,
+            Some(&face),
+            &crop,
+            &config,
+            PHOTO_W,
+            PHOTO_H,
+        );
+
+        // Protected zone for this face: 300 + 0.30*400 = 420 to 300 + 0.65*400 = 560.
+        let protected_top = 300.0 + 0.30 * 400.0; // 420
+        let protected_bottom = 300.0 + 0.65 * 400.0; // 560
+
+        assert!(result.y >= 0.0, "crop_y must not be negative");
+        assert!(
+            result.y <= protected_top,
+            "eyes top ({}) must be below crop top ({})",
+            protected_top,
+            result.y
+        );
+        assert!(
+            result.y + result.height >= protected_bottom,
+            "eyes bottom ({}) must be above crop bottom ({})",
+            protected_bottom,
+            result.y + result.height
+        );
+
+        // Dimensions must be preserved.
+        assert_eq!(result.width, crop.width, "width must not change");
+        assert_eq!(result.height, crop.height, "height must not change");
+    }
+
+    /// Mobile 9:21 with face near the top edge.
+    ///
+    /// Face y1=60 is within 5% of crop top (margin = 4032*0.05 ≈ 201.6px).
+    /// Isolation should be ModerateConstraint; penetration scaled to 70%.
+    #[test]
+    fn test_mobile_moderate_constraint() {
+        // Person and face positioned near the top of the image.
+        let person = make_bbox(1000.0, 50.0, 2000.0, 3800.0);
+        let face = make_bbox(1200.0, 60.0, 1800.0, 460.0);
+        // face.y1 = 60; crop.y = 0; margin_y = 4032*0.05 ≈ 201.6
+        // 60 < 0 + 201.6 → near top → ModerateConstraint.
+        let crop = mobile_crop();
+        let config = ArtisticCropConfig::default();
+
+        // Verify isolation classification directly.
+        let isolation = assess_face_isolation(&face, &crop, 0.05);
+        assert_eq!(
+            isolation,
+            FaceIsolation::ModerateConstraint,
+            "face near top should be ModerateConstraint"
+        );
+
+        let result = apply_aspect_aware_face_cropping(
+            &person,
+            Some(&face),
+            &crop,
+            &config,
+            PHOTO_W,
+            PHOTO_H,
+        );
+
+        // Eyes must still be visible.
+        let face_h = face.height(); // 460 - 60 = 400
+        let protected_top = face.y1 + 0.30 * face_h; // 60 + 120 = 180
+        assert!(
+            result.y <= protected_top,
+            "eyes must be visible: crop_y={} protected_top={}",
+            result.y,
+            protected_top
+        );
+        assert_eq!(result.width, crop.width, "width must not change");
+        assert_eq!(result.height, crop.height, "height must not change");
+    }
+
+    /// Portrait 9:16 with face centered.
+    ///
+    /// Should use 20% breathing room and 14% penetration.
+    #[test]
+    fn test_portrait_balanced_isolation() {
+        let person = standing_person();
+        let face = standing_face();
+        let crop = portrait_crop(); // width=2268, height=4032
+        let config = ArtisticCropConfig::default();
+
+        // Verify aspect classification.
+        let aspect = determine_aspect_ratio(crop.width, crop.height);
+        assert_eq!(
+            aspect,
+            AspectRatio::Portrait,
+            "portrait crop should be Portrait"
+        );
+
+        // Verify lookup values.
+        let br = get_breathing_room_for_aspect(aspect, &config);
+        assert!(
+            (br - 20.0).abs() < 0.01,
+            "portrait breathing room should be 20.0, got {}",
+            br
+        );
+        let pen = get_max_penetration_for_aspect(aspect, &config);
+        assert!(
+            (pen - 14.0).abs() < 0.01,
+            "portrait penetration should be 14.0, got {}",
+            pen
+        );
+
+        let result = apply_aspect_aware_face_cropping(
+            &person,
+            Some(&face),
+            &crop,
+            &config,
+            PHOTO_W,
+            PHOTO_H,
+        );
+
+        let protected_top = face.y1 + 0.30 * face.height();
+        assert!(
+            result.y <= protected_top,
+            "eyes must be visible: crop_y={} protected_top={}",
+            result.y,
+            protected_top
+        );
+        assert_eq!(result.width, crop.width, "width must not change");
+        assert_eq!(result.height, crop.height, "height must not change");
+    }
+
+    /// Landscape 21:9 with face centered.
+    ///
+    /// Should use 25% breathing room and 11% penetration (most conservative).
+    #[test]
+    fn test_landscape_isolated_face() {
+        let person = standing_person();
+        let face = standing_face();
+        let crop = landscape_crop(); // width=3024, height=1296
+        let config = ArtisticCropConfig::default();
+
+        let aspect = determine_aspect_ratio(crop.width, crop.height);
+        assert_eq!(
+            aspect,
+            AspectRatio::Landscape,
+            "landscape crop should be Landscape"
+        );
+
+        let result = apply_aspect_aware_face_cropping(
+            &person,
+            Some(&face),
+            &crop,
+            &config,
+            PHOTO_W,
+            PHOTO_H,
+        );
+
+        // Breathing room: 25% of 1296 = 324px above forehead (y1=300).
+        // crop_y_ideal = 300 - 324 = -24 → clamped to 0.
+        let protected_top = face.y1 + 0.30 * face.height();
+        assert!(
+            result.y <= protected_top,
+            "eyes must be visible: crop_y={} protected_top={}",
+            result.y,
+            protected_top
+        );
+        assert_eq!(result.width, crop.width, "width must not change");
+        assert_eq!(result.height, crop.height, "height must not change");
+    }
+
+    /// No face bbox: the function must return the original crop unchanged.
+    #[test]
+    fn test_no_face_detection_fallback() {
+        let person = standing_person();
+        let crop = mobile_crop();
+        let config = ArtisticCropConfig::default();
+
+        let result = apply_aspect_aware_face_cropping(
+            &person, None, // no face
+            &crop, &config, PHOTO_W, PHOTO_H,
+        );
+
+        assert_eq!(result.x, crop.x, "no face → original x preserved");
+        assert_eq!(result.y, crop.y, "no face → original y preserved");
+        assert_eq!(
+            result.width, crop.width,
+            "no face → original width preserved"
+        );
+        assert_eq!(
+            result.height, crop.height,
+            "no face → original height preserved"
+        );
+    }
+
+    /// Verify that different aspect ratios produce distinct breathing room values.
+    #[test]
+    fn test_aspect_specific_breathing_room() {
+        let config = ArtisticCropConfig::default();
+
+        let br_m = get_breathing_room_for_aspect(AspectRatio::Mobile, &config);
+        let br_p = get_breathing_room_for_aspect(AspectRatio::Portrait, &config);
+        let br_l = get_breathing_room_for_aspect(AspectRatio::Landscape, &config);
+
+        // Ordering: Mobile < Portrait < Landscape (tighter frame = less breathing room).
+        assert!(
+            br_m < br_p,
+            "mobile breathing room ({}) must be less than portrait ({})",
+            br_m,
+            br_p
+        );
+        assert!(
+            br_p < br_l,
+            "portrait breathing room ({}) must be less than landscape ({})",
+            br_p,
+            br_l
+        );
+
+        // Exact approved default values.
+        assert!(
+            (br_m - 12.5).abs() < 0.01,
+            "mobile default: 12.5, got {}",
+            br_m
+        );
+        assert!(
+            (br_p - 20.0).abs() < 0.01,
+            "portrait default: 20.0, got {}",
+            br_p
+        );
+        assert!(
+            (br_l - 25.0).abs() < 0.01,
+            "landscape default: 25.0, got {}",
+            br_l
+        );
+    }
+
+    /// Verify that different aspect ratios produce distinct penetration values.
+    ///
+    /// Mobile is most aggressive (shows most body); landscape is most conservative.
+    #[test]
+    fn test_aspect_specific_penetration() {
+        let config = ArtisticCropConfig::default();
+
+        let pen_m = get_max_penetration_for_aspect(AspectRatio::Mobile, &config);
+        let pen_p = get_max_penetration_for_aspect(AspectRatio::Portrait, &config);
+        let pen_l = get_max_penetration_for_aspect(AspectRatio::Landscape, &config);
+
+        // Ordering: Mobile > Portrait > Landscape (inverse of breathing room).
+        assert!(
+            pen_m > pen_p,
+            "mobile penetration ({}) must be greater than portrait ({})",
+            pen_m,
+            pen_p
+        );
+        assert!(
+            pen_p > pen_l,
+            "portrait penetration ({}) must be greater than landscape ({})",
+            pen_p,
+            pen_l
+        );
+
+        // Exact approved default values.
+        assert!(
+            (pen_m - 18.0).abs() < 0.01,
+            "mobile default: 18.0, got {}",
+            pen_m
+        );
+        assert!(
+            (pen_p - 14.0).abs() < 0.01,
+            "portrait default: 14.0, got {}",
+            pen_p
+        );
+        assert!(
+            (pen_l - 11.0).abs() < 0.01,
+            "landscape default: 11.0, got {}",
+            pen_l
+        );
+    }
+
+    /// Eyes must NEVER be cropped regardless of how aggressive the config is.
+    ///
+    /// Uses an intentionally extreme config to stress-test the eye safety invariant.
+    #[test]
+    fn test_eye_preservation_always() {
+        let person = standing_person();
+        let face = standing_face(); // y1=300, y2=700, height=400
+
+        // Stress test: penetration set to 30% (above the approved maximum).
+        // Even with this unrealistic value the eye safety check must hold.
+        let mut config = ArtisticCropConfig::default();
+        config.max_face_bbox_penetration_percent_mobile = 30.0;
+        config.breathing_room_percent_mobile = 5.0; // very tight
+
+        let crop = mobile_crop();
+        let result = apply_aspect_aware_face_cropping(
+            &person,
+            Some(&face),
+            &crop,
+            &config,
+            PHOTO_W,
+            PHOTO_H,
+        );
+
+        // Protected zone: 300 + 0.30*400 = 420 to 300 + 0.65*400 = 560.
+        let protected_top = 300.0 + 0.30 * 400.0; // 420
+        let protected_bottom = 300.0 + 0.65 * 400.0; // 560
+        let crop_top = result.y;
+        let crop_bottom = result.y + result.height;
+
+        assert!(
+            crop_top <= protected_top,
+            "eye zone top ({}) must be below crop top ({})",
+            protected_top,
+            crop_top
+        );
+        assert!(
+            crop_bottom >= protected_bottom,
+            "eye zone bottom ({}) must be above crop bottom ({})",
+            protected_bottom,
+            crop_bottom
+        );
+    }
+
     // --- find_dominant_face ---
 
     #[test]
@@ -787,19 +1577,39 @@ mod tests {
     #[test]
     fn test_face_forward_applies_head_priority_repositions_crop() {
         // Tall crop (1600px) with person at y1=100, face at y1=150 (upper 15%).
-        // Original crop y=200 (crop starts below the face top).
-        // Head-priority should reposition to anchor crop top above the face.
+        // Original crop y=200 (crop starts below the face top, clipping the face entirely).
+        // Phase 3 (or Phase 1 fallback) should reposition to a lower y than 200.
+        //
+        // Phase 3 invariant: the eye zone (face.y1 + 30% of face height) must be
+        // fully inside the crop. This is stricter than "no adjustment" but allows
+        // slight forehead penetration (Phase 1 required y <= face.y1 exactly).
+        //
+        // For this test:
+        //   face.y1=150, face_height=200 → eye_zone_top = 150 + 60 = 210
+        //   Phase 3 breathing room (mobile, 12.5% of 1600) = 200px → crop_y ideal = -50 → 0
+        //   Body overflow pushes crop_y down to ~175px (within penetration budget).
+        //   Result: crop_y ≈ 175 < eye_zone_top (210) → eyes are visible.
         let crop = make_crop(0.0, 200.0, 800.0, 1600.0);
         let person = make_bbox(200.0, 100.0, 600.0, 1800.0);
         let face = make_bbox(300.0, 150.0, 500.0, 350.0); // face in upper ~15% of person
         let config = ArtisticCropConfig::default();
         let result =
-            apply_face_aware_adjustment(&crop, Some(&person), &[face], &config, 1000, 2000);
+            apply_face_aware_adjustment(&crop, Some(&person), &[face.clone()], &config, 1000, 2000);
 
-        // Crop should have been repositioned so that face top (y=150) is inside.
+        // Crop must be repositioned (Phase 3 or Phase 1) — below the original y=200.
         assert!(
-            result.y <= 150.0,
-            "head-priority: crop top should be at or above face y1=150, got result.y={}",
+            result.y < crop.y,
+            "crop must be repositioned above original y=200, got result.y={}",
+            result.y
+        );
+        // Phase 3 invariant: the eye zone top must be inside the repositioned crop.
+        // eye_zone_top = face.y1 + 0.30 * face_height = 150 + 60 = 210.
+        let face_height = face.height(); // 200
+        let eye_zone_top = face.y1 + 0.30 * face_height; // 210
+        assert!(
+            result.y <= eye_zone_top,
+            "Phase 3: crop top must be at or above the eye zone ({}), got result.y={}",
+            eye_zone_top,
             result.y
         );
         // Dimensions must be preserved.
