@@ -12,7 +12,12 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
 };
+use std::cell::RefCell;
 use std::sync::Mutex;
+
+thread_local! {
+    static YOLO26_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
+}
 
 use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
 
@@ -33,7 +38,6 @@ pub(super) struct YOLOv26VariantConfig {
 /// Shared inference state for any YOLO26 ONNX Runtime variant.
 pub(super) struct YOLOv26OrtInner {
     session: Mutex<Session>,
-    pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
 impl YOLOv26OrtInner {
@@ -58,7 +62,6 @@ impl YOLOv26OrtInner {
 
         Ok(Self {
             session: Mutex::new(session),
-            pending_dims: Mutex::new(None),
         })
     }
 
@@ -68,9 +71,9 @@ impl YOLOv26OrtInner {
             .first()
             .ok_or_else(|| candle_core::Error::Msg("preprocess: empty image slice".into()))?;
 
-        *self.pending_dims.lock().map_err(|error| {
-            candle_core::Error::Msg(format!("pending_dims lock failed: {error}"))
-        })? = Some((img.width(), img.height()));
+        YOLO26_PENDING_DIMS.with(|pending_dims| {
+            *pending_dims.borrow_mut() = Some((img.width(), img.height()));
+        });
 
         let resized = img.resize_exact(MODEL_W, MODEL_H, FilterType::Nearest);
         let rgb = resized.to_rgb8();
@@ -89,11 +92,8 @@ impl YOLOv26OrtInner {
 
     /// Run ONNX Runtime inference and decode detections.
     pub fn postprocess(&self, logits: Tensor, _boxes: Tensor) -> CandleResult<Vec<Detection>> {
-        let (orig_w, orig_h) = self
-            .pending_dims
-            .lock()
-            .map_err(|error| candle_core::Error::Msg(format!("pending_dims lock failed: {error}")))?
-            .take()
+        let (orig_w, orig_h) = YOLO26_PENDING_DIMS
+            .with(|pending_dims| pending_dims.borrow_mut().take())
             .ok_or_else(|| {
                 candle_core::Error::Msg(
                     "postprocess: no image dimensions — call preprocess first".into(),
@@ -186,6 +186,7 @@ fn decode_output0(values: Vec<f32>, orig_w: u32, orig_h: u32) -> CandleResult<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn test_model_input_size_is_640x640() {
@@ -263,5 +264,22 @@ mod tests {
         assert!((detection.bbox.y_min - 180.0).abs() < 1e-3);
         assert!((detection.bbox.x_max - 1280.0).abs() < 1e-3);
         assert!((detection.bbox.y_max - 540.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_pending_dims_are_thread_local() {
+        YOLO26_PENDING_DIMS.with(|pending_dims| {
+            *pending_dims.borrow_mut() = Some((320, 240));
+        });
+
+        let thread_result =
+            thread::spawn(|| YOLO26_PENDING_DIMS.with(|pending_dims| *pending_dims.borrow()))
+                .join();
+
+        assert_eq!(thread_result.expect("thread should not panic"), None);
+
+        let current_thread_dims =
+            YOLO26_PENDING_DIMS.with(|pending_dims| pending_dims.borrow_mut().take());
+        assert_eq!(current_thread_dims, Some((320, 240)));
     }
 }
