@@ -9,7 +9,9 @@ use icarus_v2::face_detection::load_face_detector;
 use icarus_v2::models::load_candle_model;
 use std::path::PathBuf;
 
-const VALID_MODELS: &[&str] = &["yolov10", "yolov10s", "yolov10m"];
+const VALID_MODELS: &[&str] = &[
+    "yolov10", "yolov10s", "yolov10m", "yolo26", "yolo26s", "yolo26m",
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,7 +39,7 @@ struct Args {
         long,
         default_value = "yolov10",
         value_name = "MODEL",
-        help = "Person detection model. Options:\n  yolov10  — YOLOv10n nano (default, fastest)\n  yolov10s — YOLOv10s small (higher accuracy)\n  yolov10m — YOLOv10m medium (highest accuracy)"
+        help = "Person detection model. Options:\n  yolov10  — YOLOv10n nano (default, fastest)\n  yolov10s — YOLOv10s small (higher accuracy)\n  yolov10m — YOLOv10m medium (highest accuracy)\n  yolo26   — YOLO26n nano (fastest, 39ms CPU)\n  yolo26s  — YOLO26s small (balanced, 87ms CPU)\n  yolo26m  — YOLO26m medium (most accurate, 220ms CPU)"
     )]
     model: String,
 

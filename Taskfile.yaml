@@ -130,6 +130,64 @@ tasks:
               --visualize output/sample_yolov10_annotated.jpg
               --confidence {{ .CONFIDENCE }}
 
+    test-benchmark-v2.1:
+        deps: [build-without-warnings]
+        desc: "Benchmark v2.1 Speed Demon across baseline and YOLO26 variants"
+        silent: true
+        vars:
+            CONFIDENCE: 0.5
+            MARGIN: 0
+        cmds:
+            - |
+                run_timed() {
+                  label="$1"
+                  shift
+                  start=$(date +%s%N)
+                  "$@"
+                  end=$(date +%s%N)
+                  echo "$label: $(((end - start) / 1000000))ms"
+                }
+
+                echo "=== Baseline: YOLOv10 + YOLOv11x-face ==="
+                run_timed baseline target/debug/icarus-v2 \
+                  --quiet \
+                  --model yolov10 \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1 \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+
+                echo "=== Speed Demon: YOLO26 + YOLOv10-face ==="
+                run_timed yolo26 target/debug/icarus-v2 \
+                  --quiet \
+                  --model yolo26 \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1 \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+
+                echo "=== Balanced: YOLO26s + YOLOv10-face ==="
+                run_timed yolo26s target/debug/icarus-v2 \
+                  --quiet \
+                  --model yolo26s \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1 \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+
+                echo "=== Accuracy: YOLO26m + YOLOv10-face ==="
+                run_timed yolo26m target/debug/icarus-v2 \
+                  --quiet \
+                  --model yolo26m \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1 \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+
     test-batch:
         deps: [build-without-warnings]
         silent: true
