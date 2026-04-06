@@ -1,4 +1,4 @@
-.ai
+.ai/**
 ai-image-crop-2.0-python
 icarus-v1-rust
 input
@@ -9,5 +9,6 @@ desired_results
 input-batch
 output-batch
 desired_results_finetuning
-input-artboard-samples
-output-artboard-samples
+input-*
+output-*
+*.jpg

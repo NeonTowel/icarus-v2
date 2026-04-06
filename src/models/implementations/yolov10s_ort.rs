@@ -1,7 +1,4 @@
-//! YOLOv10 ONNX Runtime implementation of the [`Model`] trait.
-//!
-//! This is the default YOLOv10n (nano) detector. The shared preprocessing, session
-//! setup, and postprocessing live in `yolov10_common.rs`; this file is a thin wrapper.
+//! YOLOv10s ONNX Runtime implementation of the [`Model`] trait.
 use candle_core::{Device, Result as CandleResult, Tensor};
 use image::DynamicImage;
 
@@ -9,29 +6,19 @@ use crate::models::candle_backend::{Detection, Model};
 
 use super::yolov10_common::{YOLOv10OrtInner, YOLOv10VariantConfig};
 
-/// Nano-variant configuration.
 const VARIANT_CONFIG: YOLOv10VariantConfig = YOLOv10VariantConfig {
-    hf_repo: "onnx-community/yolov10n",
+    hf_repo: "onnx-community/yolov10s",
     hf_filename: "onnx/model.onnx",
-    display_name: "yolov10n",
+    display_name: "yolov10s",
 };
 
-/// YOLOv10n detector backed by ONNX Runtime.
-///
-/// # Example
-/// ```rust,ignore
-/// let device = candle_core::Device::Cpu;
-/// let model = YOLOv10Ort::from_hub(&device)?;
-/// let tensor = model.preprocess(&[img])?;
-/// let (logits, boxes) = model.forward(&tensor)?;
-/// let detections = model.postprocess(logits, boxes)?;
-/// ```
-pub struct YOLOv10Ort {
+/// YOLOv10s detector backed by ONNX Runtime.
+pub struct YOLOv10sOrt {
     inner: YOLOv10OrtInner,
 }
 
-impl YOLOv10Ort {
-    /// Download the YOLOv10n ONNX model from HuggingFace Hub and initialise the session.
+impl YOLOv10sOrt {
+    /// Download the YOLOv10s ONNX model from HuggingFace Hub and initialise the session.
     pub fn from_hub(device: &Device) -> anyhow::Result<Self> {
         Ok(Self {
             inner: YOLOv10OrtInner::from_hub(&VARIANT_CONFIG, device)?,
@@ -39,7 +26,7 @@ impl YOLOv10Ort {
     }
 }
 
-impl Model for YOLOv10Ort {
+impl Model for YOLOv10sOrt {
     fn preprocess(&self, images: &[DynamicImage]) -> CandleResult<Tensor> {
         self.inner.preprocess(images)
     }

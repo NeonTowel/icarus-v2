@@ -434,7 +434,7 @@ mod face_detection_tests {
             face_bbox: make_bbox(100.0, 100.0, 300.0, 300.0),
             person_bbox: left_person_bbox(),
         };
-        let compound = compound_face_bbox(&[pair.clone()]).unwrap();
+        let compound = compound_face_bbox(std::slice::from_ref(&pair)).unwrap();
         assert_eq!(compound, pair.face_bbox);
     }
 

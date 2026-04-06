@@ -39,9 +39,14 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
 };
+use std::cell::RefCell;
 use std::sync::Mutex;
 
 use crate::models::candle_backend::{apply_nms, BBox, Detection, Model};
+
+thread_local! {
+    static YOLOV11X_FACE_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,8 +93,6 @@ const FACE_CLASSES: &[&str] = &["face"];
 pub struct YoloV11xFaceOrt {
     /// ONNX Runtime session; `run()` requires `&mut Session`, so wrapped in Mutex.
     session: Mutex<Session>,
-    /// Original image dimensions captured in `preprocess`, consumed in `postprocess`.
-    pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
 impl YoloV11xFaceOrt {
@@ -130,7 +133,6 @@ impl YoloV11xFaceOrt {
 
         Ok(Self {
             session: Mutex::new(session),
-            pending_dims: Mutex::new(None),
         })
     }
 }
@@ -151,8 +153,9 @@ impl Model for YoloV11xFaceOrt {
             .first()
             .ok_or_else(|| candle_core::Error::Msg("preprocess: empty image slice".into()))?;
 
-        // Capture original dimensions for bbox scaling in postprocess.
-        *self.pending_dims.lock().unwrap() = Some((img.width(), img.height()));
+        YOLOV11X_FACE_PENDING_DIMS.with(|pending_dims| {
+            *pending_dims.borrow_mut() = Some((img.width(), img.height()));
+        });
 
         // Resize to 640×640 (simple resize, matching Ultralytics preprocessing).
         let resized = img.resize_exact(MODEL_W, MODEL_H, FilterType::Nearest);
@@ -186,11 +189,13 @@ impl Model for YoloV11xFaceOrt {
     /// # Errors
     /// Returns `Err` if `preprocess` was not called first, or if the ORT session fails.
     fn postprocess(&self, logits: Tensor, _boxes: Tensor) -> CandleResult<Vec<Detection>> {
-        let (orig_w, orig_h) = self.pending_dims.lock().unwrap().take().ok_or_else(|| {
-            candle_core::Error::Msg(
-                "postprocess: no image dimensions — call preprocess first".into(),
-            )
-        })?;
+        let (orig_w, orig_h) = YOLOV11X_FACE_PENDING_DIMS
+            .with(|pending_dims| pending_dims.borrow_mut().take())
+            .ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "postprocess: no image dimensions — call preprocess first".into(),
+                )
+            })?;
 
         // Convert Candle tensor → ndarray for the ORT input.
         let data: Vec<f32> = logits.flatten_all()?.to_vec1()?;

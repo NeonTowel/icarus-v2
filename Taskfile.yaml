@@ -225,30 +225,113 @@ tasks:
                     --confidence {{ .CONFIDENCE }} \
                     --margin {{ .MARGIN }}
 
-    test-artboard-samples-v2:
+    test-artboard-samples-v2.1:
         deps: [build-without-warnings]
-        desc: "Test artistic flair cropping against artboard design samples with face detection"
+        desc: "Test artistic flair cropping v2.1 against artboard design large sample set with face detection"
         silent: true
         sources:
-            - input-artboard-samples/*
+            - input-artboard-samples-v2.1/*
         method: none
         vars:
             CONFIDENCE: 0.5
             # Margin percentage around detected person bbox (0 = no padding)
             MARGIN: 0
         cmds:
+            - |
+                echo "[$(date)]: Starting batch processing..."
             - for: sources
               cmd: |-
-                  echo "Processing {{ base .ITEM }}"
+                  start=`date +%s`
+                  echo "[$(date)]: Processing {{ .ITEM }}"
                   time target/debug/icarus-v2 \
                     --quiet \
                     --model yolov10 \
-                    --use-face-detection \
-                    --artistic-mode balanced \
-                    --show-face-detection \
-                    --input input-artboard-samples/{{ base .ITEM }} \
-                    --output output-artboard-samples-v2/{{ base .ITEM }} \
-                    --visualize output-artboard-samples-v2/{{ base .ITEM }} \
+                    --input {{ .ITEM }} \
+                    --output output-artboard-samples-v2.1/{{ base .ITEM }} \
+                    --visualize output-artboard-samples-v2.1/{{ base .ITEM }} \
                     --sort-output \
                     --confidence {{ .CONFIDENCE }} \
                     --margin {{ .MARGIN }}
+                  end=`date +%s`
+                  runtime=$((end-start))
+                  echo "[$(date)]: Processing {{ base .ITEM }} took $runtime seconds."
+            - |
+                echo "[$(date)]: Batch processing complete."
+
+    test-artboard-samples-v2.1-parallel:
+        deps: [build-without-warnings]
+        desc: "Test parallel processing with artistic flair v2.1 against artboard design large sample set with face detection"
+        silent: true
+        vars:
+            CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
+        cmds:
+            - |
+                start=`date +%s`
+                echo "[$(date)]: Starting batch processing of input-artboard-samples-v2.1..."
+                time target/debug/icarus-v2 \
+                  # --quiet \
+                  --model yolov10 \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1 \
+                  --visualize output-artboard-samples-v2.1 \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+                end=`date +%s`
+                runtime=$((end-start))
+                echo "[$(date)]: Processing took $runtime seconds."
+                echo "[$(date)]: Batch processing complete."
+
+    test-artboard-samples-v2.1-parallel-yolos:
+        deps: [build-without-warnings]
+        desc: "Test parallel processing with yolo10s and artistic flair v2.1 against artboard design large sample set with face detection"
+        silent: true
+        vars:
+            CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
+        cmds:
+            - |
+                start=`date +%s`
+                echo "[$(date)]: Starting batch processing of input-artboard-samples-v2.1..."
+                time target/debug/icarus-v2 \
+                  # --quiet \
+                  --model yolov10s \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1-yolo10s \
+                  --visualize output-artboard-samples-v2.1-yolo10s \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+                end=`date +%s`
+                runtime=$((end-start))
+                echo "[$(date)]: Processing took $runtime seconds."
+                echo "[$(date)]: Batch processing complete."
+
+    test-artboard-samples-v2.1-parallel-yolom:
+        deps: [build-without-warnings]
+        desc: "Test parallel processing with yolo10m and artistic flair v2.1 against artboard design large sample set with face detection"
+        silent: true
+        vars:
+            CONFIDENCE: 0.5
+            # Margin percentage around detected person bbox (0 = no padding)
+            MARGIN: 0
+        cmds:
+            - |
+                start=`date +%s`
+                echo "[$(date)]: Starting batch processing of input-artboard-samples-v2.1..."
+                time target/debug/icarus-v2 \
+                  # --quiet \
+                  --model yolov10m \
+                  --input input-artboard-samples-v2.1 \
+                  --output output-artboard-samples-v2.1-yolo10m \
+                  --visualize output-artboard-samples-v2.1-yolo10m \
+                  --sort-output \
+                  --confidence {{ .CONFIDENCE }} \
+                  --margin {{ .MARGIN }}
+                end=`date +%s`
+                runtime=$((end-start))
+                echo "[$(date)]: Processing took $runtime seconds."
+                echo "[$(date)]: Batch processing complete."

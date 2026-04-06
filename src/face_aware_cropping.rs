@@ -466,6 +466,19 @@ pub fn apply_face_aware_adjustment(
         return crop.clone();
     }
 
+    // If the face is already comfortably inside the crop, do not shift it.
+    // This avoids unnecessary movement when the current framing is already valid.
+    let safety_margin = config.face_safety_margin_px as f32;
+    let crop_right = crop.x + crop.width;
+    let crop_bottom = crop.y + crop.height;
+    if dominant_face.x1 - safety_margin >= crop.x
+        && dominant_face.y1 - safety_margin >= crop.y
+        && dominant_face.x2 + safety_margin <= crop_right
+        && dominant_face.y2 + safety_margin <= crop_bottom
+    {
+        return crop.clone();
+    }
+
     // ── Phase 3 → Phase 1 head-priority routing ──────────────────────────────
     // Activates only when:
     //   1. A person bbox is available (Some, not None)
@@ -1266,9 +1279,11 @@ mod tests {
 
         // Stress test: penetration set to 30% (above the approved maximum).
         // Even with this unrealistic value the eye safety check must hold.
-        let mut config = ArtisticCropConfig::default();
-        config.max_face_bbox_penetration_percent_mobile = 30.0;
-        config.breathing_room_percent_mobile = 5.0; // very tight
+        let config = ArtisticCropConfig {
+            max_face_bbox_penetration_percent_mobile: 30.0,
+            breathing_room_percent_mobile: 5.0, // very tight
+            ..ArtisticCropConfig::default()
+        };
 
         let crop = mobile_crop();
         let result = apply_aspect_aware_face_cropping(
@@ -1593,8 +1608,14 @@ mod tests {
         let person = make_bbox(200.0, 100.0, 600.0, 1800.0);
         let face = make_bbox(300.0, 150.0, 500.0, 350.0); // face in upper ~15% of person
         let config = ArtisticCropConfig::default();
-        let result =
-            apply_face_aware_adjustment(&crop, Some(&person), &[face.clone()], &config, 1000, 2000);
+        let result = apply_face_aware_adjustment(
+            &crop,
+            Some(&person),
+            std::slice::from_ref(&face),
+            &config,
+            1000,
+            2000,
+        );
 
         // Crop must be repositioned (Phase 3 or Phase 1) — below the original y=200.
         assert!(

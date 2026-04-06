@@ -2,7 +2,9 @@
 ///
 /// A production-ready Rust system for detecting and cropping objects in images
 /// using multiple AI models (DETR, YOLO, DFINE, RF-DETR).
+pub mod batch_processor;
 pub mod config;
+pub mod directory_walker;
 pub mod error;
 pub mod face_aware_cropping;
 pub mod face_detection;
