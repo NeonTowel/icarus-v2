@@ -15,8 +15,9 @@ use crate::face_detection::{detect_faces, FaceDetector};
 use crate::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use crate::models::Model;
 use crate::multi_format_cropping::{
-    apply_margin_to_bbox, calculate_compound_bbox, calculate_landscape_21_9_crop,
-    calculate_portrait_9_16_crop, calculate_portrait_9_21_crop, detect_suitable_formats, BBox,
+    apply_margin_to_bbox, calculate_compound_bbox, calculate_landscape_21_9_crop_with_face,
+    calculate_portrait_9_16_crop_with_face, calculate_portrait_9_21_crop_with_face,
+    deduplicate_person_detections, detect_suitable_formats, select_dominant_face_for_crop, BBox,
     CropRegion,
 };
 use crate::output_sorting;
@@ -309,7 +310,15 @@ fn process_image_with_base_paths(
                 })
                 .collect();
 
-            calculate_compound_bbox(&detections_for_bbox)
+            let effective_detections = if ctx.crop_config.enable_reflection_dedup {
+                deduplicate_person_detections(
+                    &detections_for_bbox,
+                    ctx.crop_config.dedup_iou_threshold,
+                )
+            } else {
+                detections_for_bbox
+            };
+            calculate_compound_bbox(&effective_detections)
         }
     };
 
@@ -498,26 +507,36 @@ fn process_image_with_base_paths(
                         .map(|s| s.to_string())
                 });
 
+                // E1+E5: Select dominant face for initial crop anchoring.
+                let dominant_face: Option<&BBox> = if ctx.crop_config.enable_adaptive_headroom {
+                    select_dominant_face_for_crop(&face_bboxes)
+                } else {
+                    None
+                };
+
                 for format in &suitable_formats {
                     let working_bbox =
                         apply_margin_to_bbox(&raw_bbox, ctx.margin, image.width(), image.height());
                     let original_crop = match format.as_str() {
-                        "21:9" => calculate_landscape_21_9_crop(
+                        "21:9" => calculate_landscape_21_9_crop_with_face(
                             image.width(),
                             image.height(),
                             &working_bbox,
+                            dominant_face,
                             ctx.crop_config,
                         ),
-                        "9:21" => calculate_portrait_9_21_crop(
+                        "9:21" => calculate_portrait_9_21_crop_with_face(
                             image.width(),
                             image.height(),
                             &working_bbox,
+                            dominant_face,
                             ctx.crop_config,
                         ),
-                        "9:16" => calculate_portrait_9_16_crop(
+                        "9:16" => calculate_portrait_9_16_crop_with_face(
                             image.width(),
                             image.height(),
                             &working_bbox,
+                            dominant_face,
                             ctx.crop_config,
                         ),
                         other => {

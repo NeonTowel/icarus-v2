@@ -89,6 +89,22 @@ fn default_visibility_threshold() -> f32 {
     0.50
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_dedup_iou_threshold() -> f32 {
+    0.50
+}
+
+fn default_max_landscape_aspect() -> f32 {
+    25.0 / 9.0
+}
+
+fn default_softening_strength() -> f32 {
+    0.30
+}
+
 /// Runtime-configurable parameters that govern the intelligent multi-format cropping algorithm.
 ///
 /// Instances can be deserialized from a YAML file via [`load_crop_config`], or constructed
@@ -125,6 +141,74 @@ pub struct CropConfig {
     /// and converts before storing here. Default: `0.50` (50%).
     #[serde(default = "default_visibility_threshold")]
     pub visibility_threshold: f32,
+
+    // ── E4: Reflection / Overlap Deduplication ─────────────
+    /// Enable IoU-based deduplication of person detections before
+    /// compound bbox computation.
+    ///
+    /// When `true`, overlapping person detections (mirrors, glass
+    /// reflections) are suppressed via greedy NMS so the compound
+    /// bbox wraps only distinct persons.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_reflection_dedup: bool,
+
+    /// IoU threshold above which two person detections are
+    /// considered duplicates (one is suppressed).
+    ///
+    /// Valid range: `[0.0, 1.0]`. Lower values are more aggressive.
+    /// Default: `0.50`.
+    #[serde(default = "default_dedup_iou_threshold")]
+    pub dedup_iou_threshold: f32,
+
+    // ── E1 + E5: Multi-Tier Adaptive Headroom ──────────────
+    /// Enable adaptive headroom that varies based on where the face
+    /// sits within the person bounding box.
+    ///
+    /// When `true` and a face bbox is provided, the crop's vertical
+    /// anchor switches between three tiers:
+    /// - Face in top 20% of person → face-anchor mode (E5)
+    /// - Face in 20–50% → face-center anchor with tighter headroom
+    /// - Face ≥ 50% or absent → original body-center algorithm
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_adaptive_headroom: bool,
+
+    // ── E2: Context-Aware Landscape Aspect Ratio ───────────
+    /// Enable dynamic landscape aspect ratio expansion for narrow
+    /// subjects.
+    ///
+    /// When `true`, subjects occupying < 40% of photo width trigger a
+    /// linear expansion from 21:9 toward `max_landscape_aspect`.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_landscape_expansion: bool,
+
+    /// Upper bound for the expanded landscape aspect ratio (width/height).
+    ///
+    /// Only used when `enable_landscape_expansion` is `true`.
+    /// Default: `25.0 / 9.0` (≈ 2.778).
+    #[serde(default = "default_max_landscape_aspect")]
+    pub max_landscape_aspect: f32,
+
+    // ── E3: Off-Center Horizontal Softening ────────────────
+    /// Enable gentle horizontal pull toward photo center for subjects
+    /// in the outer 25% of the frame.
+    ///
+    /// Reduces the "dead space" artifact in deliberately off-center
+    /// compositions without eliminating the photographer's intent.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_horizontal_softening: bool,
+
+    /// Maximum blending strength for horizontal softening.
+    ///
+    /// `0.0` = no pull toward center. `1.0` = at the extreme edge,
+    /// crop_x moves fully to photo center.
+    /// Default: `0.30`. Valid range: `[0.0, 1.0]`.
+    #[serde(default = "default_softening_strength")]
+    pub softening_strength: f32,
     // TODO(Phase 2): horizontal_offset_percent: f32  — shift crop center horizontally
     // TODO(Phase 2): crop_scale_factor: f32           — scale crop before clamping
 }
@@ -134,6 +218,13 @@ impl Default for CropConfig {
         Self {
             headroom_ratio: default_headroom_ratio(),
             visibility_threshold: default_visibility_threshold(),
+            enable_reflection_dedup: default_true(),
+            dedup_iou_threshold: default_dedup_iou_threshold(),
+            enable_adaptive_headroom: default_true(),
+            enable_landscape_expansion: default_true(),
+            max_landscape_aspect: default_max_landscape_aspect(),
+            enable_horizontal_softening: default_true(),
+            softening_strength: default_softening_strength(),
         }
     }
 }
