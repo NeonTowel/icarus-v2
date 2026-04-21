@@ -104,6 +104,209 @@ impl From<[f32; 4]> for BBox {
     }
 }
 
+/// Detected pose type inferred from person and face geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoseType {
+    /// Head is in the upper portion of the person bbox or the bbox is tall and narrow.
+    Standing,
+    /// Head is lower in the person bbox or the bbox is short and wide.
+    Sitting,
+    /// Pose could not be classified confidently.
+    Unknown,
+}
+
+/// Target crop format category for pose-adaptive headroom selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CropFormat {
+    /// 21:9 landscape crop.
+    Landscape,
+    /// 9:16 portrait crop.
+    Portrait,
+    /// 9:21 mobile crop.
+    Mobile,
+}
+
+/// Horizontal facing direction used for rule-of-thirds portrait framing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Subject is facing toward the right side of the photo.
+    FacingRight,
+    /// Subject is facing toward the left side of the photo.
+    FacingLeft,
+    /// Subject is facing the camera or the signal is ambiguous.
+    Frontal,
+}
+
+/// Detect whether the subject is standing, sitting, or ambiguous.
+///
+/// # Example
+/// ```rust,ignore
+/// let pose = detect_pose_type(&person_bbox, Some(&face_bbox));
+/// ```
+pub fn detect_pose_type(person_bbox: &BBox, face_bbox: Option<&BBox>) -> PoseType {
+    if person_bbox.height() <= 0.0 || person_bbox.width() <= 0.0 {
+        return PoseType::Unknown;
+    }
+
+    if let Some(face) = face_bbox {
+        if face.height() > 0.0 {
+            let face_rel_y = (face.center_y() - person_bbox.y1) / person_bbox.height();
+            if face_rel_y < 0.25 {
+                return PoseType::Standing;
+            }
+            if face_rel_y > 0.35 {
+                return PoseType::Sitting;
+            }
+            return PoseType::Unknown;
+        }
+    }
+
+    let aspect_ratio = person_bbox.height() / person_bbox.width();
+    if aspect_ratio > 2.5 {
+        PoseType::Standing
+    } else if aspect_ratio < 1.5 {
+        PoseType::Sitting
+    } else {
+        PoseType::Unknown
+    }
+}
+
+/// Select a headroom ratio for the detected pose and target crop format.
+///
+/// # Example
+/// ```rust,ignore
+/// let headroom = calculate_headroom_for_pose(PoseType::Standing, CropFormat::Portrait);
+/// ```
+pub fn calculate_headroom_for_pose(pose: PoseType, format: CropFormat) -> f32 {
+    match (format, pose) {
+        (CropFormat::Landscape, PoseType::Standing) => 0.30,
+        (CropFormat::Landscape, PoseType::Sitting) => 0.25,
+        (CropFormat::Landscape, PoseType::Unknown) => 0.28,
+        (CropFormat::Portrait, PoseType::Standing) => 0.37,
+        (CropFormat::Portrait, PoseType::Sitting) => 0.34,
+        (CropFormat::Portrait, PoseType::Unknown) => 0.35,
+        (CropFormat::Mobile, PoseType::Standing) => 0.35,
+        (CropFormat::Mobile, PoseType::Sitting) => 0.32,
+        (CropFormat::Mobile, PoseType::Unknown) => 0.33,
+    }
+}
+
+/// Detect whether the subject is facing left, right, or front.
+///
+/// # Example
+/// ```rust,ignore
+/// let direction = detect_pose_direction(&person_bbox, Some(&face_bbox), photo_width as f32);
+/// ```
+pub fn detect_pose_direction(
+    person_bbox: &BBox,
+    face_bbox: Option<&BBox>,
+    photo_width: f32,
+) -> Direction {
+    if person_bbox.width() <= 0.0 || photo_width <= 0.0 {
+        return Direction::Frontal;
+    }
+
+    if let Some(face) = face_bbox {
+        if face.width() > 0.0 {
+            let face_rel_x = (face.center_x() - person_bbox.x1) / person_bbox.width();
+            if face_rel_x < 0.35 {
+                return Direction::FacingRight;
+            }
+            if face_rel_x > 0.65 {
+                return Direction::FacingLeft;
+            }
+            return Direction::Frontal;
+        }
+    }
+
+    let photo_center_x = photo_width / 2.0;
+    if photo_center_x <= 0.0 {
+        return Direction::Frontal;
+    }
+
+    let offset_ratio = (person_bbox.center_x() - photo_center_x) / photo_center_x;
+    if offset_ratio < -0.30 {
+        Direction::FacingRight
+    } else if offset_ratio > 0.30 {
+        Direction::FacingLeft
+    } else {
+        Direction::Frontal
+    }
+}
+
+/// Calculate the left edge of a portrait crop using rule-of-thirds placement.
+///
+/// # Example
+/// ```rust,ignore
+/// let crop_x = calculate_portrait_crop_x(&person_bbox, 1200.0, Direction::FacingRight, 3024.0);
+/// ```
+pub fn calculate_portrait_crop_x(
+    person_bbox: &BBox,
+    crop_width: f32,
+    direction: Direction,
+    photo_width: f32,
+) -> f32 {
+    let person_center_x = person_bbox.center_x();
+    let max_x = (photo_width - crop_width).max(0.0);
+
+    let crop_x = match direction {
+        Direction::FacingRight => person_center_x - (crop_width / 3.0),
+        Direction::FacingLeft => person_center_x - (crop_width * 2.0 / 3.0),
+        Direction::Frontal => person_center_x - (crop_width / 2.0),
+    };
+
+    crop_x.clamp(0.0, max_x)
+}
+
+/// Calculate a pose-aware vertical anchor for a crop.
+///
+/// When pose-adaptive headroom is enabled, the crop uses pose-specific headroom values.
+/// If face-aware anchoring is also enabled, the existing E1/E5 tiers are preserved.
+///
+/// # Example
+/// ```rust,ignore
+/// let crop_y = calculate_crop_y_anchor_with_pose(
+///     &person_bbox,
+///     Some(&face_bbox),
+///     1080.0,
+///     CropFormat::Portrait,
+///     &config,
+/// );
+/// ```
+pub fn calculate_crop_y_anchor_with_pose(
+    person_bbox: &BBox,
+    face_bbox: Option<&BBox>,
+    crop_height: f32,
+    format: CropFormat,
+    config: &CropConfig,
+) -> f32 {
+    if !config.enable_pose_adaptive_headroom {
+        return calculate_crop_y_anchor(person_bbox, face_bbox, crop_height, config);
+    }
+
+    let pose = detect_pose_type(person_bbox, face_bbox);
+    let headroom = calculate_headroom_for_pose(pose, format);
+
+    let Some(face) = face_bbox else {
+        return person_bbox.center_y() - (crop_height * headroom);
+    };
+
+    if !config.enable_adaptive_headroom || person_bbox.height() <= 0.0 {
+        return person_bbox.center_y() - (crop_height * headroom);
+    }
+
+    let face_rel_y = (face.center_y() - person_bbox.y1) / person_bbox.height();
+
+    if face_rel_y < 0.20 {
+        let breathing_gap = 0.05 * crop_height;
+        face.y1 - breathing_gap
+    } else if face_rel_y < 0.50 {
+        face.center_y() - (crop_height * headroom)
+    } else {
+        person_bbox.center_y() - (crop_height * headroom)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Margin application
 // ---------------------------------------------------------------------------
@@ -271,9 +474,12 @@ pub fn calculate_landscape_21_9_crop(
         crop_height = crop_width / ASPECT_RATIO;
     }
 
-    // Step 3: Bbox-center upward bias — place bbox center at headroom_ratio from crop top.
-    // headroom_ratio=0.40 → center is at 40% from top, leaving 60% footroom below.
-    let crop_y = bbox.center_y() - (crop_height * config.headroom_ratio);
+    // Step 3: Pose-aware vertical anchor when enabled.
+    let crop_y = if config.enable_pose_adaptive_headroom {
+        calculate_crop_y_anchor_with_pose(bbox, None, crop_height, CropFormat::Landscape, config)
+    } else {
+        bbox.center_y() - (crop_height * config.headroom_ratio)
+    };
 
     // Step 4: Center person horizontally.
     let crop_x = bbox.center_x() - (crop_width / 2.0);
@@ -464,8 +670,16 @@ pub fn calculate_landscape_21_9_crop_with_face(
         crop_height = crop_width / aspect_ratio;
     }
 
-    // E1+E5: Adaptive vertical anchor.
-    let crop_y = if config.enable_adaptive_headroom {
+    // E1+E5 + pose-adaptive headroom.
+    let crop_y = if config.enable_pose_adaptive_headroom {
+        calculate_crop_y_anchor_with_pose(
+            bbox,
+            face_bbox,
+            crop_height,
+            CropFormat::Landscape,
+            config,
+        )
+    } else if config.enable_adaptive_headroom {
         calculate_crop_y_anchor(bbox, face_bbox, crop_height, config)
     } else {
         bbox.center_y() - (crop_height * config.headroom_ratio)
@@ -536,11 +750,25 @@ fn calculate_portrait_crop(
         crop_width = crop_height * aspect_ratio;
     }
 
-    // Step 3: Bbox-center upward bias — place bbox center at headroom_ratio from crop top.
-    let crop_y = bbox.center_y() - (crop_height * config.headroom_ratio);
+    // Step 3: Pose-aware vertical anchor when enabled.
+    let format = if aspect_ratio < 0.50 {
+        CropFormat::Mobile
+    } else {
+        CropFormat::Portrait
+    };
+    let crop_y = if config.enable_pose_adaptive_headroom {
+        calculate_crop_y_anchor_with_pose(bbox, None, crop_height, format, config)
+    } else {
+        bbox.center_y() - (crop_height * config.headroom_ratio)
+    };
 
-    // Step 4: Center person horizontally.
-    let crop_x = bbox.center_x() - (crop_width / 2.0);
+    // Step 4: Rule-of-thirds horizontal positioning when enabled.
+    let crop_x = if config.enable_rule_of_thirds {
+        let direction = detect_pose_direction(bbox, None, pw);
+        calculate_portrait_crop_x(bbox, crop_width, direction, pw)
+    } else {
+        bbox.center_x() - (crop_width / 2.0)
+    };
 
     // Step 5: Clamp.
     let crop_x = crop_x.max(0.0).min((pw - crop_width).max(0.0));
@@ -569,7 +797,7 @@ fn calculate_portrait_crop(
 
 /// Calculate a 9:21 ultrawide portrait crop with configurable bbox-center upward bias.
 ///
-/// See [`calculate_portrait_crop`] for the full algorithm description.
+/// See the shared portrait crop helper in this module for the full algorithm description.
 ///
 /// # Parameters
 /// - `photo_width` / `photo_height`: Source photo dimensions.
@@ -590,7 +818,7 @@ pub fn calculate_portrait_9_21_crop(
 
 /// Calculate a 9:16 standard portrait crop with configurable bbox-center upward bias.
 ///
-/// See [`calculate_portrait_crop`] for the full algorithm description.
+/// See the shared portrait crop helper in this module for the full algorithm description.
 ///
 /// # Parameters
 /// - `photo_width` / `photo_height`: Source photo dimensions.
@@ -630,15 +858,27 @@ fn calculate_portrait_crop_enhanced(
         crop_width = crop_height * aspect_ratio;
     }
 
-    // E1+E5: Adaptive vertical anchor.
-    let crop_y = if config.enable_adaptive_headroom {
+    // E1+E5 + pose-adaptive headroom.
+    let format = if aspect_ratio < 0.50 {
+        CropFormat::Mobile
+    } else {
+        CropFormat::Portrait
+    };
+    let crop_y = if config.enable_pose_adaptive_headroom {
+        calculate_crop_y_anchor_with_pose(bbox, face_bbox, crop_height, format, config)
+    } else if config.enable_adaptive_headroom {
         calculate_crop_y_anchor(bbox, face_bbox, crop_height, config)
     } else {
         bbox.center_y() - (crop_height * config.headroom_ratio)
     };
 
     // E3: Horizontal softening.
-    let raw_crop_x = bbox.center_x() - (crop_width / 2.0);
+    let raw_crop_x = if config.enable_rule_of_thirds {
+        let direction = detect_pose_direction(bbox, face_bbox, pw);
+        calculate_portrait_crop_x(bbox, crop_width, direction, pw)
+    } else {
+        bbox.center_x() - (crop_width / 2.0)
+    };
     let crop_x = if config.enable_horizontal_softening {
         apply_horizontal_softening(raw_crop_x, crop_width, bbox.center_x(), pw, config)
     } else {
@@ -1927,6 +2167,269 @@ mod tests {
         );
     }
 
+    // --- Milestone 1: pose detection and pose-aware headroom ---
+
+    #[test]
+    fn test_detect_pose_standing_with_face() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 200.0,
+            y2: 500.0,
+        };
+        let face = BBox {
+            x1: 120.0,
+            y1: 140.0,
+            x2: 180.0,
+            y2: 180.0,
+        };
+        assert_eq!(detect_pose_type(&person, Some(&face)), PoseType::Standing);
+    }
+
+    #[test]
+    fn test_detect_pose_sitting_with_face() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 200.0,
+            y2: 500.0,
+        };
+        let face = BBox {
+            x1: 120.0,
+            y1: 280.0,
+            x2: 180.0,
+            y2: 340.0,
+        };
+        assert_eq!(detect_pose_type(&person, Some(&face)), PoseType::Sitting);
+    }
+
+    #[test]
+    fn test_detect_pose_unknown_in_ambiguous_face_zone() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 200.0,
+            y2: 500.0,
+        };
+        let face = BBox {
+            x1: 120.0,
+            y1: 205.0,
+            x2: 180.0,
+            y2: 245.0,
+        };
+        assert_eq!(detect_pose_type(&person, Some(&face)), PoseType::Unknown);
+    }
+
+    #[test]
+    fn test_detect_pose_standing_without_face_from_aspect() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 220.0,
+            y2: 700.0,
+        };
+        assert_eq!(detect_pose_type(&person, None), PoseType::Standing);
+    }
+
+    #[test]
+    fn test_detect_pose_sitting_without_face_from_aspect() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 420.0,
+            y2: 260.0,
+        };
+        assert_eq!(detect_pose_type(&person, None), PoseType::Sitting);
+    }
+
+    #[test]
+    fn test_headroom_for_pose_landscape_standing() {
+        let headroom = calculate_headroom_for_pose(PoseType::Standing, CropFormat::Landscape);
+        assert!((headroom - 0.30).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_headroom_for_pose_portrait_sitting() {
+        let headroom = calculate_headroom_for_pose(PoseType::Sitting, CropFormat::Portrait);
+        assert!((headroom - 0.34).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_headroom_for_pose_mobile_unknown() {
+        let headroom = calculate_headroom_for_pose(PoseType::Unknown, CropFormat::Mobile);
+        assert!((headroom - 0.33).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_detect_pose_direction_facing_right_with_face() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 300.0,
+            y2: 700.0,
+        };
+        let face = BBox {
+            x1: 110.0,
+            y1: 170.0,
+            x2: 170.0,
+            y2: 230.0,
+        };
+        assert_eq!(
+            detect_pose_direction(&person, Some(&face), 1200.0),
+            Direction::FacingRight
+        );
+    }
+
+    #[test]
+    fn test_detect_pose_direction_facing_left_with_face() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 300.0,
+            y2: 700.0,
+        };
+        let face = BBox {
+            x1: 230.0,
+            y1: 170.0,
+            x2: 290.0,
+            y2: 230.0,
+        };
+        assert_eq!(
+            detect_pose_direction(&person, Some(&face), 1200.0),
+            Direction::FacingLeft
+        );
+    }
+
+    #[test]
+    fn test_detect_pose_direction_frontal_with_face() {
+        let person = BBox {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 300.0,
+            y2: 700.0,
+        };
+        let face = BBox {
+            x1: 170.0,
+            y1: 170.0,
+            x2: 230.0,
+            y2: 230.0,
+        };
+        assert_eq!(
+            detect_pose_direction(&person, Some(&face), 1200.0),
+            Direction::Frontal
+        );
+    }
+
+    #[test]
+    fn test_detect_pose_direction_from_photo_asymmetry_left() {
+        let person = BBox {
+            x1: 50.0,
+            y1: 100.0,
+            x2: 250.0,
+            y2: 700.0,
+        };
+        assert_eq!(
+            detect_pose_direction(&person, None, 1200.0),
+            Direction::FacingRight
+        );
+    }
+
+    #[test]
+    fn test_detect_pose_direction_from_photo_asymmetry_right() {
+        let person = BBox {
+            x1: 950.0,
+            y1: 100.0,
+            x2: 1150.0,
+            y2: 700.0,
+        };
+        assert_eq!(
+            detect_pose_direction(&person, None, 1200.0),
+            Direction::FacingLeft
+        );
+    }
+
+    #[test]
+    fn test_portrait_crop_x_facing_right_uses_left_third() {
+        let person = BBox {
+            x1: 400.0,
+            y1: 100.0,
+            x2: 800.0,
+            y2: 700.0,
+        };
+        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::FacingRight, 1200.0);
+        assert!((crop_x - 400.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_portrait_crop_x_facing_left_uses_right_third() {
+        let person = BBox {
+            x1: 400.0,
+            y1: 100.0,
+            x2: 800.0,
+            y2: 700.0,
+        };
+        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::FacingLeft, 1200.0);
+        assert!((crop_x - 200.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_portrait_crop_x_frontal_centers_subject() {
+        let person = BBox {
+            x1: 400.0,
+            y1: 100.0,
+            x2: 800.0,
+            y2: 700.0,
+        };
+        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::Frontal, 1200.0);
+        assert!((crop_x - 300.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_crop_y_anchor_with_pose_standing_landscape() {
+        let person = BBox {
+            x1: 500.0,
+            y1: 200.0,
+            x2: 1500.0,
+            y2: 3800.0,
+        };
+        let config = CropConfig::default();
+        let result = calculate_crop_y_anchor_with_pose(
+            &person,
+            None,
+            1296.0,
+            CropFormat::Landscape,
+            &config,
+        );
+        let expected = person.center_y() - (1296.0 * 0.30);
+        assert!((result - expected).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_crop_y_anchor_with_pose_sitting_portrait() {
+        let person = BBox {
+            x1: 500.0,
+            y1: 200.0,
+            x2: 1500.0,
+            y2: 1400.0,
+        };
+        let face = BBox {
+            x1: 700.0,
+            y1: 500.0,
+            x2: 1300.0,
+            y2: 860.0,
+        };
+        let config = CropConfig::default();
+        let result = calculate_crop_y_anchor_with_pose(
+            &person,
+            Some(&face),
+            1296.0,
+            CropFormat::Portrait,
+            &config,
+        );
+        let expected = face.center_y() - (1296.0 * 0.34);
+        assert!((result - expected).abs() < 0.5);
+    }
+
     // ── E4 Tests ─────────────────────────────────────────────────────────
 
     #[test]
@@ -2258,6 +2761,8 @@ mod tests {
     fn test_softening_strength_zero_disables() {
         let config = CropConfig {
             softening_strength: 0.0,
+            enable_pose_adaptive_headroom: true,
+            enable_rule_of_thirds: true,
             ..CropConfig::default()
         };
         let result = apply_horizontal_softening(2800.0, 2000.0, 3600.0, 4000.0, &config);

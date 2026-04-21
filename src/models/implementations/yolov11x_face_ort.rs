@@ -142,7 +142,7 @@ impl YoloV11xFaceOrt {
 // ---------------------------------------------------------------------------
 
 impl Model for YoloV11xFaceOrt {
-    /// Resize image to 640×640, normalise to [0,1], stash original dimensions.
+    /// Resize image to 640×640, normalise to \[0, 1\], stash original dimensions.
     ///
     /// Returns a 1×3×640×640 Candle tensor (used as a pass-through carrier to `postprocess`).
     ///

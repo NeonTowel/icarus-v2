@@ -175,6 +175,21 @@ pub struct CropConfig {
     #[serde(default = "default_true")]
     pub enable_adaptive_headroom: bool,
 
+    /// Enable pose-adaptive headroom selection based on person/face geometry.
+    ///
+    /// When `true`, the crop uses pose-specific headroom values for standing,
+    /// sitting, and ambiguous poses instead of a single fixed ratio.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_pose_adaptive_headroom: bool,
+
+    /// Enable rule-of-thirds horizontal positioning for portrait crops.
+    ///
+    /// When `true`, portrait crops place the subject on the left or right
+    /// third line based on the detected facing direction. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enable_rule_of_thirds: bool,
+
     // ── E2: Context-Aware Landscape Aspect Ratio ───────────
     /// Enable dynamic landscape aspect ratio expansion for narrow
     /// subjects.
@@ -221,6 +236,8 @@ impl Default for CropConfig {
             enable_reflection_dedup: default_true(),
             dedup_iou_threshold: default_dedup_iou_threshold(),
             enable_adaptive_headroom: default_true(),
+            enable_pose_adaptive_headroom: default_true(),
+            enable_rule_of_thirds: default_true(),
             enable_landscape_expansion: default_true(),
             max_landscape_aspect: default_max_landscape_aspect(),
             enable_horizontal_softening: default_true(),
@@ -606,6 +623,32 @@ mod tests {
             "landscape penetration default should be 11.0, got {}",
             config.max_face_bbox_penetration_percent_landscape
         );
+    }
+
+    #[test]
+    fn test_crop_config_defaults_enable_pose_adaptive_headroom() {
+        let config = CropConfig::default();
+        assert!(config.enable_pose_adaptive_headroom);
+    }
+
+    #[test]
+    fn test_crop_config_defaults_enable_rule_of_thirds() {
+        let config = CropConfig::default();
+        assert!(config.enable_rule_of_thirds);
+    }
+
+    #[test]
+    fn test_crop_config_deserializes_enable_pose_adaptive_headroom() {
+        let yaml = r#"
+headroom_ratio: 0.40
+visibility_threshold: 0.50
+enable_pose_adaptive_headroom: false
+enable_rule_of_thirds: false
+"#;
+        let config: CropConfig = serde_yaml::from_str(yaml).expect("valid crop config YAML");
+        assert!(!config.enable_pose_adaptive_headroom);
+        assert!(!config.enable_rule_of_thirds);
+        assert!(config.enable_adaptive_headroom);
     }
 }
 
