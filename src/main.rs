@@ -131,16 +131,6 @@ fn build_crop_config(args: &Args) -> Result<CropConfig> {
         CropConfig::default()
     };
 
-    if let Some(ratio) = args.headroom_ratio {
-        if !(0.0..=1.0).contains(&ratio) {
-            bail!(
-                "--headroom-ratio must be between 0.0 and 1.0, got {}",
-                ratio
-            );
-        }
-        crop_config.headroom_ratio = ratio;
-    }
-
     if let Some(percent) = args.visibility_threshold {
         if !(0.0..=100.0).contains(&percent) {
             bail!(

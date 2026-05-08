@@ -8,6 +8,7 @@ pub mod directory_walker;
 pub mod error;
 pub mod face_aware_cropping;
 pub mod face_detection;
+pub mod focal_point;
 pub mod image_utils;
 pub mod models;
 pub mod multi_format_cropping;

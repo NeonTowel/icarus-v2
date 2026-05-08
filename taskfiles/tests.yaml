@@ -20,6 +20,10 @@ tasks:
                     - input-artboard-samples-v2.1
               cmd: |
                 OUTPUT="output/{{ .ITEM.MODEL }}_{{ .ITEM.DATASET }}"
+                if [ -d "${OUTPUT}" ]; then
+                  echo "[$(date)]: Cleaning up existing output folder ${OUTPUT}..."
+                  rm -fr "${OUTPUT}"
+                fi
                 VISUALIZE="$OUTPUT"
                 start=`date +%s`
                 echo "[$(date)]: Starting batch processing of '{{ .ITEM.DATASET }}' with model '{{ .ITEM.MODEL }}'..."

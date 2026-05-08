@@ -81,167 +81,59 @@ impl Default for DetectionConfig {
 // CropConfig — intelligent cropping parameters with YAML deserialization
 // ---------------------------------------------------------------------------
 
-fn default_headroom_ratio() -> f32 {
-    0.40
+fn default_target_y_landscape() -> f32 {
+    0.50
 }
-
+fn default_target_y_portrait() -> f32 {
+    0.50
+}
+fn default_target_y_mobile() -> f32 {
+    0.50
+}
 fn default_visibility_threshold() -> f32 {
     0.50
 }
-
 fn default_true() -> bool {
     true
 }
-
 fn default_dedup_iou_threshold() -> f32 {
     0.50
 }
 
-fn default_max_landscape_aspect() -> f32 {
-    25.0 / 9.0
-}
-
-fn default_softening_strength() -> f32 {
-    0.30
-}
-
-/// Runtime-configurable parameters that govern the intelligent multi-format cropping algorithm.
-///
-/// Instances can be deserialized from a YAML file via [`load_crop_config`], or constructed
-/// programmatically with `CropConfig::default()` for sensible defaults.
-///
-/// CLI flags (`--headroom-ratio`, `--visibility-threshold`) take precedence over YAML values.
-///
-/// # Fields
-/// - `headroom_ratio`: Fraction of crop height above the bbox center. Default `0.40` (40%).
-/// - `visibility_threshold`: Minimum visible fraction required for a format to be valid.
-///   Stored internally as a ratio in `[0.0, 1.0]`. Default `0.50` (50%).
-///
-/// # YAML example
-/// ```yaml
-/// headroom_ratio: 0.40
-/// visibility_threshold: 0.50
-/// ```
-///
-/// # Future fields (Phase 2 — not yet implemented)
-/// - `horizontal_offset_percent`: Shift crop center horizontally by a fixed percentage.
-/// - `crop_scale_factor`: Scale the crop region before clamping to photo bounds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CropConfig {
-    /// Fraction of the crop height allocated above the bbox center (headroom).
-    ///
-    /// `0.40` → bbox center sits at 40% from the top; 60% footroom below.
-    /// Valid range: `[0.0, 1.0]`. Default: `0.40`.
-    #[serde(default = "default_headroom_ratio")]
-    pub headroom_ratio: f32,
+    #[serde(default = "default_target_y_landscape", alias = "headroom_ratio")]
+    pub target_y_frac_landscape: f32, // 0.50 — places crop center at bbox vertical center
 
-    /// Minimum fraction of the person's bbox area that must fall inside the proposed crop.
-    ///
-    /// Stored as a ratio `[0.0, 1.0]`. The CLI accepts this as a percentage (0–100)
-    /// and converts before storing here. Default: `0.50` (50%).
+    #[serde(default = "default_target_y_portrait")]
+    pub target_y_frac_portrait: f32, // 0.50 — places crop center at bbox vertical center
+
+    #[serde(default = "default_target_y_mobile")]
+    pub target_y_frac_mobile: f32, // 0.50 — places crop center at bbox vertical center
+
     #[serde(default = "default_visibility_threshold")]
-    pub visibility_threshold: f32,
+    pub visibility_threshold: f32, // 0.50
 
-    // ── E4: Reflection / Overlap Deduplication ─────────────
-    /// Enable IoU-based deduplication of person detections before
-    /// compound bbox computation.
-    ///
-    /// When `true`, overlapping person detections (mirrors, glass
-    /// reflections) are suppressed via greedy NMS so the compound
-    /// bbox wraps only distinct persons.
-    /// Default: `true`.
     #[serde(default = "default_true")]
     pub enable_reflection_dedup: bool,
 
-    /// IoU threshold above which two person detections are
-    /// considered duplicates (one is suppressed).
-    ///
-    /// Valid range: `[0.0, 1.0]`. Lower values are more aggressive.
-    /// Default: `0.50`.
     #[serde(default = "default_dedup_iou_threshold")]
-    pub dedup_iou_threshold: f32,
+    pub dedup_iou_threshold: f32, // 0.50
 
-    // ── E1 + E5: Multi-Tier Adaptive Headroom ──────────────
-    /// Enable adaptive headroom that varies based on where the face
-    /// sits within the person bounding box.
-    ///
-    /// When `true` and a face bbox is provided, the crop's vertical
-    /// anchor switches between three tiers:
-    /// - Face in top 20% of person → face-anchor mode (E5)
-    /// - Face in 20–50% → face-center anchor with tighter headroom
-    /// - Face ≥ 50% or absent → original body-center algorithm
-    ///
-    /// Default: `true`.
     #[serde(default = "default_true")]
-    pub enable_adaptive_headroom: bool,
-
-    /// Enable pose-adaptive headroom selection based on person/face geometry.
-    ///
-    /// When `true`, the crop uses pose-specific headroom values for standing,
-    /// sitting, and ambiguous poses instead of a single fixed ratio.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
-    pub enable_pose_adaptive_headroom: bool,
-
-    /// Enable rule-of-thirds horizontal positioning for portrait crops.
-    ///
-    /// When `true`, portrait crops place the subject on the left or right
-    /// third line based on the detected facing direction. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enable_rule_of_thirds: bool,
-
-    // ── E2: Context-Aware Landscape Aspect Ratio ───────────
-    /// Enable dynamic landscape aspect ratio expansion for narrow
-    /// subjects.
-    ///
-    /// When `true`, subjects occupying < 40% of photo width trigger a
-    /// linear expansion from 21:9 toward `max_landscape_aspect`.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
-    pub enable_landscape_expansion: bool,
-
-    /// Upper bound for the expanded landscape aspect ratio (width/height).
-    ///
-    /// Only used when `enable_landscape_expansion` is `true`.
-    /// Default: `25.0 / 9.0` (≈ 2.778).
-    #[serde(default = "default_max_landscape_aspect")]
-    pub max_landscape_aspect: f32,
-
-    // ── E3: Off-Center Horizontal Softening ────────────────
-    /// Enable gentle horizontal pull toward photo center for subjects
-    /// in the outer 25% of the frame.
-    ///
-    /// Reduces the "dead space" artifact in deliberately off-center
-    /// compositions without eliminating the photographer's intent.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
-    pub enable_horizontal_softening: bool,
-
-    /// Maximum blending strength for horizontal softening.
-    ///
-    /// `0.0` = no pull toward center. `1.0` = at the extreme edge,
-    /// crop_x moves fully to photo center.
-    /// Default: `0.30`. Valid range: `[0.0, 1.0]`.
-    #[serde(default = "default_softening_strength")]
-    pub softening_strength: f32,
-    // TODO(Phase 2): horizontal_offset_percent: f32  — shift crop center horizontally
-    // TODO(Phase 2): crop_scale_factor: f32           — scale crop before clamping
+    pub enable_directional_thirds: bool,
 }
 
 impl Default for CropConfig {
     fn default() -> Self {
         Self {
-            headroom_ratio: default_headroom_ratio(),
+            target_y_frac_landscape: default_target_y_landscape(),
+            target_y_frac_portrait: default_target_y_portrait(),
+            target_y_frac_mobile: default_target_y_mobile(),
             visibility_threshold: default_visibility_threshold(),
             enable_reflection_dedup: default_true(),
             dedup_iou_threshold: default_dedup_iou_threshold(),
-            enable_adaptive_headroom: default_true(),
-            enable_pose_adaptive_headroom: default_true(),
-            enable_rule_of_thirds: default_true(),
-            enable_landscape_expansion: default_true(),
-            max_landscape_aspect: default_max_landscape_aspect(),
-            enable_horizontal_softening: default_true(),
-            softening_strength: default_softening_strength(),
+            enable_directional_thirds: default_true(),
         }
     }
 }
@@ -374,119 +266,8 @@ pub struct ArtisticModeParams {
 /// `ArtisticCropConfig::default()` is equivalent to `from_mode(ArtisticMode::Balanced)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArtisticCropConfig {
-    /// Artistic composition mode controlling face margin and shift budget.
     #[serde(default)]
     pub artistic_mode: ArtisticMode,
-
-    /// Maximum fraction of crop dimension allowed for face adjustment shift.
-    ///
-    /// Shift budget in X = `crop_width  * max_shift_fraction`.
-    /// Shift budget in Y = `crop_height * max_shift_fraction`.
-    /// Default: 0.10 (10%).
-    #[serde(default = "default_max_shift_fraction")]
-    pub max_shift_fraction: f32,
-
-    /// Pixel safety margin around the detected face bbox that must be inside the crop.
-    ///
-    /// Derived from `artistic_mode` by default:
-    /// - Conservative → 20 px
-    /// - Balanced     → 15 px
-    /// - Aggressive   → 10 px
-    #[serde(default = "default_face_safety_margin_px")]
-    pub face_safety_margin_px: u32,
-
-    // ===== PHASE 3: Aspect-ratio-specific breathing room =====
-    /// Breathing room above forehead for mobile (9:21) crops.
-    ///
-    /// Expressed as a percentage of crop height. A value of 12.5 means
-    /// 12.5% of the crop height is reserved as empty space above the
-    /// forehead. Tight by design: mobile frames are tall, so headroom
-    /// competes with body visibility.
-    ///
-    /// Valid range: 10.0..=15.0. Default: 12.5.
-    #[serde(default = "default_breathing_room_mobile")]
-    pub breathing_room_percent_mobile: f32,
-
-    /// Breathing room above forehead for portrait (9:16) crops.
-    ///
-    /// Balanced between head comfort and body visibility.
-    ///
-    /// Valid range: 15.0..=25.0. Default: 20.0.
-    #[serde(default = "default_breathing_room_portrait")]
-    pub breathing_room_percent_portrait: f32,
-
-    /// Breathing room above forehead for landscape (21:9) crops.
-    ///
-    /// Generous: landscape frames are wide and short, so head breathing
-    /// room improves the visual weight above the subject.
-    ///
-    /// Valid range: 20.0..=30.0. Default: 25.0.
-    #[serde(default = "default_breathing_room_landscape")]
-    pub breathing_room_percent_landscape: f32,
-
-    // ===== PHASE 3: Aspect-ratio-specific face bbox penetration =====
-    /// Max percentage of face bbox height the crop edge may penetrate (mobile).
-    ///
-    /// "Penetration" is how far the crop top edge is allowed to cut into
-    /// the face bounding box from above (forehead zone only). The protected
-    /// eye zone (30–65% of face height) is always preserved regardless of
-    /// this value.
-    ///
-    /// Mobile gets the highest penetration to show maximum body below the
-    /// face in the tall 9:21 frame.
-    ///
-    /// Valid range: 15.0..=20.0. Default: 18.0.
-    #[serde(default = "default_penetration_mobile")]
-    pub max_face_bbox_penetration_percent_mobile: f32,
-
-    /// Max face bbox penetration for portrait (9:16) crops.
-    ///
-    /// Moderate: balanced body visibility vs. comfortable head framing.
-    ///
-    /// Valid range: 12.0..=15.0. Default: 14.0.
-    #[serde(default = "default_penetration_portrait")]
-    pub max_face_bbox_penetration_percent_portrait: f32,
-
-    /// Max face bbox penetration for landscape (21:9) crops.
-    ///
-    /// Conservative: landscape frames show torso + arms by horizontal
-    /// extension; minimal vertical penetration is appropriate.
-    ///
-    /// Valid range: 10.0..=12.0. Default: 11.0.
-    #[serde(default = "default_penetration_landscape")]
-    pub max_face_bbox_penetration_percent_landscape: f32,
-}
-
-fn default_max_shift_fraction() -> f32 {
-    0.10
-}
-
-fn default_face_safety_margin_px() -> u32 {
-    15 // Balanced default
-}
-
-fn default_breathing_room_mobile() -> f32 {
-    12.5
-}
-
-fn default_breathing_room_portrait() -> f32 {
-    20.0
-}
-
-fn default_breathing_room_landscape() -> f32 {
-    25.0
-}
-
-fn default_penetration_mobile() -> f32 {
-    18.0
-}
-
-fn default_penetration_portrait() -> f32 {
-    14.0
-}
-
-fn default_penetration_landscape() -> f32 {
-    11.0
 }
 
 impl Default for ArtisticCropConfig {
@@ -496,38 +277,17 @@ impl Default for ArtisticCropConfig {
 }
 
 impl ArtisticCropConfig {
-    /// Create a config from an [`ArtisticMode`] with default shift fraction (10%).
-    ///
-    /// | Mode         | face_safety_margin_px | max_shift_fraction |
-    /// |--------------|----------------------|-------------------|
-    /// | Conservative | 20 px                | 10%               |
-    /// | Balanced     | 15 px                | 10%               |
-    /// | Aggressive   | 10 px                | 10%               |
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let config = ArtisticCropConfig::from_mode(ArtisticMode::Conservative);
-    /// assert_eq!(config.face_safety_margin_px, 20);
-    /// assert!((config.max_shift_fraction - 0.10).abs() < 0.01);
-    /// ```
     pub fn from_mode(mode: ArtisticMode) -> Self {
-        let margin = match mode {
-            ArtisticMode::Conservative => 20,
-            ArtisticMode::Balanced => 15,
-            ArtisticMode::Aggressive => 10,
-        };
         Self {
             artistic_mode: mode,
-            max_shift_fraction: 0.10,
-            face_safety_margin_px: margin,
-            // Phase 3 defaults are mode-independent: per-aspect-ratio
-            // differentiation replaces mode-based differentiation here.
-            breathing_room_percent_mobile: 12.5,
-            breathing_room_percent_portrait: 20.0,
-            breathing_room_percent_landscape: 25.0,
-            max_face_bbox_penetration_percent_mobile: 18.0,
-            max_face_bbox_penetration_percent_portrait: 14.0,
-            max_face_bbox_penetration_percent_landscape: 11.0,
+        }
+    }
+
+    pub fn target_y_offset(&self) -> f32 {
+        match self.artistic_mode {
+            ArtisticMode::Aggressive => -0.05,
+            ArtisticMode::Balanced => 0.00,
+            ArtisticMode::Conservative => 0.05,
         }
     }
 }
@@ -536,39 +296,6 @@ impl ArtisticCropConfig {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_from_mode_conservative() {
-        let config = ArtisticCropConfig::from_mode(ArtisticMode::Conservative);
-        assert_eq!(config.face_safety_margin_px, 20);
-        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
-        assert_eq!(config.artistic_mode, ArtisticMode::Conservative);
-    }
-
-    #[test]
-    fn test_from_mode_balanced() {
-        let config = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
-        assert_eq!(config.face_safety_margin_px, 15);
-        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_from_mode_aggressive() {
-        let config = ArtisticCropConfig::from_mode(ArtisticMode::Aggressive);
-        assert_eq!(config.face_safety_margin_px, 10);
-        assert!((config.max_shift_fraction - 0.10).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_default_is_balanced() {
-        let default = ArtisticCropConfig::default();
-        let balanced = ArtisticCropConfig::from_mode(ArtisticMode::Balanced);
-        assert_eq!(
-            default.face_safety_margin_px,
-            balanced.face_safety_margin_px
-        );
-        assert_eq!(default.artistic_mode, ArtisticMode::Balanced);
-    }
 
     #[test]
     fn test_artistic_mode_fromstr() {
@@ -585,70 +312,6 @@ mod tests {
             ArtisticMode::Aggressive
         );
         assert!("unknown".parse::<ArtisticMode>().is_err());
-    }
-
-    #[test]
-    fn test_phase3_defaults_present() {
-        // Phase 3 fields must be present with the approved default values
-        // regardless of whether the config is constructed via default() or
-        // from_mode().
-        let config = ArtisticCropConfig::default();
-        assert!(
-            (config.breathing_room_percent_mobile - 12.5).abs() < 0.01,
-            "mobile breathing room default should be 12.5, got {}",
-            config.breathing_room_percent_mobile
-        );
-        assert!(
-            (config.breathing_room_percent_portrait - 20.0).abs() < 0.01,
-            "portrait breathing room default should be 20.0, got {}",
-            config.breathing_room_percent_portrait
-        );
-        assert!(
-            (config.breathing_room_percent_landscape - 25.0).abs() < 0.01,
-            "landscape breathing room default should be 25.0, got {}",
-            config.breathing_room_percent_landscape
-        );
-        assert!(
-            (config.max_face_bbox_penetration_percent_mobile - 18.0).abs() < 0.01,
-            "mobile penetration default should be 18.0, got {}",
-            config.max_face_bbox_penetration_percent_mobile
-        );
-        assert!(
-            (config.max_face_bbox_penetration_percent_portrait - 14.0).abs() < 0.01,
-            "portrait penetration default should be 14.0, got {}",
-            config.max_face_bbox_penetration_percent_portrait
-        );
-        assert!(
-            (config.max_face_bbox_penetration_percent_landscape - 11.0).abs() < 0.01,
-            "landscape penetration default should be 11.0, got {}",
-            config.max_face_bbox_penetration_percent_landscape
-        );
-    }
-
-    #[test]
-    fn test_crop_config_defaults_enable_pose_adaptive_headroom() {
-        let config = CropConfig::default();
-        assert!(config.enable_pose_adaptive_headroom);
-    }
-
-    #[test]
-    fn test_crop_config_defaults_enable_rule_of_thirds() {
-        let config = CropConfig::default();
-        assert!(config.enable_rule_of_thirds);
-    }
-
-    #[test]
-    fn test_crop_config_deserializes_enable_pose_adaptive_headroom() {
-        let yaml = r#"
-headroom_ratio: 0.40
-visibility_threshold: 0.50
-enable_pose_adaptive_headroom: false
-enable_rule_of_thirds: false
-"#;
-        let config: CropConfig = serde_yaml::from_str(yaml).expect("valid crop config YAML");
-        assert!(!config.enable_pose_adaptive_headroom);
-        assert!(!config.enable_rule_of_thirds);
-        assert!(config.enable_adaptive_headroom);
     }
 }
 

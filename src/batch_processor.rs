@@ -10,15 +10,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{ArtisticCropConfig, CropConfig};
 use crate::directory_walker::relative_to;
-use crate::face_aware_cropping::apply_face_aware_adjustment;
 use crate::face_detection::{detect_faces, FaceDetector};
 use crate::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use crate::models::Model;
 use crate::multi_format_cropping::{
     apply_margin_to_bbox, calculate_compound_bbox, calculate_landscape_21_9_crop_with_face,
     calculate_portrait_9_16_crop_with_face, calculate_portrait_9_21_crop_with_face,
-    deduplicate_person_detections, detect_suitable_formats, select_dominant_face_for_crop, BBox,
-    CropRegion,
+    deduplicate_person_detections, detect_suitable_formats, BBox, CropRegion,
 };
 use crate::output_sorting;
 
@@ -507,12 +505,12 @@ fn process_image_with_base_paths(
                         .map(|s| s.to_string())
                 });
 
-                // E1+E5: Select dominant face for initial crop anchoring.
-                let dominant_face: Option<&BBox> = if ctx.crop_config.enable_adaptive_headroom {
-                    select_dominant_face_for_crop(&face_bboxes)
-                } else {
-                    None
-                };
+                let focal = crate::focal_point::compute_focal_point(
+                    person_bbox_for_adjustment.as_ref(),
+                    &face_bboxes,
+                    image_width,
+                    image_height,
+                );
 
                 for format in &suitable_formats {
                     let working_bbox =
@@ -522,22 +520,28 @@ fn process_image_with_base_paths(
                             image.width(),
                             image.height(),
                             &working_bbox,
-                            dominant_face,
+                            &face_bboxes,
+                            &focal,
                             ctx.crop_config,
+                            ctx.artistic_config,
                         ),
                         "9:21" => calculate_portrait_9_21_crop_with_face(
                             image.width(),
                             image.height(),
                             &working_bbox,
-                            dominant_face,
+                            &face_bboxes,
+                            &focal,
                             ctx.crop_config,
+                            ctx.artistic_config,
                         ),
                         "9:16" => calculate_portrait_9_16_crop_with_face(
                             image.width(),
                             image.height(),
                             &working_bbox,
-                            dominant_face,
+                            &face_bboxes,
+                            &focal,
                             ctx.crop_config,
+                            ctx.artistic_config,
                         ),
                         other => {
                             eprintln!("Warning: unknown format '{}' — skipping.", other);
@@ -550,11 +554,9 @@ fn process_image_with_base_paths(
                         None => continue,
                     };
 
-                    let adjusted_crop = apply_face_aware_adjustment(
+                    let adjusted_crop = crate::face_aware_cropping::enforce_eye_safety(
                         &original_crop,
-                        person_bbox_for_adjustment.as_ref(),
                         &face_bboxes,
-                        ctx.artistic_config,
                         image_width,
                         image_height,
                     );

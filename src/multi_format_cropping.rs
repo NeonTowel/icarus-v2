@@ -7,12 +7,14 @@
 /// # Algorithm Overview
 ///
 /// 1. **Bbox Orientation**: Wide bbox → landscape only; tall/square bbox → try all formats.
-/// 2. **Landscape 21:9 (Bbox-Center Upward Bias)**: Person bbox center at `headroom_ratio`
-///    from crop top (default 40%), giving 60% footroom — ideal for fashion/ultrawide.
-/// 3. **Portrait 9:21 & 9:16 (Bbox-Center Upward Bias)**: Same configurable ratio.
+/// 2. **Landscape 21:9 (Bbox-Center Anchor)**: Crop center placed at the person bbox vertical
+///    center (`target_y_frac = 0.50`), keeping the full subject visible.
+/// 3. **Portrait 9:21 & 9:16 (Bbox-Center Anchor)**: Same configurable ratio.
 /// 4. **Margin**: Optional symmetric padding (percentage of bbox dimensions) before positioning.
 /// 5. **Visibility Gate**: Person must be ≥`visibility_threshold` visible in the final crop,
 ///    or format is skipped (configurable, default 50%).
+/// 6. **Eye-Safety Guard**: After crop placement, [`crate::face_aware_cropping::enforce_eye_safety`]
+///    nudges vertically by up to 3% of crop height to prevent facial clipping.
 ///
 /// # Example
 /// ```rust,ignore
@@ -48,13 +50,37 @@ impl CropRegion {
     ///
     /// This is the form accepted by `image_utils::crop_image()`.
     pub fn to_xyxy_clamped(&self, photo_width: u32, photo_height: u32) -> [f32; 4] {
-        let pw = photo_width as f32;
-        let ph = photo_height as f32;
-        let x1 = self.x.max(0.0).min(pw);
-        let y1 = self.y.max(0.0).min(ph);
-        let x2 = (self.x + self.width).max(0.0).min(pw);
-        let y2 = (self.y + self.height).max(0.0).min(ph);
+        let x1 = self.x.clamp(0.0, photo_width as f32);
+        let y1 = self.y.clamp(0.0, photo_height as f32);
+        let x2 = (self.x + self.width).clamp(0.0, photo_width as f32);
+        let y2 = (self.y + self.height).clamp(0.0, photo_height as f32);
         [x1, y1, x2, y2]
+    }
+}
+
+pub fn place_focal_point(
+    photo_width: u32,
+    photo_height: u32,
+    crop_width: f32,
+    crop_height: f32,
+    focal: &crate::focal_point::FocalPoint,
+    target_x_frac: f32,
+    target_y_frac: f32,
+) -> CropRegion {
+    let mut x = focal.x - target_x_frac * crop_width;
+    let mut y = focal.y - target_y_frac * crop_height;
+
+    let max_x = (photo_width as f32 - crop_width).max(0.0);
+    let max_y = (photo_height as f32 - crop_height).max(0.0);
+
+    x = x.clamp(0.0, max_x);
+    y = y.clamp(0.0, max_y);
+
+    CropRegion {
+        x,
+        y,
+        width: crop_width,
+        height: crop_height,
     }
 }
 
@@ -197,41 +223,22 @@ pub fn calculate_headroom_for_pose(pose: PoseType, format: CropFormat) -> f32 {
 /// ```rust,ignore
 /// let direction = detect_pose_direction(&person_bbox, Some(&face_bbox), photo_width as f32);
 /// ```
-pub fn detect_pose_direction(
-    person_bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    photo_width: f32,
-) -> Direction {
-    if person_bbox.width() <= 0.0 || photo_width <= 0.0 {
+pub fn detect_pose_direction(person_bbox: &BBox, face_bbox: &BBox) -> Direction {
+    if person_bbox.width() <= 0.0 {
         return Direction::Frontal;
     }
 
-    if let Some(face) = face_bbox {
-        if face.width() > 0.0 {
-            let face_rel_x = (face.center_x() - person_bbox.x1) / person_bbox.width();
-            if face_rel_x < 0.35 {
-                return Direction::FacingLeft;
-            }
-            if face_rel_x > 0.65 {
-                return Direction::FacingRight;
-            }
-            return Direction::Frontal;
+    if face_bbox.width() > 0.0 {
+        let face_rel_x = (face_bbox.center_x() - person_bbox.x1) / person_bbox.width();
+        if face_rel_x < 0.35 {
+            return Direction::FacingLeft;
+        }
+        if face_rel_x > 0.65 {
+            return Direction::FacingRight;
         }
     }
 
-    let photo_center_x = photo_width / 2.0;
-    if photo_center_x <= 0.0 {
-        return Direction::Frontal;
-    }
-
-    let offset_ratio = (person_bbox.center_x() - photo_center_x) / photo_center_x;
-    if offset_ratio < -0.30 {
-        Direction::FacingLeft
-    } else if offset_ratio > 0.30 {
-        Direction::FacingRight
-    } else {
-        Direction::Frontal
-    }
+    Direction::Frontal
 }
 
 /// Calculate the left edge of a portrait crop using rule-of-thirds placement.
@@ -256,55 +263,6 @@ pub fn calculate_portrait_crop_x(
     };
 
     crop_x.clamp(0.0, max_x)
-}
-
-/// Calculate a pose-aware vertical anchor for a crop.
-///
-/// When pose-adaptive headroom is enabled, the crop uses pose-specific headroom values.
-/// If face-aware anchoring is also enabled, the existing E1/E5 tiers are preserved.
-///
-/// # Example
-/// ```rust,ignore
-/// let crop_y = calculate_crop_y_anchor_with_pose(
-///     &person_bbox,
-///     Some(&face_bbox),
-///     1080.0,
-///     CropFormat::Portrait,
-///     &config,
-/// );
-/// ```
-pub fn calculate_crop_y_anchor_with_pose(
-    person_bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    crop_height: f32,
-    format: CropFormat,
-    config: &CropConfig,
-) -> f32 {
-    if !config.enable_pose_adaptive_headroom {
-        return calculate_crop_y_anchor(person_bbox, face_bbox, crop_height, config);
-    }
-
-    let pose = detect_pose_type(person_bbox, face_bbox);
-    let headroom = calculate_headroom_for_pose(pose, format);
-
-    let Some(face) = face_bbox else {
-        return person_bbox.center_y() - (crop_height * headroom);
-    };
-
-    if !config.enable_adaptive_headroom || person_bbox.height() <= 0.0 {
-        return person_bbox.center_y() - (crop_height * headroom);
-    }
-
-    let face_rel_y = (face.center_y() - person_bbox.y1) / person_bbox.height();
-
-    if face_rel_y < 0.20 && !config.enable_pose_adaptive_headroom {
-        let breathing_gap = 0.05 * crop_height;
-        face.y1 - breathing_gap
-    } else if face_rel_y < 0.50 {
-        face.center_y() - (crop_height * headroom)
-    } else {
-        person_bbox.center_y() - (crop_height * headroom)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,204 +383,6 @@ pub fn person_is_reasonably_visible_threshold(
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 2: Landscape 21:9 Crop (Bbox-Center Upward Bias Positioning)
-// ---------------------------------------------------------------------------
-
-/// Calculate a 21:9 landscape crop region with configurable bbox-center upward bias.
-///
-/// **Algorithm:**
-/// 1. Start with `crop_height = photo_height`; derive `crop_width = crop_height × (21/9)`.
-/// 2. If `crop_width > photo_width`, reduce to `photo_width` and recalculate height.
-/// 3. Position bbox center at `config.headroom_ratio` from crop top (default 40%).
-///    This gives 60% footroom below the center — ideal for fashion/entertainment on ultrawides.
-/// 4. Center person horizontally.
-/// 5. Clamp to photo bounds.
-/// 6. Return `None` if person is less than `config.visibility_threshold` visible.
-///
-/// # Parameters
-/// - `photo_width` / `photo_height`: Source photo dimensions.
-/// - `bbox`: Person bounding box (should already include margin if applicable).
-/// - `config`: Cropping configuration controlling headroom and visibility threshold.
-///
-/// # Returns
-/// `Some(CropRegion)` when the person is sufficiently visible in the computed crop,
-/// `None` otherwise.
-///
-/// # Example
-/// ```rust,ignore
-/// let config = CropConfig::default();
-/// let crop = calculate_landscape_21_9_crop(4000, 3000, &bbox, &config);
-/// ```
-pub fn calculate_landscape_21_9_crop(
-    photo_width: u32,
-    photo_height: u32,
-    bbox: &BBox,
-    config: &CropConfig,
-) -> Option<CropRegion> {
-    const ASPECT_RATIO: f32 = 21.0 / 9.0; // ~2.333
-
-    let pw = photo_width as f32;
-    let ph = photo_height as f32;
-
-    // Step 1: try using the full photo height.
-    let mut crop_height = ph;
-    let mut crop_width = crop_height * ASPECT_RATIO;
-
-    // Step 2: if that would exceed photo width, scale down to fit.
-    if crop_width > pw {
-        crop_width = pw;
-        crop_height = crop_width / ASPECT_RATIO;
-    }
-
-    // Step 3: Pose-aware vertical anchor when enabled.
-    let crop_y = if config.enable_pose_adaptive_headroom {
-        calculate_crop_y_anchor_with_pose(bbox, None, crop_height, CropFormat::Landscape, config)
-    } else {
-        bbox.center_y() - (crop_height * config.headroom_ratio)
-    };
-
-    // Step 4: Center person horizontally.
-    let crop_x = bbox.center_x() - (crop_width / 2.0);
-
-    // Step 5: Clamp both axes to valid photo bounds.
-    let crop_x = crop_x.max(0.0).min((pw - crop_width).max(0.0));
-    let crop_y = crop_y.max(0.0).min((ph - crop_height).max(0.0));
-
-    let crop = CropRegion {
-        x: crop_x,
-        y: crop_y,
-        width: crop_width,
-        height: crop_height,
-    };
-
-    // Step 6: Visibility gate using configurable threshold.
-    if person_is_reasonably_visible_threshold(
-        bbox,
-        &crop,
-        config.visibility_threshold,
-        photo_width,
-        photo_height,
-    ) {
-        Some(crop)
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// E3: Off-Center Horizontal Softening
-// ---------------------------------------------------------------------------
-
-/// Apply a gentle horizontal pull toward the photo center when the
-/// subject is in the outer 25% of the frame.
-///
-/// Reduces the "dead space" artifact in off-center compositions
-/// without eliminating the photographer's deliberate negative space.
-///
-/// # Activation
-///
-/// Activates when `off_center_fraction > 0.50`, meaning the person
-/// center is in the outer 25% on either side (the outermost 25% of
-/// the left or right half).
-///
-/// # Formula
-///
-/// ```text
-/// photo_center = photo_width / 2
-/// off_center_frac = |person_center_x − photo_center| / photo_center
-///   (0.0 = centered, 1.0 = at edge)
-///
-/// if off_center_frac ≤ 0.50 → return raw_crop_x unchanged
-///
-/// activation = (off_center_frac − 0.50) / 0.50
-/// blend = activation × config.softening_strength
-/// centered_x = photo_center − crop_width / 2
-/// softened_x = raw_crop_x × (1 − blend) + centered_x × blend
-/// ```
-///
-/// # Parameters
-/// - `raw_crop_x`: Crop X from person-center algorithm (before clamping).
-/// - `crop_width`: Width of the crop region in pixels.
-/// - `person_center_x`: Horizontal center of the person bbox.
-/// - `photo_width`: Photo width in pixels (as f32).
-/// - `config`: Must have `softening_strength` in `[0.0, 1.0]`.
-///
-/// # Returns
-/// Adjusted `crop_x` (not clamped — caller clamps to photo bounds).
-pub fn apply_horizontal_softening(
-    raw_crop_x: f32,
-    crop_width: f32,
-    person_center_x: f32,
-    photo_width: f32,
-    config: &CropConfig,
-) -> f32 {
-    let photo_center = photo_width / 2.0;
-    if photo_center <= 0.0 || config.softening_strength <= 0.0 {
-        return raw_crop_x;
-    }
-
-    let off_center_frac = (person_center_x - photo_center).abs() / photo_center;
-
-    if off_center_frac <= 0.50 {
-        return raw_crop_x;
-    }
-
-    let activation = (off_center_frac - 0.50) / 0.50;
-    let blend = activation * config.softening_strength;
-    let centered_x = photo_center - (crop_width / 2.0);
-
-    raw_crop_x * (1.0 - blend) + centered_x * blend
-}
-
-// ---------------------------------------------------------------------------
-// E2: Context-Aware Landscape Aspect Ratio
-// ---------------------------------------------------------------------------
-
-/// Compute a dynamic landscape aspect ratio that widens for narrow
-/// subjects to include more environmental context.
-///
-/// When the person occupies less than 40% of the photo width, the
-/// aspect ratio scales linearly from 21:9 (at 40%) toward
-/// `config.max_landscape_aspect` (at 0%). Subjects wider than 40%
-/// of the photo always get the standard 21:9.
-///
-/// # Formula
-///
-/// ```text
-/// person_width_ratio = bbox.width() / photo_width
-/// if person_width_ratio >= 0.40 → 21/9
-/// t = person_width_ratio / 0.40   (0.0 = infinitely narrow, 1.0 = 40% wide)
-/// aspect = (21/9) + (1.0 − t) × (max_landscape_aspect − 21/9)
-/// ```
-///
-/// # Parameters
-/// - `bbox`: Person bounding box (after margin expansion).
-/// - `photo_width`: Photo width in pixels.
-/// - `config`: Must have `max_landscape_aspect` set (default 25/9).
-///
-/// # Returns
-/// Aspect ratio as `width / height` in `[21/9, max_landscape_aspect]`.
-pub fn calculate_landscape_aspect_ratio(bbox: &BBox, photo_width: u32, config: &CropConfig) -> f32 {
-    let pw = photo_width as f32;
-    if pw <= 0.0 {
-        return 21.0 / 9.0;
-    }
-
-    let person_width_ratio = bbox.width() / pw;
-    let base_aspect = 21.0_f32 / 9.0;
-
-    if person_width_ratio >= 0.40 {
-        return base_aspect;
-    }
-
-    let t = person_width_ratio / 0.40;
-    let max_aspect = config.max_landscape_aspect;
-    let expanded = base_aspect + (1.0 - t) * (max_aspect - base_aspect);
-
-    expanded.clamp(base_aspect, max_aspect)
-}
-
-// ---------------------------------------------------------------------------
 // Enhanced crop functions (_with_face variants)
 // ---------------------------------------------------------------------------
 
@@ -649,18 +409,15 @@ pub fn calculate_landscape_21_9_crop_with_face(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
-    face_bbox: Option<&BBox>,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
     config: &CropConfig,
+    artistic: &crate::config::ArtisticCropConfig,
 ) -> Option<CropRegion> {
     let pw = photo_width as f32;
     let ph = photo_height as f32;
 
-    // E2: Dynamic aspect ratio for narrow subjects.
-    let aspect_ratio = if config.enable_landscape_expansion {
-        calculate_landscape_aspect_ratio(bbox, photo_width, config)
-    } else {
-        21.0 / 9.0
-    };
+    let aspect_ratio = 21.0 / 9.0;
 
     // Compute crop dimensions.
     let mut crop_height = ph;
@@ -670,39 +427,28 @@ pub fn calculate_landscape_21_9_crop_with_face(
         crop_height = crop_width / aspect_ratio;
     }
 
-    // E1+E5 + pose-adaptive headroom.
-    let crop_y = if config.enable_pose_adaptive_headroom {
-        calculate_crop_y_anchor_with_pose(
-            bbox,
-            face_bbox,
-            crop_height,
-            CropFormat::Landscape,
-            config,
-        )
-    } else if config.enable_adaptive_headroom {
-        calculate_crop_y_anchor(bbox, face_bbox, crop_height, config)
-    } else {
-        bbox.center_y() - (crop_height * config.headroom_ratio)
-    };
+    let mut target_x_frac = 0.50;
+    if config.enable_directional_thirds && !face_bboxes.is_empty() {
+        let direction = detect_pose_direction(bbox, &face_bboxes[0]);
+        target_x_frac = match direction {
+            Direction::FacingRight => 0.33,
+            Direction::FacingLeft => 0.67,
+            Direction::Frontal => 0.50,
+        };
+    }
 
-    // E3: Horizontal softening.
-    let raw_crop_x = bbox.center_x() - (crop_width / 2.0);
-    let crop_x = if config.enable_horizontal_softening {
-        apply_horizontal_softening(raw_crop_x, crop_width, bbox.center_x(), pw, config)
-    } else {
-        raw_crop_x
-    };
+    let mut target_y_frac = config.target_y_frac_landscape + artistic.target_y_offset();
+    target_y_frac = target_y_frac.clamp(0.10, 0.50);
 
-    // Clamp to photo bounds.
-    let crop_x = crop_x.max(0.0).min((pw - crop_width).max(0.0));
-    let crop_y = crop_y.max(0.0).min((ph - crop_height).max(0.0));
-
-    let crop = CropRegion {
-        x: crop_x,
-        y: crop_y,
-        width: crop_width,
-        height: crop_height,
-    };
+    let crop = place_focal_point(
+        photo_width,
+        photo_height,
+        crop_width,
+        crop_height,
+        focal,
+        target_x_frac,
+        target_y_frac,
+    );
 
     if person_is_reasonably_visible_threshold(
         bbox,
@@ -725,75 +471,6 @@ pub fn calculate_landscape_21_9_crop_with_face(
 ///
 /// **Algorithm:**
 /// 1. Start with `crop_width = photo_width`; derive `crop_height = crop_width / aspect_ratio`.
-/// 2. If `crop_height > photo_height`, reduce to `photo_height` and recalculate width.
-/// 3. Position bbox center at `config.headroom_ratio` from crop top (default 40%).
-/// 4. Center person horizontally.
-/// 5. Clamp to photo bounds.
-/// 6. Return `None` if person visibility < `config.visibility_threshold`.
-fn calculate_portrait_crop(
-    photo_width: u32,
-    photo_height: u32,
-    bbox: &BBox,
-    aspect_ratio: f32, // width/height, e.g. 9.0/21.0 for 9:21
-    config: &CropConfig,
-) -> Option<CropRegion> {
-    let pw = photo_width as f32;
-    let ph = photo_height as f32;
-
-    // Step 1: try using the full photo width.
-    let mut crop_width = pw;
-    let mut crop_height = crop_width / aspect_ratio;
-
-    // Step 2: if height exceeds photo height, scale down to fit.
-    if crop_height > ph {
-        crop_height = ph;
-        crop_width = crop_height * aspect_ratio;
-    }
-
-    // Step 3: Pose-aware vertical anchor when enabled.
-    let format = if aspect_ratio < 0.50 {
-        CropFormat::Mobile
-    } else {
-        CropFormat::Portrait
-    };
-    let crop_y = if config.enable_pose_adaptive_headroom {
-        calculate_crop_y_anchor_with_pose(bbox, None, crop_height, format, config)
-    } else {
-        bbox.center_y() - (crop_height * config.headroom_ratio)
-    };
-
-    // Step 4: Rule-of-thirds horizontal positioning when enabled.
-    let crop_x = if config.enable_rule_of_thirds {
-        let direction = detect_pose_direction(bbox, None, pw);
-        calculate_portrait_crop_x(bbox, crop_width, direction, pw)
-    } else {
-        bbox.center_x() - (crop_width / 2.0)
-    };
-
-    // Step 5: Clamp.
-    let crop_x = crop_x.max(0.0).min((pw - crop_width).max(0.0));
-    let crop_y = crop_y.max(0.0).min((ph - crop_height).max(0.0));
-
-    let crop = CropRegion {
-        x: crop_x,
-        y: crop_y,
-        width: crop_width,
-        height: crop_height,
-    };
-
-    // Step 6: Visibility gate using configurable threshold.
-    if person_is_reasonably_visible_threshold(
-        bbox,
-        &crop,
-        config.visibility_threshold,
-        photo_width,
-        photo_height,
-    ) {
-        Some(crop)
-    } else {
-        None
-    }
-}
 
 /// Calculate a 9:21 ultrawide portrait crop with configurable bbox-center upward bias.
 ///
@@ -806,47 +483,62 @@ fn calculate_portrait_crop(
 ///
 /// # Returns
 /// `Some(CropRegion)` when the person is sufficiently visible, `None` otherwise.
-pub fn calculate_portrait_9_21_crop(
+pub fn calculate_portrait_9_21_crop_with_face(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
     config: &CropConfig,
+    artistic: &crate::config::ArtisticCropConfig,
 ) -> Option<CropRegion> {
-    const ASPECT_RATIO: f32 = 9.0 / 21.0; // ~0.4286 (width/height)
-    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO, config)
+    const ASPECT_RATIO: f32 = 9.0 / 21.0;
+    calculate_portrait_crop_enhanced(
+        photo_width,
+        photo_height,
+        bbox,
+        face_bboxes,
+        focal,
+        ASPECT_RATIO,
+        config.target_y_frac_mobile,
+        config,
+        artistic,
+    )
 }
 
-/// Calculate a 9:16 standard portrait crop with configurable bbox-center upward bias.
-///
-/// See the shared portrait crop helper in this module for the full algorithm description.
-///
-/// # Parameters
-/// - `photo_width` / `photo_height`: Source photo dimensions.
-/// - `bbox`: Person bounding box (should already include margin if applicable).
-/// - `config`: Cropping configuration controlling headroom and visibility threshold.
-///
-/// # Returns
-/// `Some(CropRegion)` when the person is sufficiently visible, `None` otherwise.
-pub fn calculate_portrait_9_16_crop(
+pub fn calculate_portrait_9_16_crop_with_face(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
     config: &CropConfig,
+    artistic: &crate::config::ArtisticCropConfig,
 ) -> Option<CropRegion> {
-    const ASPECT_RATIO: f32 = 9.0 / 16.0; // 0.5625 (width/height)
-    calculate_portrait_crop(photo_width, photo_height, bbox, ASPECT_RATIO, config)
+    const ASPECT_RATIO: f32 = 9.0 / 16.0;
+    calculate_portrait_crop_enhanced(
+        photo_width,
+        photo_height,
+        bbox,
+        face_bboxes,
+        focal,
+        ASPECT_RATIO,
+        config.target_y_frac_portrait,
+        config,
+        artistic,
+    )
 }
 
-/// Enhanced portrait crop with face-aware anchoring and horizontal
-/// softening (E1, E3, E5). No landscape expansion (E2 is
-/// landscape-only).
 fn calculate_portrait_crop_enhanced(
     photo_width: u32,
     photo_height: u32,
     bbox: &BBox,
-    face_bbox: Option<&BBox>,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
     aspect_ratio: f32,
+    target_y_frac_base: f32,
     config: &CropConfig,
+    artistic: &crate::config::ArtisticCropConfig,
 ) -> Option<CropRegion> {
     let pw = photo_width as f32;
     let ph = photo_height as f32;
@@ -858,42 +550,28 @@ fn calculate_portrait_crop_enhanced(
         crop_width = crop_height * aspect_ratio;
     }
 
-    // E1+E5 + pose-adaptive headroom.
-    let format = if aspect_ratio < 0.50 {
-        CropFormat::Mobile
-    } else {
-        CropFormat::Portrait
-    };
-    let crop_y = if config.enable_pose_adaptive_headroom {
-        calculate_crop_y_anchor_with_pose(bbox, face_bbox, crop_height, format, config)
-    } else if config.enable_adaptive_headroom {
-        calculate_crop_y_anchor(bbox, face_bbox, crop_height, config)
-    } else {
-        bbox.center_y() - (crop_height * config.headroom_ratio)
-    };
+    let mut target_x_frac = 0.50;
+    if config.enable_directional_thirds && !face_bboxes.is_empty() {
+        let direction = detect_pose_direction(bbox, &face_bboxes[0]);
+        target_x_frac = match direction {
+            Direction::FacingRight => 0.33,
+            Direction::FacingLeft => 0.67,
+            Direction::Frontal => 0.50,
+        };
+    }
 
-    // E3: Horizontal softening.
-    let raw_crop_x = if config.enable_rule_of_thirds {
-        let direction = detect_pose_direction(bbox, face_bbox, pw);
-        calculate_portrait_crop_x(bbox, crop_width, direction, pw)
-    } else {
-        bbox.center_x() - (crop_width / 2.0)
-    };
-    let crop_x = if config.enable_horizontal_softening {
-        apply_horizontal_softening(raw_crop_x, crop_width, bbox.center_x(), pw, config)
-    } else {
-        raw_crop_x
-    };
+    let mut target_y_frac = target_y_frac_base + artistic.target_y_offset();
+    target_y_frac = target_y_frac.clamp(0.10, 0.50);
 
-    let crop_x = crop_x.max(0.0).min((pw - crop_width).max(0.0));
-    let crop_y = crop_y.max(0.0).min((ph - crop_height).max(0.0));
-
-    let crop = CropRegion {
-        x: crop_x,
-        y: crop_y,
-        width: crop_width,
-        height: crop_height,
-    };
+    let crop = place_focal_point(
+        photo_width,
+        photo_height,
+        crop_width,
+        crop_height,
+        focal,
+        target_x_frac,
+        target_y_frac,
+    );
 
     if person_is_reasonably_visible_threshold(
         bbox,
@@ -906,50 +584,6 @@ fn calculate_portrait_crop_enhanced(
     } else {
         None
     }
-}
-
-/// Enhanced 9:21 portrait crop with face-aware anchoring (E1, E3, E5).
-///
-/// See [`calculate_portrait_9_21_crop`] for the base algorithm and
-/// [`calculate_landscape_21_9_crop_with_face`] for enhancement docs.
-pub fn calculate_portrait_9_21_crop_with_face(
-    photo_width: u32,
-    photo_height: u32,
-    bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    config: &CropConfig,
-) -> Option<CropRegion> {
-    const ASPECT_RATIO: f32 = 9.0 / 21.0;
-    calculate_portrait_crop_enhanced(
-        photo_width,
-        photo_height,
-        bbox,
-        face_bbox,
-        ASPECT_RATIO,
-        config,
-    )
-}
-
-/// Enhanced 9:16 portrait crop with face-aware anchoring (E1, E3, E5).
-///
-/// See [`calculate_portrait_9_16_crop`] for the base algorithm and
-/// [`calculate_landscape_21_9_crop_with_face`] for enhancement docs.
-pub fn calculate_portrait_9_16_crop_with_face(
-    photo_width: u32,
-    photo_height: u32,
-    bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    config: &CropConfig,
-) -> Option<CropRegion> {
-    const ASPECT_RATIO: f32 = 9.0 / 16.0;
-    calculate_portrait_crop_enhanced(
-        photo_width,
-        photo_height,
-        bbox,
-        face_bbox,
-        ASPECT_RATIO,
-        config,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -995,18 +629,59 @@ pub fn detect_suitable_formats(
 
     let mut suitable: Vec<String> = Vec::new();
 
+    let focal = crate::focal_point::compute_focal_point(
+        Some(&working_bbox),
+        &[],
+        photo_width,
+        photo_height,
+    );
+
     // Landscape 21:9 is always attempted regardless of bbox orientation.
-    if calculate_landscape_21_9_crop(photo_width, photo_height, &working_bbox, config).is_some() {
+    if calculate_landscape_21_9_crop_with_face(
+        photo_width,
+        photo_height,
+        &working_bbox,
+        &[],
+        &focal,
+        config,
+        &crate::config::ArtisticCropConfig::default(),
+    )
+    .is_some()
+    {
         suitable.push("21:9".to_string());
     }
 
     // Portrait formats are only attempted when the person's bbox is portrait-oriented.
     if !bbox_is_wide {
-        if calculate_portrait_9_21_crop(photo_width, photo_height, &working_bbox, config).is_some()
+        let focal = crate::focal_point::compute_focal_point(
+            Some(&working_bbox),
+            &[],
+            photo_width,
+            photo_height,
+        );
+        if calculate_portrait_9_21_crop_with_face(
+            photo_width,
+            photo_height,
+            &working_bbox,
+            &[],
+            &focal,
+            config,
+            &crate::config::ArtisticCropConfig::default(),
+        )
+        .is_some()
         {
             suitable.push("9:21".to_string());
         }
-        if calculate_portrait_9_16_crop(photo_width, photo_height, &working_bbox, config).is_some()
+        if calculate_portrait_9_16_crop_with_face(
+            photo_width,
+            photo_height,
+            &working_bbox,
+            &[],
+            &focal,
+            config,
+            &crate::config::ArtisticCropConfig::default(),
+        )
+        .is_some()
         {
             suitable.push("9:16".to_string());
         }
@@ -1382,357 +1057,6 @@ pub fn select_dominant_face_for_crop(face_bboxes: &[BBox]) -> Option<&BBox> {
     })
 }
 
-/// Compute a pose-adaptive headroom ratio based on where the face
-/// sits within the person bounding box.
-///
-/// Returns a value in `[0.0, 1.0]` representing the fraction of
-/// crop height to allocate above the vertical anchor point.
-///
-/// # Three-tier logic
-///
-/// | Tier | `face_rel_y` range | Headroom returned | Rationale |
-/// |------|--------------------|-------------------|-----------|
-/// | 1    | `< 0.20`           | `config.headroom_ratio` | Arms-raised/reclining face-at-edge; caller uses face-anchor (E5) instead |
-/// | 2    | `[0.20, 0.50)`     | `0.35` | Normal standing — face higher than body center → tighter headroom |
-/// | 3    | `≥ 0.50` or no face| `config.headroom_ratio` | Sitting/bending/no face → original algorithm |
-///
-/// `face_rel_y` = `(face_center_y − person_bbox.y1) / person_bbox.height()`.
-///
-/// # Parameters
-/// - `person_bbox`: Person detection bounding box.
-/// - `face_bbox`: Dominant face bbox, or `None` if no face detected.
-/// - `config`: Crop configuration (provides fallback `headroom_ratio`).
-pub fn calculate_adaptive_headroom(
-    person_bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    config: &CropConfig,
-) -> f32 {
-    let face = match face_bbox {
-        Some(f) => f,
-        None => return config.headroom_ratio,
-    };
-
-    let person_height = person_bbox.height();
-    if person_height <= 0.0 {
-        return config.headroom_ratio;
-    }
-
-    let face_rel_y = (face.center_y() - person_bbox.y1) / person_height;
-
-    if face_rel_y < 0.20 {
-        // Tier 1: face-anchor mode — caller uses E5 formula; return safe fallback.
-        config.headroom_ratio
-    } else if face_rel_y < 0.50 {
-        // Tier 2: normal standing — tighter headroom anchored to face center.
-        0.35
-    } else {
-        // Tier 3: sitting/bending or face below center — original headroom.
-        config.headroom_ratio
-    }
-}
-
-/// Compute the vertical crop position (crop_y) using adaptive
-/// face-aware anchoring.
-///
-/// Integrates E1 (multi-tier headroom) and E5 (face-anchor for
-/// top-20% face positions) into a single crop_y computation.
-///
-/// # Algorithm
-///
-/// 1. If `face_bbox` is `None`: body-center formula
-///    `person_center_y − crop_height × headroom_ratio`.
-/// 2. Compute `face_rel_y` (face center's relative vertical position
-///    within the person bbox; 0.0 = top, 1.0 = bottom).
-/// 3. **Tier 1** (`face_rel_y < 0.20`, E5): Anchor crop top to
-///    `face.y1 − 5% × crop_height` (tiny breathing gap above forehead).
-/// 4. **Tier 2** (`0.20 ≤ face_rel_y < 0.50`, E1): Anchor on
-///    face center with adaptive headroom (0.35).
-/// 5. **Tier 3** (`face_rel_y ≥ 0.50`): Original body-center formula.
-///
-/// The returned value is **not clamped** — caller must clamp to
-/// `[0.0, photo_height − crop_height]`.
-///
-/// # Parameters
-/// - `person_bbox`: Person bounding box.
-/// - `face_bbox`: Dominant face bbox, or `None`.
-/// - `crop_height`: Height of the crop region in pixels.
-/// - `config`: Crop config (`headroom_ratio` used for fallback).
-///
-/// # Returns
-/// Raw `crop_y` value (may be negative; caller clamps).
-pub fn calculate_crop_y_anchor(
-    person_bbox: &BBox,
-    face_bbox: Option<&BBox>,
-    crop_height: f32,
-    config: &CropConfig,
-) -> f32 {
-    let face = match face_bbox {
-        Some(f) => f,
-        None => {
-            return person_bbox.center_y() - (crop_height * config.headroom_ratio);
-        }
-    };
-
-    let person_height = person_bbox.height();
-    if person_height <= 0.0 {
-        return person_bbox.center_y() - (crop_height * config.headroom_ratio);
-    }
-
-    let face_rel_y = (face.center_y() - person_bbox.y1) / person_height;
-
-    if face_rel_y < 0.20 {
-        // Tier 1 (E5): Face-anchor — place crop top just above forehead.
-        let breathing_gap = 0.05 * crop_height;
-        face.y1 - breathing_gap
-    } else if face_rel_y < 0.50 {
-        // Tier 2 (E1): Face-center anchor with tighter headroom.
-        let headroom = calculate_adaptive_headroom(person_bbox, Some(face), config);
-        face.center_y() - (crop_height * headroom)
-    } else {
-        // Tier 3 (E1 fallback): Body-center with original headroom.
-        person_bbox.center_y() - (crop_height * config.headroom_ratio)
-    }
-}
-
-/// Select the dominant face from a list of face-person pairs using the given strategy.
-///
-/// When `pairs` is empty, returns `None`.
-///
-/// # Deprecation Notice
-/// This function is deprecated. Use [`crate::face_aware_cropping::find_dominant_face`]
-/// which works directly with `BBox` slices and always uses the `MostCentral` strategy.
-///
-/// # Arguments
-/// * `pairs`      — Correlated face-person pairs (from [`correlate_faces_to_persons`]).
-/// * `strategy`   — Selection algorithm.
-/// * `img_w`      — Image width in pixels (used for centrality calculation).
-/// * `img_h`      — Image height in pixels (used for centrality calculation).
-///
-/// # Returns
-/// Reference to the dominant [`FacePersonPair`], or `None` if `pairs` is empty.
-///
-/// # Example
-/// ```rust,ignore
-/// use icarus_v2::config::FaceSelectionStrategy;
-/// let dominant = select_dominant_face(&pairs, &FaceSelectionStrategy::MostCentral, 1920, 1080);
-/// ```
-#[deprecated(
-    since = "2.1.0",
-    note = "Use face_aware_cropping::find_dominant_face() which uses MostCentral strategy."
-)]
-#[allow(deprecated)]
-pub fn select_dominant_face<'a>(
-    pairs: &'a [FacePersonPair],
-    strategy: &crate::config::FaceSelectionStrategy,
-    img_w: u32,
-    img_h: u32,
-) -> Option<&'a FacePersonPair> {
-    use crate::config::FaceSelectionStrategy;
-
-    if pairs.is_empty() {
-        return None;
-    }
-
-    let img_cx = img_w as f32 / 2.0;
-    let img_cy = img_h as f32 / 2.0;
-    let max_dist = ((img_cx * img_cx) + (img_cy * img_cy)).sqrt();
-
-    match strategy {
-        FaceSelectionStrategy::Largest => pairs.iter().max_by(|a, b| {
-            a.face_area()
-                .partial_cmp(&b.face_area())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-
-        FaceSelectionStrategy::HighestConfidence => pairs.iter().max_by(|a, b| {
-            a.confidence
-                .partial_cmp(&b.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }),
-
-        FaceSelectionStrategy::MostCentral => pairs.iter().min_by(|a, b| {
-            let (ax, ay) = a.face_centroid();
-            let (bx, by) = b.face_centroid();
-            let da = ((ax - img_cx).powi(2) + (ay - img_cy).powi(2)).sqrt();
-            let db = ((bx - img_cx).powi(2) + (by - img_cy).powi(2)).sqrt();
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        }),
-
-        FaceSelectionStrategy::WeightedScore => {
-            // Compute per-pair score: 50% size + 30% confidence + 20% centrality.
-            // All three components are normalised to [0, 1].
-            let max_area = pairs
-                .iter()
-                .map(|p| p.face_area())
-                .fold(0.0f32, f32::max)
-                .max(1.0); // avoid division by zero
-
-            pairs.iter().max_by(|a, b| {
-                let score = |p: &FacePersonPair| {
-                    let size_score = p.face_area() / max_area;
-                    let conf_score = p.confidence; // already in [0,1]
-                    let (px, py) = p.face_centroid();
-                    let dist = ((px - img_cx).powi(2) + (py - img_cy).powi(2)).sqrt();
-                    let central_score = if max_dist > 0.0 {
-                        1.0 - (dist / max_dist)
-                    } else {
-                        1.0
-                    };
-                    0.5 * size_score + 0.3 * conf_score + 0.2 * central_score
-                };
-
-                score(a)
-                    .partial_cmp(&score(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        }
-    }
-}
-
-/// Compute a face-centric artistic crop region for the given aspect ratio.
-///
-/// Positions the crop to satisfy three competing objectives simultaneously:
-/// 1. **Face visibility**: The face (plus margin) must be entirely inside the crop.
-/// 2. **Body composition**: The person bbox is included proportionally per a fixed head-to-body ratio.
-/// 3. **Artistic framing**: The face centroid is biased toward the crop center based on `mode`.
-///
-/// # Deprecation Notice
-/// This function is deprecated. Use [`crate::face_aware_cropping::apply_face_aware_adjustment`]
-/// instead, which provides cleaner separation of concerns and always returns a valid `CropRegion`.
-///
-/// # Arguments
-/// * `photo_w` / `photo_h` — Source photo dimensions.
-/// * `dominant_face` — The selected dominant face-person pair.
-/// * `aspect_ratio` — Target crop width/height ratio (e.g. 21.0/9.0).
-/// * `artistic`     — Artistic crop configuration.
-/// * `base_config`  — Base crop config (visibility threshold, headroom ratio).
-///
-/// # Returns
-/// `Some(CropRegion)` when all constraints are met, `None` otherwise.
-///
-/// # Example
-/// ```rust,ignore
-/// let crop = compute_artistic_crop(
-///     3024, 4032, &dominant_face, 9.0 / 16.0, &artistic_config, &crop_config
-/// );
-/// ```
-#[deprecated(
-    since = "2.1.0",
-    note = "Use face_aware_cropping::apply_face_aware_adjustment() instead."
-)]
-#[allow(deprecated)]
-pub fn compute_artistic_crop(
-    photo_w: u32,
-    photo_h: u32,
-    dominant_face: &FacePersonPair,
-    aspect_ratio: f32, // width / height
-    artistic: &crate::config::ArtisticCropConfig,
-    base_config: &CropConfig,
-) -> Option<CropRegion> {
-    let pw = photo_w as f32;
-    let ph = photo_h as f32;
-
-    // Derive legacy params from the new config fields.
-    let (face_centroid_bias, margin_multiplier, min_body_visibility) = match artistic.artistic_mode
-    {
-        crate::config::ArtisticMode::Conservative => (0.3f32, 1.5f32, 0.6f32),
-        crate::config::ArtisticMode::Balanced => (0.6, 1.0, 0.4),
-        crate::config::ArtisticMode::Aggressive => (0.9, 0.7, 0.2),
-    };
-    let face_margin = artistic.face_safety_margin_px;
-    // Fixed head-to-body ratio (was configurable in old code, now mode-derived).
-    let head_to_body = match artistic.artistic_mode {
-        crate::config::ArtisticMode::Conservative => 0.4f32,
-        crate::config::ArtisticMode::Balanced => 0.5,
-        crate::config::ArtisticMode::Aggressive => 0.6,
-    };
-    // Step 1: Expand the face bbox by the pixel margin (used for visibility check below).
-
-    // Step 2: Compute the target crop dimensions for this aspect ratio.
-    // Prefer using the full photo width (portrait-like) or height (landscape-like).
-    let (crop_w, crop_h) = if aspect_ratio >= 1.0 {
-        // Landscape: start with full photo width.
-        let cw = pw;
-        let ch = cw / aspect_ratio;
-        if ch <= ph {
-            (cw, ch)
-        } else {
-            let ch2 = ph;
-            (ch2 * aspect_ratio, ch2)
-        }
-    } else {
-        // Portrait: start with full photo width.
-        let cw = pw;
-        let ch = cw / aspect_ratio;
-        if ch <= ph {
-            (cw, ch)
-        } else {
-            let ch2 = ph;
-            (ch2 * aspect_ratio, ch2)
-        }
-    };
-
-    // Step 3: Determine the face centroid.
-    let (face_cx, face_cy) = dominant_face.face_centroid();
-
-    // Step 4: Compute the person-body anchor point.
-    // Blend face centroid with person bbox center using head_to_body_ratio.
-    let person_cx = dominant_face.person_bbox.center_x();
-    let person_cy = dominant_face.person_bbox.center_y();
-
-    // Anchor Y: blend face cy and person cy. When head_to_body = 0.5, the anchor
-    // sits halfway between the face centroid and the person center (body-aware).
-    let anchor_cx = face_cx * head_to_body + person_cx * (1.0 - head_to_body);
-    let anchor_cy = face_cy * head_to_body + person_cy * (1.0 - head_to_body);
-
-    // Step 5: Position the crop.
-    // face_centroid_bias controls where in the crop the face centroid lands:
-    // 0.0 → face at top of crop, 1.0 → face at bottom.
-    // We target: crop_y = anchor_cy - (crop_h * headroom_position)
-    let headroom_position =
-        base_config.headroom_ratio * (1.0 - face_centroid_bias) + 0.35 * face_centroid_bias;
-
-    // Apply centroid bias: blend anchor_cx toward face_cx by centroid_bias.
-    let biased_cx = anchor_cx * (1.0 - face_centroid_bias) + face_cx * face_centroid_bias;
-    let biased_cy = anchor_cy * (1.0 - face_centroid_bias) + face_cy * face_centroid_bias;
-
-    let crop_x_raw = biased_cx - (crop_w / 2.0);
-    let crop_y_raw = biased_cy - (crop_h * headroom_position);
-
-    // Step 6: Clamp to photo bounds.
-    let crop_x = crop_x_raw.max(0.0).min((pw - crop_w).max(0.0));
-    let crop_y = crop_y_raw.max(0.0).min((ph - crop_h).max(0.0));
-
-    let crop = CropRegion {
-        x: crop_x,
-        y: crop_y,
-        width: crop_w,
-        height: crop_h,
-    };
-
-    // Step 7: Verify the face zone is fully visible with margins (face must never be cut).
-    let effective_margin = (face_margin as f32 * margin_multiplier) as u32;
-    let required_face_zone =
-        expand_bbox_px(&dominant_face.face_bbox, effective_margin, photo_w, photo_h);
-
-    if !is_region_visible(&required_face_zone, &crop) {
-        return None;
-    }
-
-    // Step 8: Check person body visibility against the mode's minimum threshold.
-    if !person_is_reasonably_visible_threshold(
-        &dominant_face.person_bbox,
-        &crop,
-        min_body_visibility,
-        photo_w,
-        photo_h,
-    ) {
-        return None;
-    }
-
-    Some(crop)
-}
-
 /// Returns `true` if the bounding box `zone` is fully contained within the `crop` region.
 ///
 /// Used to verify face visibility after crop positioning.
@@ -1823,44 +1147,14 @@ pub fn detect_suitable_formats_with_faces(
     person_bbox: &BBox,
     face_pairs: &[FacePersonPair],
     margin_pct: f32,
-    artistic: &crate::config::ArtisticCropConfig,
+    _artistic: &crate::config::ArtisticCropConfig,
     base_config: &CropConfig,
 ) -> Vec<String> {
     if face_pairs.is_empty() {
         // Fall back to person-bbox-only format detection.
         return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
     }
-
-    // Select the dominant face using MostCentral strategy (always, per new design).
-    #[allow(deprecated)]
-    let dominant = select_dominant_face(
-        face_pairs,
-        &crate::config::FaceSelectionStrategy::MostCentral,
-        photo_w,
-        photo_h,
-    );
-
-    let Some(dominant) = dominant else {
-        return detect_suitable_formats(photo_w, photo_h, person_bbox, margin_pct, base_config);
-    };
-
-    // Attempt each candidate aspect ratio.
-    let candidate_ratios: &[(&str, f32)] = &[
-        ("21:9", 21.0 / 9.0),
-        ("9:16", 9.0 / 16.0),
-        ("9:21", 9.0 / 21.0),
-    ];
-
-    candidate_ratios
-        .iter()
-        .filter_map(|(name, ratio)| {
-            #[allow(deprecated)]
-            let result =
-                compute_artistic_crop(photo_w, photo_h, dominant, *ratio, artistic, base_config)
-                    .map(|_| name.to_string());
-            result
-        })
-        .collect()
+    vec![]
 }
 
 // ---------------------------------------------------------------------------
@@ -2002,96 +1296,6 @@ mod tests {
             height: 400.0,
         };
         assert!(!person_is_reasonably_visible(&bbox, &crop, 1920, 1080));
-    }
-
-    // --- calculate_landscape_21_9_crop ---
-
-    #[test]
-    fn test_landscape_crop_returns_some_for_visible_person() {
-        // 4000×3000 landscape photo, centred tall person
-        let bbox = BBox {
-            x1: 1600.0,
-            y1: 300.0,
-            x2: 2400.0,
-            y2: 2800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_landscape_21_9_crop(4000, 3000, &bbox, &config);
-        assert!(result.is_some(), "Expected Some for visible person");
-        let crop = result.unwrap();
-        // Aspect ratio should be close to 21:9
-        let ratio = crop.width / crop.height;
-        assert!(
-            (ratio - 21.0 / 9.0).abs() < 0.05,
-            "Expected ~21:9 ratio, got {:.4}",
-            ratio
-        );
-        // Crop stays within photo bounds
-        assert!(crop.x >= 0.0 && crop.x + crop.width <= 4000.0);
-        assert!(crop.y >= 0.0 && crop.y + crop.height <= 3000.0);
-    }
-
-    #[test]
-    fn test_landscape_crop_clamps_to_photo_bounds() {
-        // Person in corner — crop must not go out of bounds
-        let bbox = BBox {
-            x1: 0.0,
-            y1: 0.0,
-            x2: 200.0,
-            y2: 800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_landscape_21_9_crop(1920, 1080, &bbox, &config);
-        if let Some(crop) = result {
-            assert!(crop.x >= 0.0);
-            assert!(crop.y >= 0.0);
-            assert!(crop.x + crop.width <= 1920.0 + 0.01); // float tolerance
-            assert!(crop.y + crop.height <= 1080.0 + 0.01);
-        }
-    }
-
-    // --- calculate_portrait_9_21_crop ---
-
-    #[test]
-    fn test_portrait_9_21_crop_for_tall_person_in_portrait_photo() {
-        let photo_w = 3024u32;
-        let photo_h = 4032u32;
-        let bbox = tall_person_bbox();
-        let config = CropConfig::default();
-        let result = calculate_portrait_9_21_crop(photo_w, photo_h, &bbox, &config);
-        assert!(
-            result.is_some(),
-            "Expected Some for visible tall person in portrait photo"
-        );
-        let crop = result.unwrap();
-        let ratio = crop.width / crop.height;
-        assert!(
-            (ratio - 9.0 / 21.0).abs() < 0.05,
-            "Expected ~9:21 ratio, got {:.4}",
-            ratio
-        );
-    }
-
-    // --- calculate_portrait_9_16_crop ---
-
-    #[test]
-    fn test_portrait_9_16_crop_for_tall_person_in_portrait_photo() {
-        let photo_w = 3024u32;
-        let photo_h = 4032u32;
-        let bbox = tall_person_bbox();
-        let config = CropConfig::default();
-        let result = calculate_portrait_9_16_crop(photo_w, photo_h, &bbox, &config);
-        assert!(
-            result.is_some(),
-            "Expected Some for visible tall person in portrait photo"
-        );
-        let crop = result.unwrap();
-        let ratio = crop.width / crop.height;
-        assert!(
-            (ratio - 9.0 / 16.0).abs() < 0.05,
-            "Expected ~9:16 ratio, got {:.4}",
-            ratio
-        );
     }
 
     // --- detect_suitable_formats ---
@@ -2260,176 +1464,6 @@ mod tests {
         assert!((headroom - 0.45).abs() < 0.001);
     }
 
-    #[test]
-    fn test_detect_pose_direction_facing_right_with_face() {
-        let person = BBox {
-            x1: 100.0,
-            y1: 100.0,
-            x2: 300.0,
-            y2: 700.0,
-        };
-        let face = BBox {
-            x1: 110.0,
-            y1: 170.0,
-            x2: 170.0,
-            y2: 230.0,
-        };
-        assert_eq!(
-            detect_pose_direction(&person, Some(&face), 1200.0),
-            Direction::FacingLeft
-        );
-    }
-
-    #[test]
-    fn test_detect_pose_direction_facing_left_with_face() {
-        let person = BBox {
-            x1: 100.0,
-            y1: 100.0,
-            x2: 300.0,
-            y2: 700.0,
-        };
-        let face = BBox {
-            x1: 230.0,
-            y1: 170.0,
-            x2: 290.0,
-            y2: 230.0,
-        };
-        assert_eq!(
-            detect_pose_direction(&person, Some(&face), 1200.0),
-            Direction::FacingRight
-        );
-    }
-
-    #[test]
-    fn test_detect_pose_direction_frontal_with_face() {
-        let person = BBox {
-            x1: 100.0,
-            y1: 100.0,
-            x2: 300.0,
-            y2: 700.0,
-        };
-        let face = BBox {
-            x1: 170.0,
-            y1: 170.0,
-            x2: 230.0,
-            y2: 230.0,
-        };
-        assert_eq!(
-            detect_pose_direction(&person, Some(&face), 1200.0),
-            Direction::Frontal
-        );
-    }
-
-    #[test]
-    fn test_detect_pose_direction_from_photo_asymmetry_left() {
-        let person = BBox {
-            x1: 50.0,
-            y1: 100.0,
-            x2: 250.0,
-            y2: 700.0,
-        };
-        assert_eq!(
-            detect_pose_direction(&person, None, 1200.0),
-            Direction::FacingLeft
-        );
-    }
-
-    #[test]
-    fn test_detect_pose_direction_from_photo_asymmetry_right() {
-        let person = BBox {
-            x1: 950.0,
-            y1: 100.0,
-            x2: 1150.0,
-            y2: 700.0,
-        };
-        assert_eq!(
-            detect_pose_direction(&person, None, 1200.0),
-            Direction::FacingRight
-        );
-    }
-
-    #[test]
-    fn test_portrait_crop_x_facing_right_uses_left_third() {
-        let person = BBox {
-            x1: 400.0,
-            y1: 100.0,
-            x2: 800.0,
-            y2: 700.0,
-        };
-        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::FacingRight, 1200.0);
-        assert!((crop_x - 400.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_portrait_crop_x_facing_left_uses_right_third() {
-        let person = BBox {
-            x1: 400.0,
-            y1: 100.0,
-            x2: 800.0,
-            y2: 700.0,
-        };
-        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::FacingLeft, 1200.0);
-        assert!((crop_x - 200.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_portrait_crop_x_frontal_centers_subject() {
-        let person = BBox {
-            x1: 400.0,
-            y1: 100.0,
-            x2: 800.0,
-            y2: 700.0,
-        };
-        let crop_x = calculate_portrait_crop_x(&person, 600.0, Direction::Frontal, 1200.0);
-        assert!((crop_x - 300.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_crop_y_anchor_with_pose_standing_landscape() {
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_crop_y_anchor_with_pose(
-            &person,
-            None,
-            1296.0,
-            CropFormat::Landscape,
-            &config,
-        );
-        let expected = person.center_y() - (1296.0 * 0.48);
-        assert!((result - expected).abs() < 0.5);
-    }
-
-    #[test]
-    fn test_crop_y_anchor_with_pose_sitting_portrait() {
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 1400.0,
-        };
-        let face = BBox {
-            x1: 700.0,
-            y1: 500.0,
-            x2: 1300.0,
-            y2: 860.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_crop_y_anchor_with_pose(
-            &person,
-            Some(&face),
-            1296.0,
-            CropFormat::Portrait,
-            &config,
-        );
-        let expected = face.center_y() - (1296.0 * 0.50);
-        assert!((result - expected).abs() < 0.5);
-    }
-
     // ── E4 Tests ─────────────────────────────────────────────────────────
 
     #[test]
@@ -2545,241 +1579,53 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_headroom_tier1_top_20_percent() {
-        // face_rel_y = (450-200)/3600 = 0.069 → Tier 1
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
+    fn test_place_focal_point_centered() {
+        let f = crate::focal_point::FocalPoint {
+            x: 500.0,
+            y: 500.0,
+            kind: crate::focal_point::FocalKind::ImageCenter,
         };
-        let face = BBox {
-            x1: 700.0,
-            y1: 250.0,
-            x2: 1300.0,
-            y2: 650.0,
-        }; // center_y=450
-        let config = CropConfig::default();
-        let result = calculate_adaptive_headroom(&person, Some(&face), &config);
-        assert!(
-            (result - config.headroom_ratio).abs() < 0.001,
-            "tier 1 returns fallback ratio"
-        );
+        let c = place_focal_point(1000, 1000, 400.0, 400.0, &f, 0.5, 0.5);
+        assert_eq!(c.x, 300.0);
+        assert_eq!(c.y, 300.0);
     }
 
     #[test]
-    fn test_adaptive_headroom_tier2_normal_range() {
-        // face_rel_y = (1100-200)/3600 = 0.25 → Tier 2
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
+    fn test_place_focal_point_top_left_clamp() {
+        let f = crate::focal_point::FocalPoint {
+            x: 100.0,
+            y: 100.0,
+            kind: crate::focal_point::FocalKind::BboxCenter,
         };
-        let face = BBox {
-            x1: 700.0,
-            y1: 900.0,
-            x2: 1300.0,
-            y2: 1300.0,
-        }; // center_y=1100
-        let config = CropConfig::default();
-        let result = calculate_adaptive_headroom(&person, Some(&face), &config);
-        assert!(
-            (result - 0.35).abs() < 0.001,
-            "tier 2 should return 0.35, got {result}"
-        );
+        let c = place_focal_point(1000, 1000, 400.0, 400.0, &f, 0.5, 0.5);
+        // raw x = 100 - 200 = -100 -> clamps to 0
+        assert_eq!(c.x, 0.0);
+        assert_eq!(c.y, 0.0);
     }
 
     #[test]
-    fn test_adaptive_headroom_tier3_sitting_pose() {
-        // face_rel_y = (2200-200)/3600 = 0.556 → Tier 3
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
+    fn test_place_focal_point_bottom_right_clamp() {
+        let f = crate::focal_point::FocalPoint {
+            x: 900.0,
+            y: 900.0,
+            kind: crate::focal_point::FocalKind::BboxCenter,
         };
-        let face = BBox {
-            x1: 700.0,
-            y1: 2000.0,
-            x2: 1300.0,
-            y2: 2400.0,
-        }; // center_y=2200
-        let config = CropConfig::default();
-        let result = calculate_adaptive_headroom(&person, Some(&face), &config);
-        assert!(
-            (result - config.headroom_ratio).abs() < 0.001,
-            "tier 3 should return config.headroom_ratio"
-        );
+        let c = place_focal_point(1000, 1000, 400.0, 400.0, &f, 0.5, 0.5);
+        // raw x = 900 - 200 = 700. Max x = 1000 - 400 = 600. Clamps to 600
+        assert_eq!(c.x, 600.0);
+        assert_eq!(c.y, 600.0);
     }
 
     #[test]
-    fn test_adaptive_headroom_no_face() {
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
+    fn test_place_focal_point_off_center() {
+        let f = crate::focal_point::FocalPoint {
+            x: 600.0,
+            y: 300.0,
+            kind: crate::focal_point::FocalKind::BboxCenter,
         };
-        let config = CropConfig::default();
-        let result = calculate_adaptive_headroom(&person, None, &config);
-        assert!(
-            (result - config.headroom_ratio).abs() < 0.001,
-            "no face should return config.headroom_ratio"
-        );
-    }
-
-    #[test]
-    fn test_crop_y_anchor_tier1_face_anchor() {
-        // face_rel_y = (450-200)/3600 = 0.069 → Tier 1 → face.y1 - 5%*crop_h
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
-        };
-        let face = BBox {
-            x1: 700.0,
-            y1: 250.0,
-            x2: 1300.0,
-            y2: 650.0,
-        }; // y1=250
-        let crop_height = 1296.0;
-        let config = CropConfig::default();
-        let result = calculate_crop_y_anchor(&person, Some(&face), crop_height, &config);
-        let expected = 250.0 - (0.05 * 1296.0); // = 250 - 64.8 = 185.2
-        assert!(
-            (result - expected).abs() < 0.5,
-            "tier 1 face anchor expected {expected:.1}, got {result:.1}"
-        );
-    }
-
-    #[test]
-    fn test_crop_y_anchor_no_face() {
-        // No face → person center anchor
-        let person = BBox {
-            x1: 500.0,
-            y1: 200.0,
-            x2: 1500.0,
-            y2: 3800.0,
-        }; // center_y=2000
-        let crop_height = 1296.0;
-        let config = CropConfig::default(); // headroom=0.40
-        let result = calculate_crop_y_anchor(&person, None, crop_height, &config);
-        let expected = 2000.0 - (1296.0 * 0.40); // = 2000 - 518.4 = 1481.6
-        assert!(
-            (result - expected).abs() < 0.5,
-            "no face expected {expected:.1}, got {result:.1}"
-        );
-    }
-
-    // ── E2 Tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_landscape_aspect_narrow_subject() {
-        // person_width_ratio = 400/4000 = 0.10
-        // t = 0.10/0.40 = 0.25
-        // expected = 2.333 + 0.75 * (2.778-2.333) = 2.333 + 0.333 = 2.667
-        let bbox = BBox {
-            x1: 1800.0,
-            y1: 200.0,
-            x2: 2200.0,
-            y2: 3800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_landscape_aspect_ratio(&bbox, 4000, &config);
-        let expected = 21.0_f32 / 9.0 + 0.75 * (config.max_landscape_aspect - 21.0 / 9.0);
-        assert!(
-            (result - expected).abs() < 0.01,
-            "narrow subject expected {expected:.4}, got {result:.4}"
-        );
-    }
-
-    #[test]
-    fn test_landscape_aspect_wide_subject() {
-        // person_width_ratio = 1600/4000 = 0.40 → standard 21:9
-        let bbox = BBox {
-            x1: 800.0,
-            y1: 200.0,
-            x2: 2400.0,
-            y2: 3800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_landscape_aspect_ratio(&bbox, 4000, &config);
-        assert!(
-            (result - 21.0 / 9.0).abs() < 0.01,
-            "wide subject should get standard 21:9"
-        );
-    }
-
-    #[test]
-    fn test_landscape_aspect_very_wide_subject() {
-        // person_width_ratio = 0.80 > 0.40
-        let bbox = BBox {
-            x1: 400.0,
-            y1: 200.0,
-            x2: 3600.0,
-            y2: 3800.0,
-        };
-        let config = CropConfig::default();
-        let result = calculate_landscape_aspect_ratio(&bbox, 4000, &config);
-        assert!((result - 21.0 / 9.0).abs() < 0.01);
-    }
-
-    // ── E3 Tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_softening_centered_subject() {
-        // off_center_frac = 0.0 → below threshold → unchanged
-        let config = CropConfig::default();
-        let result = apply_horizontal_softening(500.0, 2000.0, 2000.0, 4000.0, &config);
-        assert!(
-            (result - 500.0).abs() < 0.001,
-            "centered subject should be unchanged"
-        );
-    }
-
-    #[test]
-    fn test_softening_far_right_subject() {
-        // person_center_x=3600, photo_center=2000
-        // off_center_frac = 1600/2000 = 0.80
-        // activation = (0.80-0.50)/0.50 = 0.60
-        // blend = 0.60 * 0.30 = 0.18
-        // centered_x = 2000-1000 = 1000
-        // expected = 2800*0.82 + 1000*0.18 = 2296 + 180 = 2476
-        let config = CropConfig::default();
-        let result = apply_horizontal_softening(2800.0, 2000.0, 3600.0, 4000.0, &config);
-        let expected = 2476.0;
-        assert!(
-            (result - expected).abs() < 1.0,
-            "far right subject expected ~{expected:.0}, got {result:.1}"
-        );
-        assert!(result < 2800.0, "softened crop should be shifted left");
-    }
-
-    #[test]
-    fn test_softening_strength_zero_disables() {
-        let config = CropConfig {
-            softening_strength: 0.0,
-            enable_pose_adaptive_headroom: true,
-            enable_rule_of_thirds: true,
-            ..CropConfig::default()
-        };
-        let result = apply_horizontal_softening(2800.0, 2000.0, 3600.0, 4000.0, &config);
-        assert!(
-            (result - 2800.0).abs() < 0.001,
-            "zero strength should not change crop_x"
-        );
-    }
-
-    #[test]
-    fn test_softening_at_threshold_boundary() {
-        // off_center_frac = |3000-2000|/2000 = 0.50 → exactly at threshold → no softening
-        let config = CropConfig::default();
-        let result = apply_horizontal_softening(1000.0, 2000.0, 3000.0, 4000.0, &config);
-        assert!(
-            (result - 1000.0).abs() < 0.001,
-            "exactly at threshold should not soften"
-        );
+        let c = place_focal_point(1000, 1000, 300.0, 400.0, &f, 0.33, 0.30);
+        // x = 600 - 0.33*300 = 501. y = 300 - 0.30*400 = 180
+        assert_eq!(c.x, 501.0);
+        assert_eq!(c.y, 180.0);
     }
 }
