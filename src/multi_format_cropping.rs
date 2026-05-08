@@ -179,15 +179,15 @@ pub fn detect_pose_type(person_bbox: &BBox, face_bbox: Option<&BBox>) -> PoseTyp
 /// ```
 pub fn calculate_headroom_for_pose(pose: PoseType, format: CropFormat) -> f32 {
     match (format, pose) {
-        (CropFormat::Landscape, PoseType::Standing) => 0.30,
-        (CropFormat::Landscape, PoseType::Sitting) => 0.25,
-        (CropFormat::Landscape, PoseType::Unknown) => 0.28,
-        (CropFormat::Portrait, PoseType::Standing) => 0.37,
-        (CropFormat::Portrait, PoseType::Sitting) => 0.34,
-        (CropFormat::Portrait, PoseType::Unknown) => 0.35,
-        (CropFormat::Mobile, PoseType::Standing) => 0.35,
-        (CropFormat::Mobile, PoseType::Sitting) => 0.32,
-        (CropFormat::Mobile, PoseType::Unknown) => 0.33,
+        (CropFormat::Landscape, PoseType::Standing) => 0.48,
+        (CropFormat::Landscape, PoseType::Sitting) => 0.50,
+        (CropFormat::Landscape, PoseType::Unknown) => 0.45,
+        (CropFormat::Portrait, PoseType::Standing) => 0.45,
+        (CropFormat::Portrait, PoseType::Sitting) => 0.50,
+        (CropFormat::Portrait, PoseType::Unknown) => 0.45,
+        (CropFormat::Mobile, PoseType::Standing) => 0.43,
+        (CropFormat::Mobile, PoseType::Sitting) => 0.48,
+        (CropFormat::Mobile, PoseType::Unknown) => 0.45,
     }
 }
 
@@ -210,10 +210,10 @@ pub fn detect_pose_direction(
         if face.width() > 0.0 {
             let face_rel_x = (face.center_x() - person_bbox.x1) / person_bbox.width();
             if face_rel_x < 0.35 {
-                return Direction::FacingRight;
+                return Direction::FacingLeft;
             }
             if face_rel_x > 0.65 {
-                return Direction::FacingLeft;
+                return Direction::FacingRight;
             }
             return Direction::Frontal;
         }
@@ -226,9 +226,9 @@ pub fn detect_pose_direction(
 
     let offset_ratio = (person_bbox.center_x() - photo_center_x) / photo_center_x;
     if offset_ratio < -0.30 {
-        Direction::FacingRight
-    } else if offset_ratio > 0.30 {
         Direction::FacingLeft
+    } else if offset_ratio > 0.30 {
+        Direction::FacingRight
     } else {
         Direction::Frontal
     }
@@ -297,7 +297,7 @@ pub fn calculate_crop_y_anchor_with_pose(
 
     let face_rel_y = (face.center_y() - person_bbox.y1) / person_bbox.height();
 
-    if face_rel_y < 0.20 {
+    if face_rel_y < 0.20 && !config.enable_pose_adaptive_headroom {
         let breathing_gap = 0.05 * crop_height;
         face.y1 - breathing_gap
     } else if face_rel_y < 0.50 {
@@ -2245,19 +2245,19 @@ mod tests {
     #[test]
     fn test_headroom_for_pose_landscape_standing() {
         let headroom = calculate_headroom_for_pose(PoseType::Standing, CropFormat::Landscape);
-        assert!((headroom - 0.30).abs() < 0.001);
+        assert!((headroom - 0.48).abs() < 0.001);
     }
 
     #[test]
     fn test_headroom_for_pose_portrait_sitting() {
         let headroom = calculate_headroom_for_pose(PoseType::Sitting, CropFormat::Portrait);
-        assert!((headroom - 0.34).abs() < 0.001);
+        assert!((headroom - 0.50).abs() < 0.001);
     }
 
     #[test]
     fn test_headroom_for_pose_mobile_unknown() {
         let headroom = calculate_headroom_for_pose(PoseType::Unknown, CropFormat::Mobile);
-        assert!((headroom - 0.33).abs() < 0.001);
+        assert!((headroom - 0.45).abs() < 0.001);
     }
 
     #[test]
@@ -2276,7 +2276,7 @@ mod tests {
         };
         assert_eq!(
             detect_pose_direction(&person, Some(&face), 1200.0),
-            Direction::FacingRight
+            Direction::FacingLeft
         );
     }
 
@@ -2296,7 +2296,7 @@ mod tests {
         };
         assert_eq!(
             detect_pose_direction(&person, Some(&face), 1200.0),
-            Direction::FacingLeft
+            Direction::FacingRight
         );
     }
 
@@ -2330,7 +2330,7 @@ mod tests {
         };
         assert_eq!(
             detect_pose_direction(&person, None, 1200.0),
-            Direction::FacingRight
+            Direction::FacingLeft
         );
     }
 
@@ -2344,7 +2344,7 @@ mod tests {
         };
         assert_eq!(
             detect_pose_direction(&person, None, 1200.0),
-            Direction::FacingLeft
+            Direction::FacingRight
         );
     }
 
@@ -2400,7 +2400,7 @@ mod tests {
             CropFormat::Landscape,
             &config,
         );
-        let expected = person.center_y() - (1296.0 * 0.30);
+        let expected = person.center_y() - (1296.0 * 0.48);
         assert!((result - expected).abs() < 0.5);
     }
 
@@ -2426,7 +2426,7 @@ mod tests {
             CropFormat::Portrait,
             &config,
         );
-        let expected = face.center_y() - (1296.0 * 0.34);
+        let expected = face.center_y() - (1296.0 * 0.50);
         assert!((result - expected).abs() < 0.5);
     }
 
