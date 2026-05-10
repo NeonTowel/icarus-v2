@@ -9,6 +9,7 @@
 //! - [`YOLOv26mOrt`] — YOLO26m via ONNX Runtime (`zwh20081/yolo26-onnx` on HF Hub)
 //! - [`YoloV10FaceOrt`] — YOLOv10-face via ONNX Runtime (`deepghs/yolo-face` on HF Hub)
 //! - [`YoloV11xFaceOrt`] — YOLOv11x-Face via ONNX Runtime (`AdamCodd/YOLOv11x-face-detection` on HF Hub)
+pub mod eva2_classifier;
 pub mod yolo26_common;
 pub mod yolo26m_ort;
 pub mod yolo26n_ort;

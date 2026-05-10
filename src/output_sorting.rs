@@ -6,18 +6,23 @@
 /// - `portrait/`   — 9:16 vertical format
 /// - `mobile/`     — 9:21 tall mobile format
 ///
+/// When both `--sort-output` and `--classify-output` are enabled, the tier is
+/// appended to the subfolder name (e.g. `landscape-1` through `landscape-4`).
+///
 /// Additionally, annotated/visualized images always receive an `_annotated` suffix
-/// injected before the format suffix (e.g. `photo_annotated_21_9.jpg`), regardless
-/// of whether sorting is enabled.
+/// injected into the file stem. When sorting is enabled the format suffix is
+/// dropped to preserve 1:1 filename parity with inputs (e.g. `photo_annotated.jpg`).
+/// When sorting is disabled the format suffix is retained to prevent collisions
+/// (e.g. `photo_annotated_21_9.jpg`).
 ///
 /// # Example
 /// ```rust,ignore
 /// use icarus_v2::output_sorting::{ensure_output_dirs, get_sorted_output_path};
 /// use std::path::Path;
 ///
-/// ensure_output_dirs(Path::new("output/"), true)?;
-/// let path = get_sorted_output_path(Path::new("output/crop.jpg"), "21:9", "crop", "jpg", true)?;
-/// // Returns: output/landscape/crop_21_9.jpg
+/// ensure_output_dirs(Path::new("output/"), true, false)?;
+/// let path = get_sorted_output_path(Path::new("output/crop.jpg"), "21:9", "crop", "jpg", true, None)?;
+/// // Returns: output/landscape/crop.jpg
 /// ```
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -122,15 +127,27 @@ pub fn determine_best_format_for_aspect_ratio(aspect_ratio: f32) -> &'static str
 /// ensure_output_dirs(Path::new("output/"), true)?;
 /// // Creates: output/landscape/, output/portrait/, output/mobile/
 /// ```
-pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool) -> Result<()> {
+pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: bool) -> Result<()> {
     if !sort_output {
         return Ok(());
     }
 
-    for subfolder in &["landscape", "portrait", "mobile"] {
-        let dir = base_dir.join(subfolder);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create output subfolder: {:?}", dir))?;
+    let subfolders = ["landscape", "portrait", "mobile"];
+
+    if classify_output {
+        for subfolder in &subfolders {
+            for tier in 1..=4 {
+                let dir = base_dir.join(format!("{}-{}", subfolder, tier));
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("Failed to create output subfolder: {:?}", dir))?;
+            }
+        }
+    } else {
+        for subfolder in &subfolders {
+            let dir = base_dir.join(subfolder);
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("Failed to create output subfolder: {:?}", dir))?;
+        }
     }
 
     Ok(())
@@ -143,8 +160,9 @@ pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool) -> Result<()> {
 /// Construct the output path for a cropped image, optionally inside a subfolder.
 ///
 /// When `sort_output` is `true`, the image is placed in the format-appropriate
-/// subfolder (e.g. `base_dir/landscape/stem_21_9.ext`). When `sort_output` is
-/// `false`, the image is placed directly in `base_dir` (e.g. `base_dir/stem_21_9.ext`).
+/// subfolder and the format suffix is dropped to preserve the original filename
+/// (e.g. `base_dir/landscape/stem.ext`). When `sort_output` is `false`, the
+/// format suffix is kept to prevent collisions (e.g. `base_dir/stem_21_9.ext`).
 ///
 /// The `base_path` parent directory is used as `base_dir`.
 ///
@@ -160,10 +178,10 @@ pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool) -> Result<()> {
 ///
 /// # Example
 /// ```rust,ignore
-/// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", true)?;
-/// // Returns: out/landscape/crop_21_9.jpg
+/// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", true, None)?;
+/// // Returns: out/landscape/crop.jpg
 ///
-/// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", false)?;
+/// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", false, None)?;
 /// // Returns: out/crop_21_9.jpg
 /// ```
 pub fn get_sorted_output_path(
@@ -172,14 +190,24 @@ pub fn get_sorted_output_path(
     stem: &str,
     ext: &str,
     sort_output: bool,
+    classification_tier: Option<u8>,
 ) -> Result<PathBuf> {
     let dir = base_path.parent().unwrap_or(Path::new("."));
-    let suffix = format_to_suffix(format);
-    let filename = format!("{}_{}.{}", stem, suffix, ext);
+    let filename = if sort_output {
+        format!("{}.{}", stem, ext) // drop suffix when sorted into unique subfolders
+    } else {
+        format!("{}_{}.{}", stem, format.replace(":", "_"), ext)
+    };
 
     if sort_output {
-        let subfolder = get_subfolder_for_format(format)
-            .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?;
+        let mut subfolder = get_subfolder_for_format(format)
+            .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?
+            .to_string();
+
+        if let Some(tier) = classification_tier {
+            subfolder = format!("{}-{}", subfolder, tier);
+        }
+
         Ok(dir.join(subfolder).join(filename))
     } else {
         Ok(dir.join(filename))
@@ -189,8 +217,9 @@ pub fn get_sorted_output_path(
 /// Construct the output path for an annotated/visualized image.
 ///
 /// Behaves like [`get_sorted_output_path`] but automatically injects `_annotated`
-/// before the format suffix. If the `stem` already ends with `_annotated`, the
-/// suffix is not duplicated.
+/// into the stem. If the `stem` already ends with `_annotated`, the suffix is not
+/// duplicated. The format suffix is dropped when `sort_output` is `true` (since the
+/// subfolder already disambiguates) and kept when `sort_output` is `false`.
 ///
 /// # Arguments
 /// * `base_path` — The user-supplied `--visualize` path (used to derive the parent dir)
@@ -201,10 +230,10 @@ pub fn get_sorted_output_path(
 ///
 /// # Example
 /// ```rust,ignore
-/// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", true)?;
-/// // Returns: out/landscape/viz_annotated_21_9.jpg
+/// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", true, None)?;
+/// // Returns: out/landscape/viz_annotated.jpg
 ///
-/// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", false)?;
+/// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", false, None)?;
 /// // Returns: out/viz_annotated_21_9.jpg
 /// ```
 pub fn get_annotated_output_path(
@@ -213,15 +242,25 @@ pub fn get_annotated_output_path(
     stem: &str,
     ext: &str,
     sort_output: bool,
+    classification_tier: Option<u8>,
 ) -> Result<PathBuf> {
     let dir = base_path.parent().unwrap_or(Path::new("."));
     let annotated_stem = ensure_annotated_suffix(stem);
-    let suffix = format_to_suffix(format);
-    let filename = format!("{}_{}.{}", annotated_stem, suffix, ext);
+    let filename = if sort_output {
+        format!("{}.{}", annotated_stem, ext) // drop suffix when sorted into unique subfolders
+    } else {
+        format!("{}_{}.{}", annotated_stem, format.replace(":", "_"), ext)
+    };
 
     if sort_output {
-        let subfolder = get_subfolder_for_format(format)
-            .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?;
+        let mut subfolder = get_subfolder_for_format(format)
+            .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?
+            .to_string();
+
+        if let Some(tier) = classification_tier {
+            subfolder = format!("{}-{}", subfolder, tier);
+        }
+
         Ok(dir.join(subfolder).join(filename))
     } else {
         Ok(dir.join(filename))
@@ -231,13 +270,6 @@ pub fn get_annotated_output_path(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Convert a format string to a filename-safe suffix.
-///
-/// Replaces `:` with `_` so that format strings like `"21:9"` become `"21_9"`.
-fn format_to_suffix(format: &str) -> String {
-    format.replace(':', "_")
-}
 
 /// Ensure the stem ends with `_annotated`, without duplicating the suffix.
 ///

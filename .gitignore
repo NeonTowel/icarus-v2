@@ -1,14 +1,18 @@
 .ai
-ai-image-crop-2.0-python
-icarus-v1-rust
+tests
+target
+
+# artboard samples
+artboards
 input
 output
-target
-tests
-desired_results
-input-batch
-output-batch
-desired_results_finetuning
-input-*
-output-*
+
+# test photos
 *.jpg
+*.JPG
+*.png
+
+# scratch artifacts
+__pycache__/
+*.pyc
+*.py

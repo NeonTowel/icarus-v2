@@ -14,10 +14,10 @@ pub mod backbones;
 pub mod candle_backend;
 pub mod implementations;
 
-pub use candle_backend::{BBox, Detection, Model};
+pub use candle_backend::{BBox, Detection, Model, ImageClassifier};
 pub use implementations::{
     YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt, YOLOv26sOrt, YoloV10FaceOrt,
-    YoloV11xFaceOrt,
+    YoloV11xFaceOrt, eva2_classifier::FreepikEva02,
 };
 
 use candle_core::Device;
@@ -58,4 +58,14 @@ pub async fn load_candle_model(
     })
     .await
     .map_err(|e| anyhow::anyhow!("model load task panicked: {e}"))?
+}
+
+/// Load the Freepik NSFW image classifier.
+pub async fn load_classifier(device: &Device) -> anyhow::Result<Box<dyn ImageClassifier>> {
+    let device = device.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Box<dyn ImageClassifier>> {
+        Ok(Box::new(FreepikEva02::from_hub(&device)?))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("classifier load task panicked: {e}"))?
 }

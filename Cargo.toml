@@ -37,6 +37,7 @@ yolov10 = { version = "0.2", default-features = false, features = ["cpu"] }
 # the ONNX Runtime shared library automatically at build time.
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries"] }
 ndarray = "0.16"
+little_exif = "0.6.23"
 
 [dev-dependencies]
 tempfile = "3"
@@ -48,3 +49,4 @@ path = "src/main.rs"
 [lib]
 name = "icarus_v2"
 path = "src/lib.rs"
+

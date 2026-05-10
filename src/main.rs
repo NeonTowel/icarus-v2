@@ -67,6 +67,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     sort_output: bool,
 
+    #[arg(long, default_value_t = false)]
+    classify_output: bool,
+
     #[arg(long, value_name = "FLOAT")]
     headroom_ratio: Option<f32>,
 
@@ -88,6 +91,11 @@ async fn main() -> Result<()> {
     let crop_config = build_crop_config(&args)?;
     let artistic_config = build_artistic_config(&args)?;
     let (model, face_detector) = load_models(&args).await?;
+    let classifier = if args.classify_output {
+        Some(icarus_v2::models::load_classifier(&candle_core::Device::Cpu).await?)
+    } else {
+        None
+    };
 
     if let Some(ref model_path) = args.model_path {
         if !args.quiet {
@@ -101,12 +109,14 @@ async fn main() -> Result<()> {
     let context = ProcessingContext {
         model: model.as_ref(),
         face_detector: &face_detector,
+        classifier: classifier.as_deref(),
         crop_config: &crop_config,
         artistic_config: &artistic_config,
         confidence: args.confidence,
         margin: args.margin,
         keep_aspect_ratio: args.keep_aspect_ratio,
         sort_output: args.sort_output,
+        classify_output: args.classify_output,
         quiet: args.quiet,
     };
 

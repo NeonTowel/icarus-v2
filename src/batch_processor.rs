@@ -19,17 +19,62 @@ use crate::multi_format_cropping::{
     deduplicate_person_detections, detect_suitable_formats, BBox, CropRegion,
 };
 use crate::output_sorting;
+use little_exif::exif_tag::ExifTag;
+use little_exif::filetype::FileExtension;
+use little_exif::ifd::ExifTagGroup;
+use little_exif::metadata::Metadata;
+
+fn save_image_with_exif(image: &DynamicImage, path: &Path, tier: Option<u8>) -> Result<()> {
+    if let Some(t) = tier {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+        let (img_format, exif_ext) = match ext.as_str() {
+            "png" => (
+                image::ImageFormat::Png,
+                FileExtension::PNG {
+                    as_zTXt_chunk: true,
+                },
+            ),
+            "webp" => (image::ImageFormat::WebP, FileExtension::WEBP),
+            _ => (image::ImageFormat::Jpeg, FileExtension::JPEG),
+        };
+
+        let mut img_buffer: Vec<u8> = Vec::new();
+        image.write_to(&mut std::io::Cursor::new(&mut img_buffer), img_format)?;
+
+        let mut metadata =
+            Metadata::new_from_vec(&img_buffer, exif_ext).unwrap_or_else(|_| Metadata::new());
+
+        // 0x4746 = Rating tag
+        metadata.set_tag(ExifTag::UnknownINT16U(
+            vec![t as u16],
+            0x4746,
+            ExifTagGroup::GENERIC,
+        ));
+        metadata.write_to_vec(&mut img_buffer, exif_ext)?;
+
+        std::fs::write(path, img_buffer)?;
+    } else {
+        image.save(path)?;
+    }
+    Ok(())
+}
 
 /// Shared processing inputs used for a single image.
 pub struct ProcessingContext<'a> {
     pub model: &'a dyn Model,
     pub face_detector: &'a FaceDetector,
+    pub classifier: Option<&'a dyn crate::models::ImageClassifier>,
     pub crop_config: &'a CropConfig,
     pub artistic_config: &'a ArtisticCropConfig,
     pub confidence: f32,
     pub margin: f32,
     pub keep_aspect_ratio: bool,
     pub sort_output: bool,
+    pub classify_output: bool,
     pub quiet: bool,
 }
 
@@ -87,16 +132,6 @@ fn save_fallback_crop(image: &DynamicImage, output_path: &Path) -> Result<()> {
     let crop = crop_to_ultrawide_21_9_centered(image)
         .with_context(|| "Failed to crop image to centered 21:9")?;
     crop.save(output_path)
-        .with_context(|| format!("Failed to save cropped image to {:?}", output_path))?;
-    Ok(())
-}
-
-fn save_crop_region(image: &DynamicImage, crop: &CropRegion, output_path: &Path) -> Result<()> {
-    let xyxy = crop.to_xyxy_clamped(image.width(), image.height());
-    let cropped = crop_image(image, xyxy)
-        .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
-    cropped
-        .save(output_path)
         .with_context(|| format!("Failed to save cropped image to {:?}", output_path))?;
     Ok(())
 }
@@ -356,6 +391,7 @@ fn process_image_with_base_paths(
         output_sorting::ensure_output_dirs(
             output_path.parent().unwrap_or(Path::new(".")),
             ctx.sort_output,
+            ctx.classify_output,
         )
         .context("Failed to create output subdirectories")?;
 
@@ -376,6 +412,13 @@ fn process_image_with_base_paths(
                 )
             };
 
+            let tier = if let (Some(classifier), true) = (ctx.classifier, ctx.classify_output) {
+                let img_to_classify = cropped_image.as_ref().unwrap_or(&image);
+                Some(classifier.classify(img_to_classify)?)
+            } else {
+                None
+            };
+
             let actual_output_path = if ctx.sort_output {
                 let (crop_width, crop_height) = match &cropped_image {
                     Some(cropped) => (cropped.width(), cropped.height()),
@@ -391,17 +434,15 @@ fn process_image_with_base_paths(
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("jpg");
-                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true)?
+                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
             } else {
                 output_path.to_path_buf()
             };
 
             match &cropped_image {
-                Some(cropped) => cropped
-                    .save(&actual_output_path)
+                Some(cropped) => save_image_with_exif(cropped, &actual_output_path, tier)
                     .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
-                None => image
-                    .save(&actual_output_path)
+                None => save_image_with_exif(&image, &actual_output_path, tier)
                     .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
             }
 
@@ -428,7 +469,9 @@ fn process_image_with_base_paths(
                         .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or("jpg");
-                    output_sorting::get_annotated_output_path(viz_target, format, stem, ext, true)?
+                    output_sorting::get_annotated_output_path(
+                        viz_target, format, stem, ext, true, tier,
+                    )?
                 } else {
                     let stem = viz_target
                         .file_stem()
@@ -563,18 +606,33 @@ fn process_image_with_base_paths(
 
                     all_crop_regions.push(adjusted_crop.clone());
 
+                    // Generate the cropped DynamicImage
+                    let xyxy = adjusted_crop.to_xyxy_clamped(image.width(), image.height());
+                    let final_crop = crop_image(&image, xyxy)
+                        .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
+
+                    let tier =
+                        if let (Some(classifier), true) = (ctx.classifier, ctx.classify_output) {
+                            Some(classifier.classify(&final_crop)?)
+                        } else {
+                            None
+                        };
+
                     let crop_path = output_sorting::get_sorted_output_path(
                         output_path,
                         format,
                         stem,
                         ext,
                         ctx.sort_output,
+                        tier,
                     )
                     .with_context(|| {
                         format!("Failed to build output path for format {}", format)
                     })?;
 
-                    save_crop_region(&image, &adjusted_crop, &crop_path)?;
+                    save_image_with_exif(&final_crop, &crop_path, tier).with_context(|| {
+                        format!("Failed to save cropped image to {:?}", crop_path)
+                    })?;
                     output_files.push(crop_path.clone());
 
                     if !ctx.quiet {
@@ -591,6 +649,7 @@ fn process_image_with_base_paths(
                             vstem,
                             vext,
                             ctx.sort_output,
+                            tier,
                         )
                         .with_context(|| {
                             format!("Failed to build annotated path for format {}", format)

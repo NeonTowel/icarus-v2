@@ -78,6 +78,19 @@ impl BBox {
 }
 
 // ---------------------------------------------------------------------------
+// ImageClassifier trait
+// ---------------------------------------------------------------------------
+
+/// The core inference contract for image classification models.
+pub trait ImageClassifier: Send + Sync {
+    /// Classify a cropped image and return the predicted tier (1-4).
+    fn classify(&self, image: &image::DynamicImage) -> anyhow::Result<u8>;
+    
+    /// The name of this classifier.
+    fn name(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
 // Model trait
 // ---------------------------------------------------------------------------
 
