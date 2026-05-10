@@ -1,259 +1,157 @@
-# AGENTS.md: Development Guidelines for Icarus-v2
+This file provides guidance to AI coding agents like Claude Code (claude.ai/code), Cursor AI, Codex, Gemini CLI, GitHub Copilot, and other AI coding assistants when working with code in this repository.
 
-**Icarus-v2** is a production-ready Rust system for AI-powered object detection and intelligent image cropping, using YOLOv10 via ONNX Runtime and Candle-based models for multiple detection backends.
+# Icarus-v2 agent guide
 
-## Quick Reference
+## Project snapshot
 
-### Project Type
-- **Language:** Rust (Edition 2021)
-- **Build System:** Cargo
-- **Architecture:** CLI application + library with multiple AI models (YOLOv10, DETR, RT-DETR, etc.)
-- **Testing:** Integrated tests in `tests/` directory + inline unit tests in modules
+- Language/runtime: Rust 2021 (`cargo` workspace with one binary + one library crate).
+- Entry points:
+  - Binary: `src/main.rs` (`icarus-v2` CLI)
+  - Library: `src/lib.rs`
+- Core purpose: person-first intelligent cropping across multiple target formats using
+  ONNX Runtime-backed detection models and face-aware post-adjustment.
 
----
+## Canonical commands
 
-## Build & Commands
+## Dependency setup
 
-### Install Dependencies
 ```bash
 task deps
-# Installs protoc (required for candle-onnx) to ~/.local/bin
-# Auto-detects OS/arch (Linux x86_64/aarch64, macOS x86_64/arm64)
 ```
 
-### Build
+Installs `protoc` (required by Candle dependencies) to `~/.local/bin` when missing.
+
+## Build
+
 ```bash
-cargo build                    # Debug build
-cargo build --release         # Release build (optimized)
-task build                     # Using Taskfile
-task build-without-warnings    # Build with warnings suppressed
+cargo build
+cargo build --release
+task build
+task build-without-warnings
 ```
 
-### Run Tests
+## Test
+
 ```bash
-# Run all tests (unit + integration)
 cargo test
-
-# Run a specific test by name
-cargo test test_crop_image_produces_correct_dimensions
-
-# Run tests in a specific module
-cargo test image_utils::
-
-# Run integration tests only
-cargo test --test integration_tests
-
-# Run with output (don't suppress println!)
-cargo test -- --nocapture
-
-# Run a single test file
-cargo test --test detr_candle_test
+cargo test <test_name> -- --nocapture
 ```
 
-### Common Development Tasks
+Task-based sample-run workflow:
+
 ```bash
-task test-crop          # Test multi-format cropping with sample photos
-task test-yolo          # Test YOLOv10 model specifically
-task test-batch         # Batch process multiple images
-task test-align-issue   # Test margin/alignment edge cases
+task test-with-samples
+task test-with-samples_beta
 ```
 
-### Example: Run Single Test
+## Lint/format
+
 ```bash
-cargo test test_crop_image_produces_correct_dimensions -- --nocapture
+cargo fmt
+cargo clippy --all-targets --all-features
 ```
 
----
+## CLI invocation pattern
 
-## Code Style Guidelines
-
-### File Organization
-```
-src/
-├── main.rs                    # CLI entry point (argument parsing, orchestration)
-├── lib.rs                     # Library root, module exports
-├── error.rs                   # Error types (Error enum, Result alias)
-├── config.rs                  # Configuration structs (with Default impls)
-├── image_utils.rs             # Image cropping, normalization utilities
-├── multi_format_cropping.rs   # Multi-format crop logic (21:9, 9:21, 9:16)
-└── models/                    # Model loading & inference
-    ├── mod.rs
-    ├── candle_backend.rs      # Candle-based inference (DETR, RT-DETR, etc.)
-    └── yolov10_onnx.rs        # YOLOv10-specific ONNX integration
-
-tests/
-├── integration_tests.rs       # Cross-cutting image_utils tests
-├── detr_candle_test.rs        # DETR model inference tests
-├── rt_detr_candle_test.rs     # RT-DETR model inference tests
-└── fixtures/                  # Test images/data
+```bash
+cargo run --release -- --model yolov10 --input <image-or-dir> --output <path>
 ```
 
-### Imports
-- **Order:** `use` statements organized as:
-  1. Standard library (`std::*`)
-  2. External crates (alphabetical)
-  3. Internal crate modules (`use crate::*`)
-- **Example:**
-  ```rust
-  use std::path::PathBuf;
-  use anyhow::Result;
-  use image::DynamicImage;
-  use crate::error::Error;
-  use crate::models::load_model;
-  ```
+Useful flags implemented in `src/main.rs`:
 
-### Formatting & Whitespace
-- **Line length:** Keep ≤100 characters (soft limit, 120 hard limit)
-- **Indentation:** 4 spaces (enforced by rustfmt)
-- **Blank lines:** Use between logical sections (but not excessively)
-- **Run:** `rustfmt --check src/` (auto-format via `cargo fmt`)
+- `--recurse` for recursive directory processing
+- `--visualize <path>` for annotated output
+- `--output-boxes <path>` for JSON detections
+- `--sort-output` for aspect-ratio subfolder organization
+- `--margin <percent>` for bbox expansion before crop computation
+- `--crop-config <yaml>` and `--visibility-threshold <percent>` for crop rules
+- `--artistic-mode conservative|balanced|aggressive`
 
-### Types & Generics
-- **Type annotations:** Explicit in public APIs, inferred in internal code
-- **Generic constraints:** Placed in `where` clauses for clarity
-- **Example:**
-  ```rust
-  pub fn crop_image(img: &DynamicImage, bbox: [f32; 4]) -> Result<DynamicImage> { }
-  
-  fn process_batch<T>(items: &[T]) -> Result<Vec<Output>>
-  where
-      T: AsRef<Path>,
-  { }
-  ```
+## Architecture (high level)
 
-### Naming Conventions
-- **Modules/Crates:** `snake_case`
-  - Files: `image_utils.rs`, `multi_format_cropping.rs`
-- **Functions/Methods:** `snake_case`
-  - Public: `load_model()`, `crop_image()`, `detect_suitable_formats()`
-  - Private: `_process_inference()`, `_validate_bbox()`
-- **Types/Structs/Enums:** `PascalCase`
-  - `DynamicImage`, `BBox`, `CropRegion`, `DetectionConfig`
-- **Constants:** `UPPER_SNAKE_CASE`
-  - `VALID_MODELS`, `DEFAULT_CONFIDENCE`, `MAX_DIMENSION`
-- **Abbreviations OK:** `bbox` (common), `img` (common), `onnx` (acronym)
+## Pipeline flow
 
-### Documentation
-- **Doc comments:** Use `///` for public items (required for public API)
-- **Module docs:** `//!` at module root
-- **Example:**
-  ```rust
-  /// Crops an image to a region defined by `[x1, y1, x2, y2]` coordinates.
-  ///
-  /// # Arguments
-  /// * `img` - Input image
-  /// * `bbox` - Bounding box as `[x1, y1, x2, y2]` in pixels
-  ///
-  /// # Returns
-  /// A cropped `DynamicImage` or an error if bbox is invalid.
-  ///
-  /// # Example
-  /// ```rust,ignore
-  /// let bbox = [10.0, 20.0, 100.0, 150.0];
-  /// let crop = crop_image(&img, bbox)?;
-  /// ```
-  pub fn crop_image(img: &DynamicImage, bbox: [f32; 4]) -> Result<DynamicImage> { }
-  ```
+1. Parse CLI args and validate them (`main.rs`).
+2. Load crop config + artistic mode (`config.rs`).
+3. Load person detector (`models::load_candle_model`) and face detector (`face_detection.rs`).
+4. Dispatch by input type:
+   - File: single-image processing
+   - Directory: discover images, then parallel batch processing
+5. For each image (`batch_processor.rs`):
+   - preprocess → forward → postprocess via selected model
+   - confidence filter and person extraction
+   - optional reflection/overlap dedup and compound bbox
+   - face detection (best-effort; non-fatal failure path)
+   - format suitability detection (`multi_format_cropping.rs`)
+   - crop generation + eye-safety enforcement (`face_aware_cropping.rs`)
+   - optional visualization + JSON output
 
-### Error Handling
-- **Use `Result<T>`:** Return results for fallible operations (defined in `error.rs`)
-- **Error type:** `anyhow::Result<T>` for flexibility; `Error` enum for specific errors
-- **Pattern:**
-  ```rust
-  pub type Result<T> = anyhow::Result<T>;
-  
-  pub fn process() -> Result<DynamicImage> {
-      let img = image::open("path")?;  // ? propagates errors
-      validate_image(&img)?;
-      Ok(img)
-  }
-  ```
-- **Custom errors:** Use `#[derive(Error)]` from `thiserror` crate
-  ```rust
-  #[derive(Error, Debug)]
-  pub enum Error {
-      #[error("Invalid bbox: {0}")]
-      InvalidBbox(String),
-  }
-  ```
-- **Error context:** Use `anyhow::Context` for adding context:
-  ```rust
-  let img = image::open(path).context("failed to load image")?;
-  ```
+## Main modules and responsibilities
 
-### Struct Design
-- **Derive traits:** `Debug`, `Clone` for public types
-- **Builder pattern:** For complex configuration (e.g., `DetectionConfig`)
-- **Example:**
-  ```rust
-  #[derive(Debug, Clone)]
-  pub struct BBox {
-      pub x1: f32,
-      pub y1: f32,
-      pub x2: f32,
-      pub y2: f32,
-  }
-  
-  impl BBox {
-      pub fn width(&self) -> f32 { self.x2 - self.x1 }
-      pub fn center_x(&self) -> f32 { (self.x1 + self.x2) / 2.0 }
-  }
-  ```
+- `src/main.rs`
+  - CLI surface and top-level orchestration.
+  - Input path mode switching (single vs batch).
 
-### Testing
-- **Inline tests:** Use `#[cfg(test)] mod tests { }` in same file
-- **Integration tests:** Place in `tests/` directory
-- **Test naming:** Descriptive (`test_crop_image_clamps_to_image_bounds`)
-- **Assertions:** Clear error messages
-  ```rust
-  #[test]
-  fn test_crop_image_dimensions() {
-      let bbox = [50.0, 60.0, 200.0, 180.0];
-      let crop = crop_image(&img, bbox).expect("valid bbox");
-      assert_eq!(crop.width(), 150, "width = x2 - x1");
-  }
-  ```
+- `src/batch_processor.rs`
+  - Core processing pipeline used by both single and batch modes.
+  - Parallel batch execution via Rayon.
+  - Output writing (crop, visualization, JSON).
 
-### Clippy Warnings
-- Fix all clippy warnings before committing
-- Common issues: unused variables, inefficient clones, missing docs
-- Run: `cargo clippy --all-targets --all-features`
+- `src/multi_format_cropping.rs`
+  - Format suitability + crop region generation for `21:9`, `9:21`, `9:16`.
+  - Visibility gating and directional thirds logic.
+  - Multi-person helpers (compound bbox, dedup logic).
 
----
+- `src/focal_point.rs`
+  - Computes focal anchor (currently bbox-center driven).
 
-## Key Files & Responsibilities
+- `src/face_aware_cropping.rs`
+  - Applies eye-safety vertical nudge with strict bounded budget.
 
-| File | Purpose |
-|------|---------|
-| `src/main.rs` | CLI argument parsing via clap, orchestration |
-| `src/lib.rs` | Library root, module exports |
-| `src/error.rs` | Error types, Result alias |
-| `src/image_utils.rs` | Image I/O, normalization, cropping |
-| `src/multi_format_cropping.rs` | 21:9 / 9:21 / 9:16 intelligent cropping |
-| `src/models/` | Model loading & inference (Candle + ONNX) |
-| `src/config.rs` | Configuration with sensible defaults |
-| `tests/` | Integration + unit tests |
-| `Cargo.toml` | Dependencies, package metadata |
-| `Taskfile.yaml` | Task automation (build, test, run) |
+- `src/face_detection.rs`
+  - Face detector loading and inference abstraction.
+  - Converts model bbox type into crop-domain bbox type.
 
----
+- `src/models/`
+  - `candle_backend.rs`: shared trait (`Model`) + detection primitives + utilities.
+  - `implementations/`: ONNX Runtime-backed YOLOv10/YOLO26 variants and face models.
+  - `backbones/`: currently deferred/stubbed DINOv2 placeholders for future RF-DETR work.
 
-## Common Tasks for Agents
+- `src/output_sorting.rs`
+  - Aspect-ratio to subfolder routing (`landscape`, `portrait`, `mobile`)
+  - Annotated filename suffix policy.
 
-1. **Bug Fix:** Identify failing test → Fix implementation → Run full test suite
-2. **New Feature:** Add struct/trait → Implement logic → Write tests → Doc comments
-3. **Refactoring:** Extract function → Move to module → Update imports → Test
-4. **Testing:** Add `#[test]` to module or create file in `tests/` → Run `cargo test`
+- `src/directory_walker.rs`
+  - Extension-filtered image discovery with optional recursion.
 
----
+## Model/back-end status
 
-## CI/Lint Standards
+Person models currently wired in CLI and loader:
 
-- **Format:** `cargo fmt` (auto-formatting)
-- **Lint:** `cargo clippy` (warnings must be fixed)
-- **Tests:** All tests must pass (`cargo test`)
-- **Doc:** Public items must have doc comments (`///`)
+- `yolov10`, `yolov10s`, `yolov10m`
+- `yolo26`, `yolo26s`, `yolo26m`
 
----
+Face detection model path:
 
-*Last updated: 2026-03-22 | Rust Edition 2021 | Icarus-v2 v2.0.0*
+- Default: YOLOv11x-face
+- Alternate fast path is implemented (`load_fast_face_detector`) but not default.
+
+Note: Several Candle-centric/deferred wrappers exist for future roadmap work; do not assume
+they are production-ready without checking loader wiring in `src/models/mod.rs` and CLI
+validation in `src/main.rs`.
+
+## Conventions to preserve when editing
+
+- Keep person detection and face detection concerns separated (face module should not own crop logic).
+- Preserve fail-fast validation for CLI numeric ranges and input path semantics.
+- Keep face detection failure non-fatal during processing (warn + continue).
+- Keep output path creation idempotent and parent-directory-safe.
+- Keep crop coordinate clamping before image writes.
+- Preserve single-image path parity with batch path by routing through shared pipeline code.
+
+## Agent checklist before finishing changes
+
+1. Run `cargo fmt`.
+2. Run `cargo clippy --all-targets --all-features` (or document why it was skipped).
+3. Run `cargo test` (or at minimum targeted tests for modified modules).
+4. If CLI/output behavior changed, include a runnable example command in your summary.
