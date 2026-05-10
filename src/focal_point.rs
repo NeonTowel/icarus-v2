@@ -374,6 +374,9 @@ mod tests {
         };
         let f = compute_focal_point(Some(&person), &[face_a, face_b], 1000, 1000);
         assert_eq!(f.kind, FocalKind::BboxCenter);
-        assert_eq!(f.y, 400.0, "vertical anchor must be bbox center, not face eye-line average");
+        assert_eq!(
+            f.y, 400.0,
+            "vertical anchor must be bbox center, not face eye-line average"
+        );
     }
 }

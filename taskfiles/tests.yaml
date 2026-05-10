@@ -5,14 +5,28 @@ tasks:
     desc: "Test content-aware cropping with sample photos"
     silent: true
     vars:
-      BUILD: 'release' # 'debug' or 'release'
+      BUILD: 'release' # 'debug' / 'release'
+      VISUALIZE: false # false / true
+      QUIET: true # false / true
     cmds:
       - task: build-without-warnings
+        vars:
+          QUIET:
+            ref: .QUIET
         if: '[ -n "{{ .BUILD }}" -a "{{ .BUILD }}" == "debug" ]'
       - task: build:release-without-warnings
+        vars:
+          QUIET:
+            ref: .QUIET
         if: '[ -n "{{ .BUILD }}" -a "{{ .BUILD }}" == "release" ]'
       - task: run-test-with-samples
-        vars: { BUILD: '{{ .BUILD }}' }
+        vars:
+          BUILD:
+            ref: .BUILD
+          VISUALIZE:
+            ref: .VISUALIZE
+          QUIET:
+            ref: .QUIET
 
   run-test-with-samples:
     internal: true
@@ -34,27 +48,30 @@ tasks:
               - yolo26s
               - yolo26m
             DATASET:
-              - artboard-samples-v2
-              #- artboard-samples-v2.1
+              #- artboard-samples-v2
+              - artboard-samples-v2.1
         cmd: |
           OUTPUT="output/{{ .ITEM.MODEL }}_{{ .ITEM.DATASET }}"
           INPUT="input/{{ .ITEM.DATASET }}"
           if [ -d "${OUTPUT}" ]; then
             echo "[$(date)]: Cleaning up existing output folder ${OUTPUT}..."
             rm -fr "${OUTPUT}"
+          else
+            mkdir -p "${OUTPUT}"
           fi
           VISUALIZE="$OUTPUT"
           start=`date +%s`
           echo "[$(date)]: Starting batch processing of dataset '{{ .ITEM.DATASET }}' using model '{{ .ITEM.MODEL }}'..."
-          time target/{{ .BUILD }}/icarus-v2 \
+          target/{{ .BUILD }}/icarus-v2 \
             --model {{ .ITEM.MODEL }} \
             --input ${INPUT} \
-            --output "${OUTPUT}" \
-            --visualize "${VISUALIZE}" \
+            --output "${OUTPUT}" \{{ if .VISUALIZE }}
+            --visualize "${VISUALIZE}" \{{ end }}
             --sort-output \
             --classify-output \
             --confidence {{ .CONFIDENCE }} \
-            --margin {{ .MARGIN }}
+            --margin {{ .MARGIN }}{{ if .QUIET }} \
+            --quiet{{ end }}
           end=`date +%s`
           runtime=$((end-start))
           hours=$((runtime/3600))
@@ -66,3 +83,12 @@ tasks:
           if [ "$seconds" -gt 0 ] || [ -z "$pretty" ]; then pretty="${pretty}${pretty:+ }${seconds}s"; fi
           echo "[$(date)]: Processing took ${runtime}s (${pretty})."
           echo "[$(date)]: Batch done."
+          echo "[$(date)]: Writing 'output/' to './out.zip'..."
+          (
+            cd output
+            if [ -f "../out.zip" ]; then
+              rm -f ../out.zip
+            fi
+            7z a -tzip ../out.zip ./\*
+          )
+          echo "[$(date)]: Done."

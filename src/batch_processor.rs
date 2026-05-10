@@ -23,43 +23,79 @@ use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 use little_exif::ifd::ExifTagGroup;
 use little_exif::metadata::Metadata;
+use xmp_writer::XmpWriter;
+
+fn build_xmp_packet_with_rating(rating: u8) -> Result<Vec<u8>> {
+    let mut writer = XmpWriter::new();
+    writer.rating(i64::from(rating));
+    Ok(writer.finish(None).into_bytes())
+}
+
+fn insert_jpeg_app1_xmp_segment(jpeg_bytes: &mut Vec<u8>, xmp_packet: &[u8]) -> Result<()> {
+    const APP1_MARKER_PREFIX: [u8; 2] = [0xFF, 0xE1];
+    const XMP_APP1_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+
+    if jpeg_bytes.len() < 4 || jpeg_bytes[0] != 0xFF || jpeg_bytes[1] != 0xD8 {
+        bail!("Output buffer is not a valid JPEG (missing SOI marker)");
+    }
+
+    let mut payload = Vec::with_capacity(XMP_APP1_HEADER.len() + xmp_packet.len());
+    payload.extend_from_slice(XMP_APP1_HEADER);
+    payload.extend_from_slice(xmp_packet);
+
+    let segment_len_u16 = u16::try_from(payload.len() + 2)
+        .context("XMP packet too large for a single JPEG APP1 segment")?;
+
+    let mut segment = Vec::with_capacity(2 + 2 + payload.len());
+    segment.extend_from_slice(&APP1_MARKER_PREFIX);
+    segment.extend_from_slice(&segment_len_u16.to_be_bytes());
+    segment.extend_from_slice(&payload);
+
+    // Insert right after SOI to keep implementation minimal and deterministic.
+    jpeg_bytes.splice(2..2, segment);
+
+    Ok(())
+}
 
 fn save_image_with_exif(image: &DynamicImage, path: &Path, tier: Option<u8>) -> Result<()> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_lowercase();
+    let (img_format, exif_ext) = match ext.as_str() {
+        "png" => (
+            image::ImageFormat::Png,
+            FileExtension::PNG {
+                as_zTXt_chunk: true,
+            },
+        ),
+        "webp" => (image::ImageFormat::WebP, FileExtension::WEBP),
+        _ => (image::ImageFormat::Jpeg, FileExtension::JPEG),
+    };
+
+    let mut img_buffer: Vec<u8> = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut img_buffer), img_format)?;
+
     if let Some(t) = tier {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("jpg")
-            .to_lowercase();
-        let (img_format, exif_ext) = match ext.as_str() {
-            "png" => (
-                image::ImageFormat::Png,
-                FileExtension::PNG {
-                    as_zTXt_chunk: true,
-                },
-            ),
-            "webp" => (image::ImageFormat::WebP, FileExtension::WEBP),
-            _ => (image::ImageFormat::Jpeg, FileExtension::JPEG),
-        };
-
-        let mut img_buffer: Vec<u8> = Vec::new();
-        image.write_to(&mut std::io::Cursor::new(&mut img_buffer), img_format)?;
-
-        let mut metadata =
-            Metadata::new_from_vec(&img_buffer, exif_ext).unwrap_or_else(|_| Metadata::new());
-
-        // 0x4746 = Rating tag
+        let mut metadata = Metadata::new();
+        // 0x4746 = EXIF Rating tag
         metadata.set_tag(ExifTag::UnknownINT16U(
             vec![t as u16],
             0x4746,
             ExifTagGroup::GENERIC,
         ));
+
         metadata.write_to_vec(&mut img_buffer, exif_ext)?;
 
-        std::fs::write(path, img_buffer)?;
-    } else {
-        image.save(path)?;
+        // Also write XMP xmp:Rating for Adobe Bridge star interoperability.
+        if ext == "jpg" || ext == "jpeg" {
+            let xmp_packet = build_xmp_packet_with_rating(t)?;
+            insert_jpeg_app1_xmp_segment(&mut img_buffer, &xmp_packet)?;
+        }
     }
+
+    std::fs::write(path, img_buffer)?;
     Ok(())
 }
 
@@ -290,8 +326,16 @@ fn process_image_with_base_paths(
     boxes_path: Option<&Path>,
     ctx: &ProcessingContext<'_>,
 ) -> Result<ProcessingResult> {
-    let image = image::open(image_path)
-        .with_context(|| format!("Failed to open input image: {:?}", image_path))?;
+    let file_label = image_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<unknown>");
+    let image = image::open(image_path).with_context(|| {
+        format!(
+            "[{}] failed to open input image: {:?}",
+            file_label, image_path
+        )
+    })?;
 
     let image_width = image.width();
     let image_height = image.height();
@@ -328,8 +372,8 @@ fn process_image_with_base_paths(
         count => {
             if !ctx.quiet {
                 println!(
-                    "  Detected {} persons — using compound bbox for cropping.",
-                    count
+                    "[{}] {} persons detected; using compound bbox.",
+                    file_label, count
                 );
             }
 
@@ -360,28 +404,24 @@ fn process_image_with_base_paths(
     let face_bboxes = match detect_faces(&image, ctx.face_detector) {
         Ok(faces) => {
             if !ctx.quiet && !faces.is_empty() {
-                println!("  Face detections: {}", faces.len());
+                println!("[{}] {} face(s) detected.", file_label, faces.len());
             }
             faces
         }
         Err(error) => {
             eprintln!(
-                "Warning: face detection failed ({}). Continuing without faces.",
-                error
+                "[WARN][{}] face detection failed: {}. continuing without faces.",
+                file_label, error
             );
             Vec::new()
         }
     };
 
-    if !ctx.quiet {
-        if detections.is_empty() {
-            println!(
-                "No objects detected (confidence threshold: {}).",
-                ctx.confidence
-            );
-        } else {
-            println!("Found {} object(s):", detections.len());
-        }
+    if !ctx.quiet && detections.is_empty() {
+        println!(
+            "[{}] no objects detected (confidence: {}).",
+            file_label, ctx.confidence
+        );
     }
 
     let mut all_crop_regions: Vec<CropRegion> = Vec::new();
@@ -449,7 +489,7 @@ fn process_image_with_base_paths(
             output_files.push(actual_output_path.clone());
 
             if !ctx.quiet {
-                println!("Saved cropped image to {:?}", actual_output_path);
+                println!("[{}] saved crop → {:?}", file_label, actual_output_path);
             }
 
             if let Some(viz_target) = viz_path {
@@ -500,7 +540,7 @@ fn process_image_with_base_paths(
                 output_files.push(actual_viz_path.clone());
 
                 if !ctx.quiet {
-                    println!("Saved visualized image to {:?}", actual_viz_path);
+                    println!("[{}] saved annotated → {:?}", file_label, actual_viz_path);
                 }
             }
         } else {
@@ -520,13 +560,17 @@ fn process_image_with_base_paths(
 
             if suitable_formats.is_empty() {
                 if !ctx.quiet {
-                    println!("  No suitable crop formats found for this photo.");
+                    println!("[{}] no suitable crop formats; using fallback.", file_label);
                 }
                 save_fallback_crop(&image, output_path)?;
                 output_files.push(output_path.to_path_buf());
             } else {
                 if !ctx.quiet {
-                    println!("  Suitable formats: {}", suitable_formats.join(", "));
+                    println!(
+                        "[{}] suitable formats: {}",
+                        file_label,
+                        suitable_formats.join(", ")
+                    );
                 }
 
                 let stem = output_path
@@ -587,7 +631,10 @@ fn process_image_with_base_paths(
                             ctx.artistic_config,
                         ),
                         other => {
-                            eprintln!("Warning: unknown format '{}' — skipping.", other);
+                            eprintln!(
+                                "[WARN][{}] unknown format '{}' — skipping.",
+                                file_label, other
+                            );
                             None
                         }
                     };
@@ -636,7 +683,7 @@ fn process_image_with_base_paths(
                     output_files.push(crop_path.clone());
 
                     if !ctx.quiet {
-                        println!("  Saved {} crop → {:?}", format, crop_path);
+                        println!("[{}] saved {} crop → {:?}", file_label, format, crop_path);
                     }
 
                     if let (Some(vstem), Some(vext), Some(viz_target)) =
@@ -665,7 +712,10 @@ fn process_image_with_base_paths(
                         output_files.push(viz_output_path.clone());
 
                         if !ctx.quiet {
-                            println!("  Saved {} annotated → {:?}", format, viz_output_path);
+                            println!(
+                                "[{}] saved {} annotated → {:?}",
+                                file_label, format, viz_output_path
+                            );
                         }
                     }
                 }
@@ -682,7 +732,7 @@ fn process_image_with_base_paths(
         output_files.push(viz_path.to_path_buf());
 
         if !ctx.quiet {
-            println!("Saved visualized image to {:?}", viz_path);
+            println!("[{}] saved annotated → {:?}", file_label, viz_path);
         }
     }
 
@@ -692,7 +742,8 @@ fn process_image_with_base_paths(
 
         if !ctx.quiet {
             println!(
-                "Saved {} person + {} face detection(s) to {:?}",
+                "[{}] saved {} person + {} face detection(s) → {:?}",
+                file_label,
                 detections
                     .iter()
                     .filter(|detection| detection.class_id == PERSON_CLASS_ID)
@@ -793,8 +844,11 @@ pub fn run_batch(
                     succeeded.fetch_add(1, Ordering::Relaxed);
                     if !ctx.quiet {
                         println!(
-                            "  [OK] {:?} — {} person(s), {} face(s)",
-                            image_path.file_name().unwrap_or_default(),
+                            "[OK][{}] {} person(s), {} face(s)",
+                            image_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("<unknown>"),
                             result.person_count,
                             result.face_count,
                         );
@@ -803,8 +857,11 @@ pub fn run_batch(
                 }
                 Err(error) => {
                     eprintln!(
-                        "  [FAIL] {:?} — {}",
-                        image_path.file_name().unwrap_or_default(),
+                        "[ERROR][{}] {}",
+                        image_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("<unknown>"),
                         error
                     );
                     Some((image_path.clone(), format!("{:#}", error)))

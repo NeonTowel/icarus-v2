@@ -1202,6 +1202,7 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+ "xmp-writer",
  "yolov10",
 ]
 
@@ -3620,6 +3621,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xmp-writer"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9440ea3e5aeabb0ac63af70daf835274065238cdd0cec83418f417eae38bacee"
 
 [[package]]
 name = "y4m"

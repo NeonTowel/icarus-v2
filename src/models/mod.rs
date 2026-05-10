@@ -14,10 +14,10 @@ pub mod backbones;
 pub mod candle_backend;
 pub mod implementations;
 
-pub use candle_backend::{BBox, Detection, Model, ImageClassifier};
+pub use candle_backend::{BBox, Detection, ImageClassifier, Model};
 pub use implementations::{
-    YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt, YOLOv26sOrt, YoloV10FaceOrt,
-    YoloV11xFaceOrt, eva2_classifier::FreepikEva02,
+    eva2_classifier::FreepikEva02, YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt,
+    YOLOv26sOrt, YoloV10FaceOrt, YoloV11xFaceOrt,
 };
 
 use candle_core::Device;

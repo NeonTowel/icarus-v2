@@ -1,0 +1,17 @@
+version: '3'
+
+tasks:
+  build:release:
+    desc: "Cargo release build"
+    cmds:
+      - cargo build --release {{ if .QUIET }}--quiet{{ end }}
+
+  build:release-without-warnings:
+    desc: "Cargo release build without warnings"
+    env:
+      RUSTFLAGS: -Awarnings
+    cmds:
+      - task: build:release
+        vars:
+          QUIET:
+            ref: .QUIET

@@ -1,14 +1,17 @@
 version: '3'
 
 tasks:
-    build:
-        desc: "Cargo debug build"
-        cmds:
-            - time cargo build
+  build:
+    desc: "Cargo debug build"
+    cmds:
+        - cargo build {{ if .QUIET }}--quiet{{ end }}
 
-    build-without-warnings:
-        desc: "Cargo debug build"
-        env:
-          RUSTFLAGS: -Awarnings
-        cmds:
-            - task: build
+  build-without-warnings:
+    desc: "Cargo debug build"
+    env:
+      RUSTFLAGS: -Awarnings
+    cmds:
+      - task: build
+        vars:
+          QUIET:
+            ref: .QUIET

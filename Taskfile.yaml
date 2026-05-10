@@ -7,52 +7,13 @@ includes:
   build:
     taskfile: taskfiles/build.yaml
     flatten: true
+  release:
+    taskfile: taskfiles/release.yaml
+    flatten: true
   tests:
     taskfile: taskfiles/tests.yaml
     flatten: true
 
 tasks:
-    default:
-        - task --list-all
-
-    test-with-samples_beta:
-        deps: [build-without-warnings]
-        desc: "Test content-aware cropping with sample photos"
-        silent: true
-        vars:
-            CONFIDENCE: 0.25
-            # Margin percentage around detected person bbox (0 = no padding)
-            MARGIN: 0 # 15
-        cmds:
-            - for:
-                matrix:
-                  MODEL:
-                    # - yolov10
-                    # - yolov10s
-                    # - yolov10m
-                    # - yolo26
-                    - yolo26s
-                    # - yolo26m
-                  DATASET:
-                    # - input
-                    # - input-batch
-                    - input-artboard-samples
-                    - input-artboard-samples-v2
-                    - input-artboard-samples-v2.1
-              cmd: |
-                OUTPUT="output/{{ .ITEM.MODEL }}_{{ .ITEM.DATASET }}"
-                VISUALIZE="$OUTPUT"
-                start=`date +%s`
-                echo "[$(date)]: Starting batch processing of '{{ .ITEM.DATASET }}' with model '{{ .ITEM.MODEL }}'..."
-                time target/debug/icarus-v2 \
-                  --model {{ .ITEM.MODEL }} \
-                  --input {{ .ITEM.DATASET }} \
-                  --output "${OUTPUT}" \
-                  --visualize "${VISUALIZE}" \
-                  --sort-output \
-                  --confidence {{ .CONFIDENCE }} \
-                  --margin {{ .MARGIN }}
-                end=`date +%s`
-                runtime=$((end-start))
-                echo "[$(date)]: Processing took $runtime seconds."
-                echo "[$(date)]: Batch done."
+  default:
+    - task --list-all
