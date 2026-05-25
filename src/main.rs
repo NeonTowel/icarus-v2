@@ -70,6 +70,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     classify_output: bool,
 
+    #[arg(long, default_value_t = false)]
+    classify_only: bool,
+
     #[arg(long, value_name = "FLOAT")]
     headroom_ratio: Option<f32>,
 
@@ -88,10 +91,11 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
+    validate_args(&args)?;
     let crop_config = build_crop_config(&args)?;
     let artistic_config = build_artistic_config(&args)?;
     let (model, face_detector) = load_models(&args).await?;
-    let classifier = if args.classify_output {
+    let classifier = if args.classify_output || args.classify_only {
         Some(icarus_v2::models::load_classifier(&candle_core::Device::Cpu).await?)
     } else {
         None
@@ -114,13 +118,25 @@ async fn main() -> Result<()> {
         artistic_config: &artistic_config,
         confidence: args.confidence,
         margin: args.margin,
-        keep_aspect_ratio: args.keep_aspect_ratio,
+        keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
         sort_output: args.sort_output,
-        classify_output: args.classify_output,
+        classify_output: args.classify_output || args.classify_only,
         quiet: args.quiet,
     };
 
     dispatch(&args, &context).await
+}
+
+fn validate_args(args: &Args) -> Result<()> {
+    if args.classify_only && args.output.is_none() {
+        bail!("--classify-only requires --output");
+    }
+
+    if args.classify_only && !args.sort_output {
+        bail!("--classify-only requires --sort-output");
+    }
+
+    Ok(())
 }
 
 fn build_crop_config(args: &Args) -> Result<CropConfig> {
