@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
         keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
         sort_output: args.sort_output,
         classify_output: args.classify_output || args.classify_only,
+        classify_only: args.classify_only,
         quiet: args.quiet,
     };
 

@@ -111,6 +111,7 @@ pub struct ProcessingContext<'a> {
     pub keep_aspect_ratio: bool,
     pub sort_output: bool,
     pub classify_output: bool,
+    pub classify_only: bool,
     pub quiet: bool,
 }
 
@@ -435,7 +436,40 @@ fn process_image_with_base_paths(
         )
         .context("Failed to create output subdirectories")?;
 
-        if ctx.keep_aspect_ratio || crop_bbox.is_none() {
+        if ctx.classify_only {
+            let tier = if let Some(classifier) = ctx.classifier {
+                Some(classifier.classify(&image)?)
+            } else {
+                bail!("--classify-only requires classifier but none was initialized");
+            };
+
+            let actual_output_path = if ctx.sort_output {
+                let aspect_ratio = image.width() as f32 / image.height() as f32;
+                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
+                let stem = output_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("crop");
+                let ext = output_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
+            } else {
+                output_path.to_path_buf()
+            };
+
+            save_image_with_exif(&image, &actual_output_path, tier)
+                .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
+            output_files.push(actual_output_path.clone());
+
+            if !ctx.quiet {
+                println!(
+                    "[{}] classify-only: saved original image → {:?}",
+                    file_label, actual_output_path
+                );
+            }
+        } else if ctx.keep_aspect_ratio || crop_bbox.is_none() {
             let cropped_image = if ctx.keep_aspect_ratio {
                 if let Some(person) = person_for_crop {
                     Some(
