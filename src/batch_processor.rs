@@ -341,6 +341,59 @@ fn process_image_with_base_paths(
     let image_width = image.width();
     let image_height = image.height();
 
+    if ctx.classify_only {
+        let mut output_files: Vec<PathBuf> = Vec::new();
+
+        if let Some(output_path) = output_path {
+            output_sorting::ensure_output_dirs(
+                output_path.parent().unwrap_or(Path::new(".")),
+                ctx.sort_output,
+                ctx.classify_output,
+            )
+            .context("Failed to create output subdirectories")?;
+
+            let tier = if let Some(classifier) = ctx.classifier {
+                Some(classifier.classify(&image)?)
+            } else {
+                bail!("--classify-only requires classifier but none was initialized");
+            };
+
+            let actual_output_path = if ctx.sort_output {
+                let aspect_ratio = image.width() as f32 / image.height() as f32;
+                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
+                let stem = output_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("crop");
+                let ext = output_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
+            } else {
+                output_path.to_path_buf()
+            };
+
+            save_image_with_exif(&image, &actual_output_path, tier)
+                .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
+            output_files.push(actual_output_path.clone());
+
+            if !ctx.quiet {
+                println!(
+                    "[{}] classify-only: saved original image → {:?}",
+                    file_label, actual_output_path
+                );
+            }
+        }
+
+        return Ok(ProcessingResult {
+            input_path: image_path.to_path_buf(),
+            output_files,
+            person_count: 0,
+            face_count: 0,
+        });
+    }
+
     let input_tensor = ctx
         .model
         .preprocess(std::slice::from_ref(&image))
@@ -436,40 +489,7 @@ fn process_image_with_base_paths(
         )
         .context("Failed to create output subdirectories")?;
 
-        if ctx.classify_only {
-            let tier = if let Some(classifier) = ctx.classifier {
-                Some(classifier.classify(&image)?)
-            } else {
-                bail!("--classify-only requires classifier but none was initialized");
-            };
-
-            let actual_output_path = if ctx.sort_output {
-                let aspect_ratio = image.width() as f32 / image.height() as f32;
-                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
-                let stem = output_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("crop");
-                let ext = output_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg");
-                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
-            } else {
-                output_path.to_path_buf()
-            };
-
-            save_image_with_exif(&image, &actual_output_path, tier)
-                .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
-            output_files.push(actual_output_path.clone());
-
-            if !ctx.quiet {
-                println!(
-                    "[{}] classify-only: saved original image → {:?}",
-                    file_label, actual_output_path
-                );
-            }
-        } else if ctx.keep_aspect_ratio || crop_bbox.is_none() {
+        if ctx.keep_aspect_ratio || crop_bbox.is_none() {
             let cropped_image = if ctx.keep_aspect_ratio {
                 if let Some(person) = person_for_crop {
                     Some(
