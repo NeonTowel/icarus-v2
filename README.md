@@ -27,7 +27,8 @@ cargo build --release
 cargo run --release -- \
   --model yolov10 \
   --input <image-or-dir> \
-  --output <path>
+  --output <path> \
+  --threads 4
 ```
 
 ## Common Flags
@@ -41,6 +42,7 @@ cargo run --release -- \
 | `--margin <pct>` | Bbox expansion before crop |
 | `--crop-config <yaml>` | Crop rule overrides |
 | `--visibility-threshold <pct>` | Minimum visible-person ratio |
+| `-t, --threads <num>` | Batch worker threads (default: 50% cores, min 1, capped at cores) |
 | `--artistic-mode` | `conservative` \| `balanced` \| `aggressive` |
 
 ## Development

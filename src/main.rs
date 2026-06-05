@@ -3,7 +3,10 @@ use anyhow::{bail, Context, Result};
 use candle_core::Device;
 use clap::Parser;
 use icarus_v2::batch_processor::{process_single_image, run_batch, ProcessingContext};
-use icarus_v2::config::{load_crop_config, ArtisticCropConfig, ArtisticMode, CropConfig};
+use icarus_v2::config::{
+    available_core_count, load_crop_config, resolve_thread_count, ArtisticCropConfig, ArtisticMode,
+    CropConfig,
+};
 use icarus_v2::directory_walker::discover_images;
 use icarus_v2::face_detection::load_face_detector;
 use icarus_v2::models::load_candle_model;
@@ -34,6 +37,12 @@ struct Args {
     /// Recursively search subdirectories when --input is a directory.
     #[arg(long, default_value_t = false)]
     recurse: bool,
+
+    /// Number of worker threads for batch processing.
+    /// Defaults to 50% of available cores. Values above the core count are
+    /// capped at the maximum available. Has no effect on single-file input.
+    #[arg(short = 't', long, value_name = "NUM")]
+    threads: Option<usize>,
 
     #[arg(
         long,
@@ -135,6 +144,10 @@ fn validate_args(args: &Args) -> Result<()> {
 
     if args.classify_only && !args.sort_output {
         bail!("--classify-only requires --sort-output");
+    }
+
+    if let Some(0) = args.threads {
+        bail!("--threads must be >= 1 (omit the flag to auto-select 50% of cores)");
     }
 
     Ok(())
@@ -264,6 +277,14 @@ async fn dispatch(args: &Args, context: &ProcessingContext<'_>) -> Result<()> {
         println!("Found {} image(s) to process.", image_paths.len());
     }
 
+    let thread_count = resolve_thread_count(args.threads, available_core_count());
+    if !args.quiet {
+        println!(
+            "Using {} worker thread(s) for batch processing.",
+            thread_count
+        );
+    }
+
     let summary = run_batch(
         &image_paths,
         &input_root,
@@ -271,6 +292,7 @@ async fn dispatch(args: &Args, context: &ProcessingContext<'_>) -> Result<()> {
         args.visualize.as_deref(),
         args.output_boxes.as_deref(),
         context,
+        thread_count,
     );
 
     if !args.quiet {

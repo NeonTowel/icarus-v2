@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 use image::DynamicImage;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -880,49 +881,64 @@ pub fn run_batch(
     viz_root: Option<&Path>,
     boxes_root: Option<&Path>,
     ctx: &ProcessingContext<'_>,
+    thread_count: usize,
 ) -> BatchSummary {
     let succeeded = AtomicUsize::new(0);
 
-    let mut failed: Vec<(PathBuf, String)> = image_paths
-        .par_iter()
-        .filter_map(|image_path| {
-            match process_one_in_batch(
-                image_path,
-                input_root,
-                output_root,
-                viz_root,
-                boxes_root,
-                ctx,
-            ) {
-                Ok(result) => {
-                    succeeded.fetch_add(1, Ordering::Relaxed);
-                    if !ctx.quiet {
-                        println!(
-                            "[OK][{}] {} person(s), {} face(s)",
+    let collect_failures = || -> Vec<(PathBuf, String)> {
+        image_paths
+            .par_iter()
+            .filter_map(|image_path| {
+                match process_one_in_batch(
+                    image_path,
+                    input_root,
+                    output_root,
+                    viz_root,
+                    boxes_root,
+                    ctx,
+                ) {
+                    Ok(result) => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                        if !ctx.quiet {
+                            println!(
+                                "[OK][{}] {} person(s), {} face(s)",
+                                image_path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("<unknown>"),
+                                result.person_count,
+                                result.face_count,
+                            );
+                        }
+                        None
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[ERROR][{}] {}",
                             image_path
                                 .file_name()
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("<unknown>"),
-                            result.person_count,
-                            result.face_count,
+                            error
                         );
+                        Some((image_path.clone(), format!("{:#}", error)))
                     }
-                    None
                 }
-                Err(error) => {
-                    eprintln!(
-                        "[ERROR][{}] {}",
-                        image_path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("<unknown>"),
-                        error
-                    );
-                    Some((image_path.clone(), format!("{:#}", error)))
-                }
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
+
+    let thread_pool = ThreadPoolBuilder::new()
+        .num_threads(thread_count.max(1))
+        .build();
+
+    let mut failed: Vec<(PathBuf, String)> = match thread_pool {
+        Ok(pool) => pool.install(collect_failures),
+        Err(error) => {
+            eprintln!("[WARN] failed to build thread pool ({error}); using default Rayon pool.");
+            collect_failures()
+        }
+    };
 
     failed.sort_by(|left, right| left.0.cmp(&right.0));
 

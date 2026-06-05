@@ -292,6 +292,49 @@ impl ArtisticCropConfig {
     }
 }
 
+/// Resolve the number of Rayon worker threads for batch processing.
+///
+/// Policy:
+/// - `requested == None`  → 50% of `available` cores, floored, minimum 1.
+/// - `requested == Some(n)` where `n > available` → capped at `available`.
+/// - `requested == Some(n)` where `1 <= n <= available` → `n` unchanged.
+///
+/// # Parameters
+/// - `requested`: Optional CLI override from `--threads`.
+/// - `available`: Logical core count visible to this process.
+///
+/// # Example
+/// ```rust
+/// use icarus_v2::config::resolve_thread_count;
+///
+/// assert_eq!(resolve_thread_count(None, 8), 4);
+/// assert_eq!(resolve_thread_count(Some(999), 8), 8);
+/// ```
+pub fn resolve_thread_count(requested: Option<usize>, available: usize) -> usize {
+    let available = available.max(1);
+    match requested {
+        None => (available / 2).max(1),
+        Some(count) => count.clamp(1, available),
+    }
+}
+
+/// Number of logical cores available to this process, never less than 1.
+///
+/// Uses [`std::thread::available_parallelism`], which respects affinity and
+/// cgroup limits when supported by the platform.
+///
+/// # Example
+/// ```rust
+/// use icarus_v2::config::available_core_count;
+///
+/// assert!(available_core_count() >= 1);
+/// ```
+pub fn available_core_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|core_count| core_count.get())
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -312,6 +355,30 @@ mod tests {
             ArtisticMode::Aggressive
         );
         assert!("unknown".parse::<ArtisticMode>().is_err());
+    }
+
+    #[test]
+    fn resolve_thread_count_defaults_to_half() {
+        assert_eq!(resolve_thread_count(None, 8), 4);
+        assert_eq!(resolve_thread_count(None, 16), 8);
+    }
+
+    #[test]
+    fn resolve_thread_count_floors_to_at_least_one() {
+        assert_eq!(resolve_thread_count(None, 1), 1);
+        assert_eq!(resolve_thread_count(None, 0), 1);
+    }
+
+    #[test]
+    fn resolve_thread_count_caps_at_available() {
+        assert_eq!(resolve_thread_count(Some(9999), 8), 8);
+        assert_eq!(resolve_thread_count(Some(8), 8), 8);
+    }
+
+    #[test]
+    fn resolve_thread_count_passes_through_valid_request() {
+        assert_eq!(resolve_thread_count(Some(3), 8), 3);
+        assert_eq!(resolve_thread_count(Some(1), 8), 1);
     }
 }
 
