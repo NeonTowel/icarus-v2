@@ -2,10 +2,10 @@ use crate::multi_format_cropping::{BBox, CropRegion};
 
 /// Enforces eye safety for the computed crop region.
 ///
-/// If any face's eye zone (top 30% to 65% of the face bbox) is clipped by the crop's
+/// If any face's eye zone (top 20% to 70% of the face bbox, covering forehead/eyes) is clipped by the crop's
 /// top or bottom edge, this function attempts to nudge the crop vertically by the
 /// minimal amount needed to bring the eye zone fully inside, clamped to the image
-/// bounds and capped at 3% of the crop height.
+/// bounds and capped at 6% of the crop height (increased to reduce head cutoffs).
 ///
 /// If the required shift exceeds the budget, or if the nudge causes the crop to exceed
 /// image boundaries while still clipping, the original crop is returned unmodified.
@@ -44,8 +44,8 @@ pub fn enforce_eye_safety(
         return crop.clone();
     };
 
-    let eye_top = face.y1 + 0.30 * face.height();
-    let eye_bottom = face.y1 + 0.65 * face.height();
+    let eye_top = face.y1 + 0.20 * face.height();
+    let eye_bottom = face.y1 + 0.70 * face.height();
 
     let mut shift_y = 0.0;
     if eye_top < crop.y {
@@ -56,7 +56,7 @@ pub fn enforce_eye_safety(
         shift_y = eye_bottom - (crop.y + crop.height); // this is positive
     }
 
-    let budget = 0.03 * crop.height;
+    let budget = 0.06 * crop.height;
     shift_y = shift_y.clamp(-budget, budget);
 
     let mut new_y = crop.y + shift_y;
@@ -105,8 +105,7 @@ mod tests {
             width: 400.0,
             height: 400.0,
         };
-        // Eye top is at 90 + 0.3*100 = 120. Wait, if y1=80, h=100. Eye top = 80 + 30 = 110.
-        // Let's make eye_top < 100. y1=60, h=100. Eye top = 60 + 30 = 90.
+        // With new 20% zone: y1=60 h=100 → eye_top=80; shift=-20 (within 6% =24 budget)
         let face = BBox {
             x1: 100.0,
             y1: 60.0,
@@ -114,7 +113,7 @@ mod tests {
             y2: 160.0,
         };
         let new_crop = enforce_eye_safety(&crop, &[face], 1000, 1000);
-        assert_eq!(new_crop.y, 90.0); // shifted up by 10
+        assert_eq!(new_crop.y, 80.0); // shifted up by 20
     }
 
     #[test]
@@ -124,8 +123,8 @@ mod tests {
             y: 100.0,
             width: 400.0,
             height: 400.0,
-        }; // budget = 12
-           // eye top = 50 + 30 = 80 (needs 20 shift, exceeds 12 budget)
+        }; // budget = 24 (6%)
+           // eye_top = 50 + 0.2*100 = 70 (needs 30 shift, exceeds 24 budget)
         let face = BBox {
             x1: 100.0,
             y1: 50.0,
