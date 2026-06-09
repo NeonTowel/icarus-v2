@@ -12,9 +12,11 @@
 /// All models implement the [`Model`] trait (preprocess → forward → postprocess).
 pub mod backbones;
 pub mod candle_backend;
+pub mod ensemble;
 pub mod implementations;
 
 pub use candle_backend::{BBox, Detection, ImageClassifier, Model};
+pub use ensemble::{ClassifierKind, SingleWdClassifier, WdEnsembleClassifier};
 pub use implementations::{
     eva2_classifier::FreepikEva02, YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt,
     YOLOv26sOrt, YoloV10FaceOrt, YoloV11xFaceOrt,
@@ -60,11 +62,19 @@ pub async fn load_candle_model(
     .map_err(|e| anyhow::anyhow!("model load task panicked: {e}"))?
 }
 
-/// Load the Freepik NSFW image classifier.
-pub async fn load_classifier(device: &Device) -> anyhow::Result<Box<dyn ImageClassifier>> {
+/// Load an image classifier by runtime kind.
+pub async fn load_classifier(
+    kind: ClassifierKind,
+    device: &Device,
+) -> anyhow::Result<Box<dyn ImageClassifier>> {
     let device = device.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<Box<dyn ImageClassifier>> {
-        Ok(Box::new(FreepikEva02::from_hub(&device)?))
+        match kind {
+            ClassifierKind::Freepik => Ok(Box::new(FreepikEva02::from_hub(&device)?)),
+            ClassifierKind::WdEva02 => Ok(Box::new(SingleWdClassifier::wd_eva02()?)),
+            ClassifierKind::Idolsankaku => Ok(Box::new(SingleWdClassifier::idolsankaku()?)),
+            ClassifierKind::WdEnsemble => Ok(Box::new(WdEnsembleClassifier::from_hub()?)),
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("classifier load task panicked: {e}"))?

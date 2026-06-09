@@ -82,6 +82,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     classify_only: bool,
 
+    #[arg(
+        long,
+        default_value = "freepik",
+        value_name = "NAME",
+        help = "Image classifier to use when --classify-output or --classify-only is set. \
+                Options:\n  freepik       — Existing 4-tier Freepik NSFW (default)\n  \
+                wd-eva02      — SmilingWolf WD EVA02-Large v3, 5-tier rating head\n  \
+                idolsankaku   — deepghs Idolsankaku EVA02-Large v1, 5-tier rating head\n  \
+                wd-ensemble   — Confidence-weighted ensemble of wd-eva02 + idolsankaku, 5-tier"
+    )]
+    classifier: String,
+
     #[arg(long, value_name = "FLOAT")]
     headroom_ratio: Option<f32>,
 
@@ -114,7 +126,10 @@ async fn main() -> Result<()> {
     let artistic_config = build_artistic_config(&args)?;
     let (model, face_detector) = load_models(&args).await?;
     let classifier = if args.classify_output || args.classify_only {
-        Some(icarus_v2::models::load_classifier(&candle_core::Device::Cpu).await?)
+        let kind = args
+            .classifier
+            .parse::<icarus_v2::models::ClassifierKind>()?;
+        Some(icarus_v2::models::load_classifier(kind, &candle_core::Device::Cpu).await?)
     } else {
         None
     };

@@ -63,6 +63,7 @@ Useful flags implemented in `src/main.rs`:
 - `--visualize <path>` for annotated output
 - `--output-boxes <path>` for JSON detections
 - `--sort-output` for aspect-ratio subfolder organization
+- `--classifier freepik|wd-eva02|idolsankaku|wd-ensemble` for content rating backend selection
 - `--margin <percent>` for bbox expansion before crop computation
 - `--crop-config <yaml>` and `--visibility-threshold <percent>` for crop rules
 - `--artistic-mode conservative|balanced|aggressive`
@@ -135,6 +136,16 @@ Face detection model path:
 
 - Default: YOLOv11x-face
 - Alternate fast path is implemented (`load_fast_face_detector`) but not default.
+
+Classifiers currently wired in CLI and loader:
+
+- `freepik` — existing 4-tier Freepik classifier (`Freepik/nsfw_image_detector`)
+- `wd-eva02` — 5-tier rating head from
+  `SmilingWolf/wd-eva02-large-tagger-v3`
+- `idolsankaku` — 5-tier rating head from
+  `deepghs/idolsankaku-eva02-large-tagger-v1`
+- `wd-ensemble` — confidence-weighted combination of `wd-eva02` +
+  `idolsankaku` using shared 5-tier severity mapping
 
 Note: Several Candle-centric/deferred wrappers exist for future roadmap work; do not assume
 they are production-ready without checking loader wiring in `src/models/mod.rs` and CLI

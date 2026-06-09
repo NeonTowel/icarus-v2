@@ -11,6 +11,8 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 tokio = { version = "1.0", features = ["full"] }
 clap = { version = "4.0", features = ["derive"] }
+csv = "1.3"
+dirs = "5"
 anyhow = "1.0"
 thiserror = "1.0"
 log = "0.4"
@@ -38,6 +40,7 @@ yolov10 = { version = "0.2", default-features = false, features = ["cpu"] }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries"] }
 ndarray = "0.16"
 little_exif = "0.6.23"
+ureq = "2"
 xmp-writer = "0.3"
 
 [dev-dependencies]
@@ -50,4 +53,3 @@ path = "src/main.rs"
 [lib]
 name = "icarus_v2"
 path = "src/lib.rs"
-

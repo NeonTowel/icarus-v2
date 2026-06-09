@@ -7,7 +7,7 @@
 /// - `mobile/`     — 9:21 tall mobile format
 ///
 /// When both `--sort-output` and `--classify-output` are enabled, the tier is
-/// appended to the subfolder name (e.g. `landscape-0` through `landscape-4`).
+/// appended to the subfolder name (e.g. `landscape-0` through `landscape-5`).
 ///
 /// Additionally, annotated/visualized images always receive an `_annotated` suffix
 /// injected into the file stem. When sorting is enabled the format suffix is
@@ -110,7 +110,7 @@ pub fn determine_best_format_for_aspect_ratio(aspect_ratio: f32) -> &'static str
 ///
 /// Creates `landscape/`, `portrait/`, and `mobile/` subdirectories under
 /// `base_dir` when classification is disabled. When classification is enabled,
-/// creates `landscape-0..4`, `portrait-0..4`, and `mobile-0..4` instead.
+/// creates `landscape-0..5`, `portrait-0..5`, and `mobile-0..5` instead.
 /// This operation is **idempotent**: calling it multiple times does not
 /// produce errors or duplicate directories.
 ///
@@ -127,7 +127,7 @@ pub fn determine_best_format_for_aspect_ratio(aspect_ratio: f32) -> &'static str
 /// # Example
 /// ```rust,ignore
 /// ensure_output_dirs(Path::new("output/"), true, true)?;
-/// // Creates: output/landscape-0..4, output/portrait-0..4, output/mobile-0..4
+/// // Creates: output/landscape-0..5, output/portrait-0..5, output/mobile-0..5
 /// ```
 pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: bool) -> Result<()> {
     if !sort_output {
@@ -138,8 +138,8 @@ pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: b
 
     if classify_output {
         for subfolder in &subfolders {
-            // tier 0 = classifier failed / unknown; 1-4 = normal classification tiers
-            for tier in 0..=4 {
+            // tier 0 = classifier failed / unknown; 1-5 = normal classification tiers
+            for tier in 0..=5 {
                 let dir = base_dir.join(format!("{}-{}", subfolder, tier));
                 std::fs::create_dir_all(&dir)
                     .with_context(|| format!("Failed to create output subfolder: {:?}", dir))?;
@@ -292,8 +292,9 @@ fn ensure_annotated_suffix(stem: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_annotated_output_path, get_sorted_output_path};
+    use super::{ensure_output_dirs, get_annotated_output_path, get_sorted_output_path};
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn get_sorted_output_path_uses_tier_zero_when_none() {
@@ -311,5 +312,24 @@ mod tests {
                 .expect("path generation should succeed");
 
         assert_eq!(path, Path::new("out/mobile-0/viz_annotated.jpg"));
+    }
+
+    #[test]
+    fn ensure_output_dirs_creates_classification_tiers_through_five() {
+        let temp_dir = tempdir().expect("tempdir should be created");
+        let output_dir = temp_dir.path();
+
+        ensure_output_dirs(output_dir, true, true).expect("directory creation should succeed");
+
+        for subfolder in ["landscape", "portrait", "mobile"] {
+            for tier in 0..=5 {
+                let expected_directory = output_dir.join(format!("{subfolder}-{tier}"));
+                assert!(
+                    expected_directory.is_dir(),
+                    "expected directory to exist: {:?}",
+                    expected_directory
+                );
+            }
+        }
     }
 }

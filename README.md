@@ -29,6 +29,12 @@ cargo run --release -- \
   --input <image-or-dir> \
   --output <path> \
   --threads 4
+
+# Use the WD ensemble for 5-tier content rating
+cargo run --release -- \
+  --input <dir> --output <out> \
+  --classify-only --sort-output \
+  --classifier wd-ensemble
 ```
 
 ## Common Flags
@@ -42,6 +48,7 @@ cargo run --release -- \
 | `--margin <pct>` | Bbox expansion before crop |
 | `--crop-config <yaml>` | Crop rule overrides |
 | `--visibility-threshold <pct>` | Minimum visible-person ratio |
+| `--classifier <name>` | Classifier mode: `freepik`, `wd-eva02`, `idolsankaku`, `wd-ensemble` |
 | `-t, --threads <num>` | Batch worker threads (default: 50% cores, min 1, capped at cores) |
 | `--artistic-mode` | `conservative` \| `balanced` \| `aggressive` |
 
