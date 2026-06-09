@@ -7,7 +7,7 @@
 /// - `mobile/`     — 9:21 tall mobile format
 ///
 /// When both `--sort-output` and `--classify-output` are enabled, the tier is
-/// appended to the subfolder name (e.g. `landscape-1` through `landscape-4`).
+/// appended to the subfolder name (e.g. `landscape-0` through `landscape-4`).
 ///
 /// Additionally, annotated/visualized images always receive an `_annotated` suffix
 /// injected into the file stem. When sorting is enabled the format suffix is
@@ -22,7 +22,7 @@
 ///
 /// ensure_output_dirs(Path::new("output/"), true, false)?;
 /// let path = get_sorted_output_path(Path::new("output/crop.jpg"), "21:9", "crop", "jpg", true, None)?;
-/// // Returns: output/landscape/crop.jpg
+/// // Returns: output/landscape-0/crop.jpg
 /// ```
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -109,8 +109,10 @@ pub fn determine_best_format_for_aspect_ratio(aspect_ratio: f32) -> &'static str
 /// Ensure the aspect-ratio output subdirectories exist under `base_dir`.
 ///
 /// Creates `landscape/`, `portrait/`, and `mobile/` subdirectories under
-/// `base_dir`. This operation is **idempotent**: calling it multiple times
-/// does not produce errors or duplicate directories.
+/// `base_dir` when classification is disabled. When classification is enabled,
+/// creates `landscape-0..4`, `portrait-0..4`, and `mobile-0..4` instead.
+/// This operation is **idempotent**: calling it multiple times does not
+/// produce errors or duplicate directories.
 ///
 /// Does nothing if `sort_output` is `false`.
 ///
@@ -124,8 +126,8 @@ pub fn determine_best_format_for_aspect_ratio(aspect_ratio: f32) -> &'static str
 ///
 /// # Example
 /// ```rust,ignore
-/// ensure_output_dirs(Path::new("output/"), true)?;
-/// // Creates: output/landscape/, output/portrait/, output/mobile/
+/// ensure_output_dirs(Path::new("output/"), true, true)?;
+/// // Creates: output/landscape-0..4, output/portrait-0..4, output/mobile-0..4
 /// ```
 pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: bool) -> Result<()> {
     if !sort_output {
@@ -136,7 +138,8 @@ pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: b
 
     if classify_output {
         for subfolder in &subfolders {
-            for tier in 1..=4 {
+            // tier 0 = classifier failed / unknown; 1-4 = normal classification tiers
+            for tier in 0..=4 {
                 let dir = base_dir.join(format!("{}-{}", subfolder, tier));
                 std::fs::create_dir_all(&dir)
                     .with_context(|| format!("Failed to create output subfolder: {:?}", dir))?;
@@ -179,7 +182,7 @@ pub fn ensure_output_dirs(base_dir: &Path, sort_output: bool, classify_output: b
 /// # Example
 /// ```rust,ignore
 /// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", true, None)?;
-/// // Returns: out/landscape/crop.jpg
+/// // Returns: out/landscape-0/crop.jpg
 ///
 /// let path = get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", false, None)?;
 /// // Returns: out/crop_21_9.jpg
@@ -204,9 +207,8 @@ pub fn get_sorted_output_path(
             .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?
             .to_string();
 
-        if let Some(tier) = classification_tier {
-            subfolder = format!("{}-{}", subfolder, tier);
-        }
+        let tier = classification_tier.unwrap_or(0);
+        subfolder = format!("{}-{}", subfolder, tier);
 
         Ok(dir.join(subfolder).join(filename))
     } else {
@@ -231,7 +233,7 @@ pub fn get_sorted_output_path(
 /// # Example
 /// ```rust,ignore
 /// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", true, None)?;
-/// // Returns: out/landscape/viz_annotated.jpg
+/// // Returns: out/landscape-0/viz_annotated.jpg
 ///
 /// let path = get_annotated_output_path(Path::new("out/viz.jpg"), "21:9", "viz", "jpg", false, None)?;
 /// // Returns: out/viz_annotated_21_9.jpg
@@ -257,9 +259,8 @@ pub fn get_annotated_output_path(
             .with_context(|| format!("Unknown format '{}'; cannot determine subfolder", format))?
             .to_string();
 
-        if let Some(tier) = classification_tier {
-            subfolder = format!("{}-{}", subfolder, tier);
-        }
+        let tier = classification_tier.unwrap_or(0);
+        subfolder = format!("{}-{}", subfolder, tier);
 
         Ok(dir.join(subfolder).join(filename))
     } else {
@@ -286,5 +287,29 @@ fn ensure_annotated_suffix(stem: &str) -> String {
         stem.to_string()
     } else {
         format!("{}_annotated", stem)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_annotated_output_path, get_sorted_output_path};
+    use std::path::Path;
+
+    #[test]
+    fn get_sorted_output_path_uses_tier_zero_when_none() {
+        let path =
+            get_sorted_output_path(Path::new("out/crop.jpg"), "21:9", "crop", "jpg", true, None)
+                .expect("path generation should succeed");
+
+        assert_eq!(path, Path::new("out/landscape-0/crop.jpg"));
+    }
+
+    #[test]
+    fn get_annotated_output_path_uses_tier_zero_when_none() {
+        let path =
+            get_annotated_output_path(Path::new("out/viz.jpg"), "9:21", "viz", "jpg", true, None)
+                .expect("path generation should succeed");
+
+        assert_eq!(path, Path::new("out/mobile-0/viz_annotated.jpg"));
     }
 }

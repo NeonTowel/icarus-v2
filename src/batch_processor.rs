@@ -412,8 +412,8 @@ fn process_image_with_base_paths(
             .context("Failed to create output subdirectories")?;
 
             let tier = if let Some(classifier) = ctx.classifier {
-                Some(try_get_classification_tier(Some(classifier), &image, file_label).unwrap_or(3))
-            // fallback to neutral rating (3) when classifier fails
+                Some(try_get_classification_tier(Some(classifier), &image, file_label).unwrap_or(0))
+            // unknown tier (0) when classifier fails → lands in landscape-0 etc.
             } else {
                 bail!("--classify-only requires classifier but none was initialized");
             };
@@ -587,8 +587,8 @@ fn process_image_with_base_paths(
                 let img_to_classify = cropped_image.as_ref().unwrap_or(&image);
                 Some(
                     try_get_classification_tier(ctx.classifier, img_to_classify, file_label)
-                        .unwrap_or(3),
-                ) // fallback to neutral rating (3) when classifier fails
+                        .unwrap_or(0),
+                ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
             } else {
                 None
             };
@@ -705,8 +705,8 @@ fn process_image_with_base_paths(
                 let tier = if ctx.classify_output {
                     Some(
                         try_get_classification_tier(ctx.classifier, &image, file_label)
-                            .unwrap_or(3),
-                    ) // fallback to neutral rating (3) when classifier fails
+                            .unwrap_or(0),
+                    ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
                 } else {
                     None
                 };
@@ -817,8 +817,8 @@ fn process_image_with_base_paths(
                     let tier = if ctx.classify_output {
                         Some(
                             try_get_classification_tier(ctx.classifier, &final_crop, file_label)
-                                .unwrap_or(3),
-                        ) // fallback to neutral rating (3) when classifier fails
+                                .unwrap_or(0),
+                        ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
                     } else {
                         None
                     };
