@@ -424,10 +424,15 @@ fn process_image_with_base_paths(
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("crop");
-                let ext = output_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg");
+                // Respect --jpeg flag: always use .jpg extension for classify-only + sort-output
+                let ext = if ctx.jpeg_quality.is_some() {
+                    "jpg"
+                } else {
+                    output_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg")
+                };
                 output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
             } else {
                 output_path.to_path_buf()
@@ -595,10 +600,14 @@ fn process_image_with_base_paths(
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("crop");
-                let ext = output_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg");
+                let ext = if ctx.jpeg_quality.is_some() {
+                    "jpg"
+                } else {
+                    output_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg")
+                };
                 output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
             } else {
                 output_path.to_path_buf()
@@ -709,20 +718,28 @@ fn process_image_with_base_paths(
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("crop");
-                let ext = output_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg");
+                let ext = if ctx.jpeg_quality.is_some() {
+                    "jpg"
+                } else {
+                    output_path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("jpg")
+                };
                 let viz_stem = viz_path.and_then(|path| {
                     path.file_stem()
                         .and_then(|s| s.to_str())
                         .map(|s| s.to_string())
                 });
-                let viz_ext = viz_path.and_then(|path| {
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s.to_string())
-                });
+                let viz_ext = if ctx.jpeg_quality.is_some() {
+                    Some("jpg".to_string())
+                } else {
+                    viz_path.and_then(|path| {
+                        path.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.to_string())
+                    })
+                };
 
                 let focal = crate::focal_point::compute_focal_point(
                     person_bbox_for_adjustment.as_ref(),
@@ -921,11 +938,15 @@ fn process_one_in_batch(
 
     if ctx.rename {
         let new_stem = uuid::Uuid::new_v4().to_string();
-        let ext = relative
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_owned();
+        let ext = if ctx.jpeg_quality.is_some() {
+            "jpg".to_string()
+        } else {
+            relative
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_owned()
+        };
         relative.set_file_name(new_stem);
         if !ext.is_empty() {
             relative.set_extension(ext);
