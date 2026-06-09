@@ -70,20 +70,30 @@ fn save_image_with_exif(
         .and_then(|e| e.to_str())
         .unwrap_or("jpg")
         .to_lowercase();
-    let (img_format, exif_ext) = match ext.as_str() {
-        "png" => (
+
+    // When --jpeg is used we always output JPEG regardless of original extension
+    let use_jpeg = jpeg_quality.is_some() || matches!(ext.as_str(), "jpg" | "jpeg");
+    let (img_format, exif_ext) = if use_jpeg {
+        (image::ImageFormat::Jpeg, FileExtension::JPEG)
+    } else if ext == "png" {
+        (
             image::ImageFormat::Png,
             FileExtension::PNG {
                 as_zTXt_chunk: true,
             },
-        ),
-        "webp" => (image::ImageFormat::WebP, FileExtension::WEBP),
-        _ => (image::ImageFormat::Jpeg, FileExtension::JPEG),
+        )
+    } else if ext == "webp" {
+        (image::ImageFormat::WebP, FileExtension::WEBP)
+    } else {
+        (image::ImageFormat::Jpeg, FileExtension::JPEG)
     };
 
     let mut img_buffer: Vec<u8> = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut img_buffer);
-    if let Some(quality) = jpeg_quality {
+
+    // Always use JPEG encoder when --jpeg flag is provided (even if path suggests PNG)
+    if use_jpeg {
+        let quality = jpeg_quality.unwrap_or(95);
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
         encoder.encode_image(image)?;
     } else {
@@ -102,7 +112,13 @@ fn save_image_with_exif(
         metadata.write_to_vec(&mut img_buffer, exif_ext)?;
 
         // Also write XMP xmp:Rating for Adobe Bridge star interoperability.
-        if ext == "jpg" || ext == "jpeg" {
+        // XMP only makes sense for JPEG (after possible format coercion).
+        let final_ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+            .to_lowercase();
+        if final_ext == "jpg" || final_ext == "jpeg" {
             let xmp_packet = build_xmp_packet_with_rating(t)?;
             insert_jpeg_app1_xmp_segment(&mut img_buffer, &xmp_packet)?;
         }
