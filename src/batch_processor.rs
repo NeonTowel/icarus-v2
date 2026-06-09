@@ -412,7 +412,8 @@ fn process_image_with_base_paths(
             .context("Failed to create output subdirectories")?;
 
             let tier = if let Some(classifier) = ctx.classifier {
-                try_get_classification_tier(Some(classifier), &image, file_label)
+                Some(try_get_classification_tier(Some(classifier), &image, file_label).unwrap_or(3))
+            // fallback to neutral rating (3) when classifier fails
             } else {
                 bail!("--classify-only requires classifier but none was initialized");
             };
@@ -584,7 +585,10 @@ fn process_image_with_base_paths(
 
             let tier = if ctx.classify_output {
                 let img_to_classify = cropped_image.as_ref().unwrap_or(&image);
-                try_get_classification_tier(ctx.classifier, img_to_classify, file_label)
+                Some(
+                    try_get_classification_tier(ctx.classifier, img_to_classify, file_label)
+                        .unwrap_or(3),
+                ) // fallback to neutral rating (3) when classifier fails
             } else {
                 None
             };
@@ -699,7 +703,10 @@ fn process_image_with_base_paths(
                     println!("[{}] no suitable crop formats; using fallback.", file_label);
                 }
                 let tier = if ctx.classify_output {
-                    try_get_classification_tier(ctx.classifier, &image, file_label)
+                    Some(
+                        try_get_classification_tier(ctx.classifier, &image, file_label)
+                            .unwrap_or(3),
+                    ) // fallback to neutral rating (3) when classifier fails
                 } else {
                     None
                 };
@@ -808,7 +815,10 @@ fn process_image_with_base_paths(
                         .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
 
                     let tier = if ctx.classify_output {
-                        try_get_classification_tier(ctx.classifier, &final_crop, file_label)
+                        Some(
+                            try_get_classification_tier(ctx.classifier, &final_crop, file_label)
+                                .unwrap_or(3),
+                        ) // fallback to neutral rating (3) when classifier fails
                     } else {
                         None
                     };
