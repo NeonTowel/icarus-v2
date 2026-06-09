@@ -93,6 +93,15 @@ struct Args {
 
     #[arg(long, default_value = "balanced", value_name = "MODE")]
     artistic_mode: String,
+
+    #[arg(long)]
+    rename: bool,
+
+    #[arg(long, num_args = 0..=1, default_missing_value = "98", value_name = "QUALITY")]
+    jpeg: Option<u8>,
+
+    #[arg(long)]
+    flatten: bool,
 }
 
 #[tokio::main]
@@ -132,6 +141,9 @@ async fn main() -> Result<()> {
         classify_output: args.classify_output || args.classify_only,
         classify_only: args.classify_only,
         quiet: args.quiet,
+        rename: args.rename,
+        jpeg_quality: args.jpeg,
+        flatten: args.flatten,
     };
 
     dispatch(&args, &context).await

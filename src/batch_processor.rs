@@ -59,7 +59,12 @@ fn insert_jpeg_app1_xmp_segment(jpeg_bytes: &mut Vec<u8>, xmp_packet: &[u8]) -> 
     Ok(())
 }
 
-fn save_image_with_exif(image: &DynamicImage, path: &Path, tier: Option<u8>) -> Result<()> {
+fn save_image_with_exif(
+    image: &DynamicImage,
+    path: &Path,
+    tier: Option<u8>,
+    jpeg_quality: Option<u8>,
+) -> Result<()> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -77,7 +82,13 @@ fn save_image_with_exif(image: &DynamicImage, path: &Path, tier: Option<u8>) -> 
     };
 
     let mut img_buffer: Vec<u8> = Vec::new();
-    image.write_to(&mut std::io::Cursor::new(&mut img_buffer), img_format)?;
+    let mut cursor = std::io::Cursor::new(&mut img_buffer);
+    if let Some(quality) = jpeg_quality {
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+        encoder.encode_image(image)?;
+    } else {
+        image.write_to(&mut cursor, img_format)?;
+    }
 
     if let Some(t) = tier {
         let mut metadata = Metadata::new();
@@ -115,6 +126,9 @@ pub struct ProcessingContext<'a> {
     pub classify_output: bool,
     pub classify_only: bool,
     pub quiet: bool,
+    pub rename: bool,
+    pub jpeg_quality: Option<u8>,
+    pub flatten: bool,
 }
 
 /// Result metadata for one processed image.
@@ -167,10 +181,15 @@ fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
         .find(|detection| detection.class_id == PERSON_CLASS_ID)
 }
 
-fn save_fallback_crop(image: &DynamicImage, output_path: &Path, tier: Option<u8>) -> Result<()> {
+fn save_fallback_crop(
+    image: &DynamicImage,
+    output_path: &Path,
+    tier: Option<u8>,
+    jpeg_quality: Option<u8>,
+) -> Result<()> {
     let crop = crop_to_ultrawide_21_9_centered(image)
         .with_context(|| "Failed to crop image to centered 21:9")?;
-    save_image_with_exif(&crop, output_path, tier)
+    save_image_with_exif(&crop, output_path, tier, jpeg_quality)
         .with_context(|| format!("Failed to save fallback crop to {:?}", output_path))?;
     Ok(())
 }
@@ -398,7 +417,7 @@ fn process_image_with_base_paths(
                 output_path.to_path_buf()
             };
 
-            save_image_with_exif(&image, &actual_output_path, tier)
+            save_image_with_exif(&image, &actual_output_path, tier, ctx.jpeg_quality)
                 .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
             output_files.push(actual_output_path.clone());
 
@@ -570,9 +589,11 @@ fn process_image_with_base_paths(
             };
 
             match &cropped_image {
-                Some(cropped) => save_image_with_exif(cropped, &actual_output_path, tier)
-                    .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
-                None => save_image_with_exif(&image, &actual_output_path, tier)
+                Some(cropped) => {
+                    save_image_with_exif(cropped, &actual_output_path, tier, ctx.jpeg_quality)
+                        .with_context(|| format!("Failed to save to {:?}", actual_output_path))?
+                }
+                None => save_image_with_exif(&image, &actual_output_path, tier, ctx.jpeg_quality)
                     .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
             }
 
@@ -657,7 +678,7 @@ fn process_image_with_base_paths(
                 } else {
                     None
                 };
-                save_fallback_crop(&image, output_path, tier)?;
+                save_fallback_crop(&image, output_path, tier, ctx.jpeg_quality)?;
                 output_files.push(output_path.to_path_buf());
             } else {
                 if !ctx.quiet {
@@ -771,9 +792,10 @@ fn process_image_with_base_paths(
                         format!("Failed to build output path for format {}", format)
                     })?;
 
-                    save_image_with_exif(&final_crop, &crop_path, tier).with_context(|| {
-                        format!("Failed to save cropped image to {:?}", crop_path)
-                    })?;
+                    save_image_with_exif(&final_crop, &crop_path, tier, ctx.jpeg_quality)
+                        .with_context(|| {
+                            format!("Failed to save cropped image to {:?}", crop_path)
+                        })?;
                     output_files.push(crop_path.clone());
 
                     if !ctx.quiet {
@@ -867,12 +889,32 @@ fn process_one_in_batch(
     boxes_root: Option<&Path>,
     ctx: &ProcessingContext<'_>,
 ) -> Result<ProcessingResult> {
-    let relative = relative_to(image_path, input_root).unwrap_or_else(|| {
+    let mut relative = if ctx.flatten {
         image_path
             .file_name()
             .map(PathBuf::from)
             .unwrap_or_else(|| image_path.to_path_buf())
-    });
+    } else {
+        relative_to(image_path, input_root).unwrap_or_else(|| {
+            image_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| image_path.to_path_buf())
+        })
+    };
+
+    if ctx.rename {
+        let new_stem = uuid::Uuid::new_v4().to_string();
+        let ext = relative
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_owned();
+        relative.set_file_name(new_stem);
+        if !ext.is_empty() {
+            relative.set_extension(ext);
+        }
+    }
 
     let output_path = output_root.map(|root| root.join(&relative));
     let viz_path = viz_root.map(|root| root.join(&relative));
@@ -909,7 +951,39 @@ pub fn process_single_image(
     boxes_path: Option<&Path>,
     ctx: &ProcessingContext<'_>,
 ) -> Result<ProcessingResult> {
-    process_image_with_base_paths(input_path, output_path, viz_path, boxes_path, ctx)
+    if ctx.rename {
+        let new_stem = uuid::Uuid::new_v4().to_string();
+
+        let apply_rename = |p: Option<&Path>| -> Option<PathBuf> {
+            p.map(|path| {
+                let mut path_buf = path.to_path_buf();
+                let ext = path_buf
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                path_buf.set_file_name(&new_stem);
+                if !ext.is_empty() {
+                    path_buf.set_extension(ext);
+                }
+                path_buf
+            })
+        };
+
+        let new_output = apply_rename(output_path);
+        let new_viz = apply_rename(viz_path);
+        let new_boxes = apply_rename(boxes_path);
+
+        process_image_with_base_paths(
+            input_path,
+            new_output.as_deref(),
+            new_viz.as_deref(),
+            new_boxes.as_deref(),
+            ctx,
+        )
+    } else {
+        process_image_with_base_paths(input_path, output_path, viz_path, boxes_path, ctx)
+    }
 }
 
 /// Run the batch processing pipeline in parallel.

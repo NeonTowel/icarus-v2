@@ -467,11 +467,6 @@ pub fn calculate_landscape_21_9_crop_with_face(
 // Milestone 3: Portrait Crops (Configurable Bbox-Center Upward Bias)
 // ---------------------------------------------------------------------------
 
-/// Internal generic portrait crop calculator used by both 9:21 and 9:16 variants.
-///
-/// **Algorithm:**
-/// 1. Start with `crop_width = photo_width`; derive `crop_height = crop_width / aspect_ratio`.
-
 /// Calculate a 9:21 ultrawide portrait crop with configurable bbox-center upward bias.
 ///
 /// See the shared portrait crop helper in this module for the full algorithm description.
@@ -529,6 +524,7 @@ pub fn calculate_portrait_9_16_crop_with_face(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn calculate_portrait_crop_enhanced(
     photo_width: u32,
     photo_height: u32,
