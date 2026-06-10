@@ -1,6 +1,8 @@
 //! Batch Processing Module
 //!
 //! Contains the shared single-image pipeline plus parallel batch orchestration.
+//! Pipeline stages are extracted into focused functions; the main orchestrator
+//! (`process_image_with_base_paths`) wires them together.
 
 use anyhow::{bail, Context, Result};
 use image::DynamicImage;
@@ -24,6 +26,10 @@ use crate::multi_format_cropping::{
 };
 use crate::output_sorting;
 use crate::visualization::save_visualized_with_faces;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 /// Shared processing inputs used for a single image.
 pub struct ProcessingContext<'a> {
@@ -86,12 +92,58 @@ impl From<crate::models::Detection> for Detection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 const PERSON_CLASS_ID: usize = 0;
 
+// ---------------------------------------------------------------------------
+// Small stage helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the output file stem and extension from `output_path` and `jpeg_quality`.
+///
+/// When `jpeg_quality` is set, always returns `"jpg"` as the extension regardless
+/// of the path extension, ensuring `--jpeg` is honoured everywhere.
+fn resolve_output_naming(output_path: &Path, jpeg_quality: Option<u8>) -> (&str, &str) {
+    let stem = output_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("crop");
+    let ext = if jpeg_quality.is_some() {
+        "jpg"
+    } else {
+        output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg")
+    };
+    (stem, ext)
+}
+
 fn find_best_person_detection(detections: &[Detection]) -> Option<&Detection> {
-    detections
-        .iter()
-        .find(|detection| detection.class_id == PERSON_CLASS_ID)
+    detections.iter().find(|d| d.class_id == PERSON_CLASS_ID)
+}
+
+/// Classify `image` and return the content tier. Never propagates errors (classifier
+/// failure is non-fatal, matching the face-detection contract).
+fn try_get_classification_tier(
+    classifier: Option<&dyn crate::models::ImageClassifier>,
+    image: &DynamicImage,
+    file_label: &str,
+) -> Option<u8> {
+    let c = classifier?;
+    match c.classify(image) {
+        Ok(t) => Some(t),
+        Err(error) => {
+            eprintln!(
+                "[WARN][{}] classifier failed: {}. continuing without rating.",
+                file_label, error
+            );
+            None
+        }
+    }
 }
 
 fn save_fallback_crop(
@@ -103,30 +155,7 @@ fn save_fallback_crop(
     let crop = crop_to_ultrawide_21_9_centered(image)
         .with_context(|| "Failed to crop image to centered 21:9")?;
     save_image_with_exif(&crop, output_path, tier, jpeg_quality)
-        .with_context(|| format!("Failed to save fallback crop to {:?}", output_path))?;
-    Ok(())
-}
-
-/// Complementary classifier helper. Never fails the image (like face detection).
-/// Returns tier if successful, None on error or no classifier. Logs WARN.
-fn try_get_classification_tier(
-    classifier: Option<&dyn crate::models::ImageClassifier>,
-    image: &DynamicImage,
-    file_label: &str,
-) -> Option<u8> {
-    match classifier {
-        Some(c) => match c.classify(image) {
-            Ok(t) => Some(t),
-            Err(error) => {
-                eprintln!(
-                    "[WARN][{}] classifier failed: {}. continuing without rating.",
-                    file_label, error
-                );
-                None
-            }
-        },
-        None => None,
-    }
+        .with_context(|| format!("Failed to save fallback crop to {:?}", output_path))
 }
 
 fn ensure_parent_directories(path: &Path) -> Result<()> {
@@ -134,119 +163,47 @@ fn ensure_parent_directories(path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output dir: {:?}", parent))?;
     }
-
     Ok(())
 }
 
-fn process_image_with_base_paths(
-    image_path: &Path,
-    output_path: Option<&Path>,
-    viz_path: Option<&Path>,
-    boxes_path: Option<&Path>,
-    ctx: &ProcessingContext<'_>,
-) -> Result<ProcessingResult> {
-    let file_label = image_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("<unknown>");
-    let image = image::open(image_path).with_context(|| {
-        format!(
-            "[{}] failed to open input image: {:?}",
-            file_label, image_path
-        )
-    })?;
+// ---------------------------------------------------------------------------
+// Detection stages
+// ---------------------------------------------------------------------------
 
-    let image_width = image.width();
-    let image_height = image.height();
-
-    if ctx.classify_only {
-        let mut output_files: Vec<PathBuf> = Vec::new();
-
-        if let Some(output_path) = output_path {
-            output_sorting::ensure_output_dirs(
-                output_path.parent().unwrap_or(Path::new(".")),
-                ctx.sort_output,
-                ctx.classify_output,
-            )
-            .context("Failed to create output subdirectories")?;
-
-            let tier = if let Some(classifier) = ctx.classifier {
-                Some(try_get_classification_tier(Some(classifier), &image, file_label).unwrap_or(0))
-            // unknown tier (0) when classifier fails → lands in landscape-0 etc.
-            } else {
-                bail!("--classify-only requires classifier but none was initialized");
-            };
-
-            let actual_output_path = if ctx.sort_output {
-                let aspect_ratio = image.width() as f32 / image.height() as f32;
-                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
-                let stem = output_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("crop");
-                // Respect --jpeg flag: always use .jpg extension for classify-only + sort-output
-                let ext = if ctx.jpeg_quality.is_some() {
-                    "jpg"
-                } else {
-                    output_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg")
-                };
-                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
-            } else {
-                output_path.to_path_buf()
-            };
-
-            save_image_with_exif(&image, &actual_output_path, tier, ctx.jpeg_quality)
-                .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
-            output_files.push(actual_output_path.clone());
-
-            if !ctx.quiet {
-                println!(
-                    "[{}] classify-only: saved original image → {:?}",
-                    file_label, actual_output_path
-                );
-            }
-        }
-
-        return Ok(ProcessingResult {
-            input_path: image_path.to_path_buf(),
-            output_files,
-            person_count: 0,
-            face_count: 0,
-        });
-    }
-
-    let input_tensor = ctx
-        .model
-        .preprocess(std::slice::from_ref(&image))
-        .map_err(|error| anyhow::anyhow!("Preprocessing failed: {error}"))?;
-
-    let (logits, boxes) = ctx
-        .model
+/// Run person detection and return all confidence-filtered detections.
+fn run_detection(
+    image: &DynamicImage,
+    file_label: &str,
+    model: &dyn Model,
+    confidence: f32,
+) -> Result<Vec<Detection>> {
+    let input_tensor = model
+        .preprocess(std::slice::from_ref(image))
+        .map_err(|e| anyhow::anyhow!("Preprocessing failed: {e}"))?;
+    let (logits, boxes) = model
         .forward(&input_tensor)
-        .map_err(|error| anyhow::anyhow!("Inference failed: {error}"))?;
-
-    let raw_detections = ctx
-        .model
+        .map_err(|e| anyhow::anyhow!("Inference failed: {e}"))?;
+    let raw = model
         .postprocess(logits, boxes)
-        .map_err(|error| anyhow::anyhow!("Postprocessing failed: {error}"))?;
-
-    let detections: Vec<Detection> = raw_detections
+        .map_err(|e| anyhow::anyhow!("Postprocessing failed: {e}"))?;
+    let _ = file_label; // reserved for future per-image logging
+    Ok(raw
         .into_iter()
         .map(Detection::from)
-        .filter(|detection| detection.confidence >= ctx.confidence)
-        .collect();
+        .filter(|d| d.confidence >= confidence)
+        .collect())
+}
 
-    let person_detections: Vec<&Detection> = detections
-        .iter()
-        .filter(|detection| detection.class_id == PERSON_CLASS_ID)
-        .collect();
-
-    let face_bboxes = match detect_faces(&image, ctx.face_detector) {
+/// Detect faces; non-fatal — on error, log a warning and return empty.
+fn detect_faces_nonfatal(
+    image: &DynamicImage,
+    file_label: &str,
+    face_detector: &crate::face_detection::FaceDetector,
+    quiet: bool,
+) -> Vec<BBox> {
+    match detect_faces(image, face_detector) {
         Ok(faces) => {
-            if !ctx.quiet && !faces.is_empty() {
+            if !quiet && !faces.is_empty() {
                 println!("[{}] {} face(s) detected.", file_label, faces.len());
             }
             faces
@@ -258,53 +215,486 @@ fn process_image_with_base_paths(
             );
             Vec::new()
         }
-    };
+    }
+}
 
-    let base_bbox: Option<BBox> = match person_detections.len() {
+/// Compute the person bounding box: single bbox, or compound+dedup for multiple persons.
+fn compute_base_bbox(
+    person_detections: &[&Detection],
+    file_label: &str,
+    crop_config: &CropConfig,
+    quiet: bool,
+) -> Option<BBox> {
+    match person_detections.len() {
         0 => None,
         1 => Some(person_detections[0].bbox.into()),
         count => {
-            if !ctx.quiet {
+            if !quiet {
                 println!(
                     "[{}] {} persons detected; using compound bbox.",
                     file_label, count
                 );
             }
-
-            let detections_for_bbox: Vec<crate::image_utils::Detection> = person_detections
+            let items: Vec<crate::image_utils::Detection> = person_detections
                 .iter()
-                .map(|detection| crate::image_utils::Detection {
-                    bbox: detection.bbox,
-                    confidence: detection.confidence,
-                    label: detection.label.clone(),
-                    class_id: detection.class_id,
+                .map(|d| crate::image_utils::Detection {
+                    bbox: d.bbox,
+                    confidence: d.confidence,
+                    label: d.label.clone(),
+                    class_id: d.class_id,
                 })
                 .collect();
-
-            let effective_detections = if ctx.crop_config.enable_reflection_dedup {
-                deduplicate_person_detections(
-                    &detections_for_bbox,
-                    ctx.crop_config.dedup_iou_threshold,
-                )
+            let effective = if crop_config.enable_reflection_dedup {
+                deduplicate_person_detections(&items, crop_config.dedup_iou_threshold)
             } else {
-                detections_for_bbox
+                items
             };
-            calculate_compound_bbox(&effective_detections)
+            calculate_compound_bbox(&effective)
         }
-    };
+    }
+}
 
-    let crop_bbox = if let Some(b) = base_bbox {
-        let mut merged = b;
-        for f in &face_bboxes {
-            merged = merge_bboxes(&merged, f);
-        }
+/// Merge person bbox with faces (or fall back to dominant face when no person detected).
+fn compute_crop_bbox(base: Option<BBox>, face_bboxes: &[BBox]) -> Option<BBox> {
+    if let Some(b) = base {
+        let merged = face_bboxes.iter().fold(b, |acc, f| merge_bboxes(&acc, f));
         Some(merged)
     } else if !face_bboxes.is_empty() {
-        select_dominant_face_for_crop(&face_bboxes).cloned()
+        select_dominant_face_for_crop(face_bboxes).cloned()
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classify-only stage
+// ---------------------------------------------------------------------------
+
+fn process_classify_only(
+    image_path: &Path,
+    image: &DynamicImage,
+    file_label: &str,
+    output_path: Option<&Path>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<ProcessingResult> {
+    let mut output_files: Vec<PathBuf> = Vec::new();
+
+    if let Some(output_path) = output_path {
+        output_sorting::ensure_output_dirs(
+            output_path.parent().unwrap_or(Path::new(".")),
+            ctx.sort_output,
+            ctx.classify_output,
+        )
+        .context("Failed to create output subdirectories")?;
+
+        let Some(classifier) = ctx.classifier else {
+            bail!("--classify-only requires classifier but none was initialized");
+        };
+        let tier =
+            Some(try_get_classification_tier(Some(classifier), image, file_label).unwrap_or(0));
+
+        let (stem, ext) = resolve_output_naming(output_path, ctx.jpeg_quality);
+        let actual_output_path = if ctx.sort_output {
+            let ar = image.width() as f32 / image.height() as f32;
+            let fmt = output_sorting::determine_best_format_for_aspect_ratio(ar);
+            output_sorting::get_sorted_output_path(output_path, fmt, stem, ext, true, tier)?
+        } else {
+            output_path.to_path_buf()
+        };
+
+        save_image_with_exif(image, &actual_output_path, tier, ctx.jpeg_quality)
+            .with_context(|| format!("Failed to save to {:?}", actual_output_path))?;
+        output_files.push(actual_output_path.clone());
+
+        if !ctx.quiet {
+            println!(
+                "[{}] classify-only: saved original image → {:?}",
+                file_label, actual_output_path
+            );
+        }
+    }
+
+    Ok(ProcessingResult {
+        input_path: image_path.to_path_buf(),
+        output_files,
+        person_count: 0,
+        face_count: 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Output stages
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn write_whole_image_crop(
+    image: &DynamicImage,
+    file_label: &str,
+    output_path: &Path,
+    viz_path: Option<&Path>,
+    person_for_crop: Option<&Detection>,
+    detections: &[Detection],
+    face_bboxes: &[BBox],
+    all_crop_regions: &[CropRegion],
+    output_files: &mut Vec<PathBuf>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<()> {
+    let cropped = if ctx.keep_aspect_ratio {
+        person_for_crop
+            .map(|p| {
+                crop_image(image, p.bbox)
+                    .with_context(|| format!("Failed to crop bbox {:?}", p.bbox))
+            })
+            .transpose()?
+    } else {
+        Some(
+            crop_to_ultrawide_21_9_centered(image)
+                .with_context(|| "Failed to crop image to centered 21:9")?,
+        )
+    };
+
+    let img_to_use = cropped.as_ref().unwrap_or(image);
+    let tier = if ctx.classify_output {
+        Some(try_get_classification_tier(ctx.classifier, img_to_use, file_label).unwrap_or(0))
     } else {
         None
     };
 
+    let (stem, ext) = resolve_output_naming(output_path, ctx.jpeg_quality);
+    let actual_path = if ctx.sort_output {
+        let ar = img_to_use.width() as f32 / img_to_use.height() as f32;
+        let fmt = output_sorting::determine_best_format_for_aspect_ratio(ar);
+        output_sorting::get_sorted_output_path(output_path, fmt, stem, ext, true, tier)?
+    } else {
+        output_path.to_path_buf()
+    };
+
+    save_image_with_exif(img_to_use, &actual_path, tier, ctx.jpeg_quality)
+        .with_context(|| format!("Failed to save to {:?}", actual_path))?;
+    output_files.push(actual_path.clone());
+    if !ctx.quiet {
+        println!("[{}] saved crop → {:?}", file_label, actual_path);
+    }
+
+    if let Some(viz_target) = viz_path {
+        let viz_out = resolve_whole_image_viz_path(viz_target, img_to_use, tier, ctx)?;
+        save_visualized_with_faces(image, detections, face_bboxes, all_crop_regions, &viz_out)?;
+        output_files.push(viz_out.clone());
+        if !ctx.quiet {
+            println!("[{}] saved annotated → {:?}", file_label, viz_out);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_whole_image_viz_path(
+    viz_target: &Path,
+    img_to_use: &DynamicImage,
+    tier: Option<u8>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<PathBuf> {
+    if ctx.sort_output {
+        let ar = img_to_use.width() as f32 / img_to_use.height() as f32;
+        let fmt = output_sorting::determine_best_format_for_aspect_ratio(ar);
+        let stem = viz_target
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("viz");
+        let ext = viz_target
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jpg");
+        return output_sorting::get_annotated_output_path(viz_target, fmt, stem, ext, true, tier);
+    }
+    let stem = viz_target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("viz");
+    let ext = viz_target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    let dir = viz_target.parent().unwrap_or(Path::new("."));
+    let annotated_stem = if stem.ends_with("_annotated") {
+        stem.to_string()
+    } else {
+        format!("{}_annotated", stem)
+    };
+    Ok(dir.join(format!("{}.{}", annotated_stem, ext)))
+}
+
+/// Named bundle of loop-invariant context shared across all format iterations.
+struct FormatLoopCtx<'a> {
+    image: &'a DynamicImage,
+    file_label: &'a str,
+    output_path: &'a Path,
+    viz_path: Option<&'a Path>,
+    face_bboxes: &'a [BBox],
+    detections: &'a [Detection],
+    focal: &'a crate::focal_point::FocalPoint,
+    image_width: u32,
+    image_height: u32,
+    stem: &'a str,
+    ext: &'a str,
+    viz_stem: Option<String>,
+    viz_ext: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_multi_format_crops(
+    image: &DynamicImage,
+    file_label: &str,
+    output_path: &Path,
+    viz_path: Option<&Path>,
+    crop_bbox: &BBox,
+    face_bboxes: &[BBox],
+    detections: &[Detection],
+    image_width: u32,
+    image_height: u32,
+    output_files: &mut Vec<PathBuf>,
+    all_crop_regions: &mut Vec<CropRegion>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<()> {
+    if ctx.margin < 0.0 {
+        bail!("--margin must be ≥ 0, got {}", ctx.margin);
+    }
+    let suitable_formats = detect_suitable_formats(
+        image.width(),
+        image.height(),
+        crop_bbox,
+        ctx.margin,
+        ctx.crop_config,
+    );
+    if suitable_formats.is_empty() {
+        if !ctx.quiet {
+            println!("[{}] no suitable crop formats; using fallback.", file_label);
+        }
+        let tier = if ctx.classify_output {
+            Some(try_get_classification_tier(ctx.classifier, image, file_label).unwrap_or(0))
+        } else {
+            None
+        };
+        save_fallback_crop(image, output_path, tier, ctx.jpeg_quality)?;
+        output_files.push(output_path.to_path_buf());
+        return Ok(());
+    }
+    if !ctx.quiet {
+        println!(
+            "[{}] suitable formats: {}",
+            file_label,
+            suitable_formats.join(", ")
+        );
+    }
+    let focal = crate::focal_point::compute_focal_point(
+        Some(crop_bbox),
+        face_bboxes,
+        image_width,
+        image_height,
+    );
+    let (stem, ext) = resolve_output_naming(output_path, ctx.jpeg_quality);
+    let loop_ctx = FormatLoopCtx {
+        image,
+        file_label,
+        output_path,
+        viz_path,
+        face_bboxes,
+        detections,
+        focal: &focal,
+        image_width,
+        image_height,
+        stem,
+        ext,
+        viz_stem: viz_path.and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string)),
+        viz_ext: if ctx.jpeg_quality.is_some() {
+            Some("jpg".to_string())
+        } else {
+            viz_path.and_then(|p| p.extension().and_then(|e| e.to_str()).map(str::to_string))
+        },
+    };
+    for format in &suitable_formats {
+        let working_bbox =
+            apply_margin_to_bbox(crop_bbox, ctx.margin, image.width(), image.height());
+        write_one_format_crop(
+            format,
+            &working_bbox,
+            &loop_ctx,
+            output_files,
+            all_crop_regions,
+            ctx,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_one_format_crop(
+    format: &str,
+    working_bbox: &BBox,
+    lc: &FormatLoopCtx<'_>,
+    output_files: &mut Vec<PathBuf>,
+    all_crop_regions: &mut Vec<CropRegion>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<()> {
+    let Some(original_crop) = compute_format_crop(
+        format,
+        lc.image,
+        working_bbox,
+        lc.face_bboxes,
+        lc.focal,
+        ctx,
+        lc.file_label,
+    ) else {
+        return Ok(());
+    };
+
+    let adjusted = crate::face_aware_cropping::enforce_eye_safety(
+        &original_crop,
+        lc.face_bboxes,
+        lc.image_width,
+        lc.image_height,
+    );
+    all_crop_regions.push(adjusted.clone());
+
+    let xyxy = adjusted.to_xyxy_clamped(lc.image.width(), lc.image.height());
+    let final_crop = crop_image(lc.image, xyxy)
+        .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
+
+    let tier = if ctx.classify_output {
+        Some(try_get_classification_tier(ctx.classifier, &final_crop, lc.file_label).unwrap_or(0))
+    } else {
+        None
+    };
+
+    let crop_path = output_sorting::get_sorted_output_path(
+        lc.output_path,
+        format,
+        lc.stem,
+        lc.ext,
+        ctx.sort_output,
+        tier,
+    )
+    .with_context(|| format!("Failed to build output path for format {}", format))?;
+
+    save_image_with_exif(&final_crop, &crop_path, tier, ctx.jpeg_quality)
+        .with_context(|| format!("Failed to save cropped image to {:?}", crop_path))?;
+    output_files.push(crop_path.clone());
+    if !ctx.quiet {
+        println!(
+            "[{}] saved {} crop → {:?}",
+            lc.file_label, format, crop_path
+        );
+    }
+
+    if let (Some(vstem), Some(vext), Some(viz_base)) = (&lc.viz_stem, &lc.viz_ext, lc.viz_path) {
+        let viz_out = output_sorting::get_annotated_output_path(
+            viz_base,
+            format,
+            vstem,
+            vext,
+            ctx.sort_output,
+            tier,
+        )
+        .with_context(|| format!("Failed to build annotated path for format {}", format))?;
+        save_visualized_with_faces(
+            lc.image,
+            lc.detections,
+            lc.face_bboxes,
+            std::slice::from_ref(&adjusted),
+            &viz_out,
+        )?;
+        output_files.push(viz_out.clone());
+        if !ctx.quiet {
+            println!(
+                "[{}] saved {} annotated → {:?}",
+                lc.file_label, format, viz_out
+            );
+        }
+    }
+    Ok(())
+}
+
+fn compute_format_crop(
+    format: &str,
+    image: &DynamicImage,
+    bbox: &BBox,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
+    ctx: &ProcessingContext<'_>,
+    file_label: &str,
+) -> Option<CropRegion> {
+    match format {
+        "21:9" => calculate_landscape_21_9_crop_with_face(
+            image.width(),
+            image.height(),
+            bbox,
+            face_bboxes,
+            focal,
+            ctx.crop_config,
+            ctx.artistic_config,
+        ),
+        "9:21" => calculate_portrait_9_21_crop_with_face(
+            image.width(),
+            image.height(),
+            bbox,
+            face_bboxes,
+            focal,
+            ctx.crop_config,
+            ctx.artistic_config,
+        ),
+        "9:16" => calculate_portrait_9_16_crop_with_face(
+            image.width(),
+            image.height(),
+            bbox,
+            face_bboxes,
+            focal,
+            ctx.crop_config,
+            ctx.artistic_config,
+        ),
+        other => {
+            eprintln!(
+                "[WARN][{}] unknown format '{}' — skipping.",
+                file_label, other
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main orchestrator
+// ---------------------------------------------------------------------------
+
+fn process_image_with_base_paths(
+    image_path: &Path,
+    output_path: Option<&Path>,
+    viz_path: Option<&Path>,
+    boxes_path: Option<&Path>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<ProcessingResult> {
+    let file_label = image_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+    let image = image::open(image_path).with_context(|| {
+        format!(
+            "[{}] failed to open input image: {:?}",
+            file_label, image_path
+        )
+    })?;
+    let image_width = image.width();
+    let image_height = image.height();
+
+    if ctx.classify_only {
+        return process_classify_only(image_path, &image, file_label, output_path, ctx);
+    }
+
+    let detections = run_detection(&image, file_label, ctx.model, ctx.confidence)?;
+    let person_detections: Vec<&Detection> = detections
+        .iter()
+        .filter(|d| d.class_id == PERSON_CLASS_ID)
+        .collect();
+    let face_bboxes = detect_faces_nonfatal(&image, file_label, ctx.face_detector, ctx.quiet);
+    let base_bbox = compute_base_bbox(&person_detections, file_label, ctx.crop_config, ctx.quiet);
+    let crop_bbox = compute_crop_bbox(base_bbox, &face_bboxes);
     let person_for_crop = find_best_person_detection(&detections);
 
     if !ctx.quiet && detections.is_empty() {
@@ -317,357 +707,64 @@ fn process_image_with_base_paths(
     let mut all_crop_regions: Vec<CropRegion> = Vec::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
 
-    if let Some(output_path) = output_path {
+    if let Some(out) = output_path {
         output_sorting::ensure_output_dirs(
-            output_path.parent().unwrap_or(Path::new(".")),
+            out.parent().unwrap_or(Path::new(".")),
             ctx.sort_output,
             ctx.classify_output,
         )
         .context("Failed to create output subdirectories")?;
 
         if ctx.keep_aspect_ratio || crop_bbox.is_none() {
-            let cropped_image = if ctx.keep_aspect_ratio {
-                if let Some(person) = person_for_crop {
-                    Some(
-                        crop_image(&image, person.bbox)
-                            .with_context(|| format!("Failed to crop bbox {:?}", person.bbox))?,
-                    )
-                } else {
-                    None
-                }
-            } else {
-                Some(
-                    crop_to_ultrawide_21_9_centered(&image)
-                        .with_context(|| "Failed to crop image to centered 21:9")?,
-                )
-            };
-
-            let tier = if ctx.classify_output {
-                let img_to_classify = cropped_image.as_ref().unwrap_or(&image);
-                Some(
-                    try_get_classification_tier(ctx.classifier, img_to_classify, file_label)
-                        .unwrap_or(0),
-                ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
-            } else {
-                None
-            };
-
-            let actual_output_path = if ctx.sort_output {
-                let (crop_width, crop_height) = match &cropped_image {
-                    Some(cropped) => (cropped.width(), cropped.height()),
-                    None => (image.width(), image.height()),
-                };
-                let aspect_ratio = crop_width as f32 / crop_height as f32;
-                let format = output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
-                let stem = output_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("crop");
-                let ext = if ctx.jpeg_quality.is_some() {
-                    "jpg"
-                } else {
-                    output_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg")
-                };
-                output_sorting::get_sorted_output_path(output_path, format, stem, ext, true, tier)?
-            } else {
-                output_path.to_path_buf()
-            };
-
-            match &cropped_image {
-                Some(cropped) => {
-                    save_image_with_exif(cropped, &actual_output_path, tier, ctx.jpeg_quality)
-                        .with_context(|| format!("Failed to save to {:?}", actual_output_path))?
-                }
-                None => save_image_with_exif(&image, &actual_output_path, tier, ctx.jpeg_quality)
-                    .with_context(|| format!("Failed to save to {:?}", actual_output_path))?,
-            }
-
-            output_files.push(actual_output_path.clone());
-
-            if !ctx.quiet {
-                println!("[{}] saved crop → {:?}", file_label, actual_output_path);
-            }
-
-            if let Some(viz_target) = viz_path {
-                let actual_viz_path = if ctx.sort_output {
-                    let (crop_width, crop_height) = match &cropped_image {
-                        Some(cropped) => (cropped.width(), cropped.height()),
-                        None => (image.width(), image.height()),
-                    };
-                    let aspect_ratio = crop_width as f32 / crop_height as f32;
-                    let format =
-                        output_sorting::determine_best_format_for_aspect_ratio(aspect_ratio);
-                    let stem = viz_target
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("viz");
-                    let ext = viz_target
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg");
-                    output_sorting::get_annotated_output_path(
-                        viz_target, format, stem, ext, true, tier,
-                    )?
-                } else {
-                    let stem = viz_target
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("viz");
-                    let ext = viz_target
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg");
-                    let dir = viz_target.parent().unwrap_or(Path::new("."));
-                    let annotated_stem = if stem.ends_with("_annotated") {
-                        stem.to_string()
-                    } else {
-                        format!("{}_annotated", stem)
-                    };
-                    dir.join(format!("{}.{}", annotated_stem, ext))
-                };
-
-                save_visualized_with_faces(
-                    &image,
-                    &detections,
-                    &face_bboxes,
-                    &all_crop_regions,
-                    &actual_viz_path,
-                )?;
-                output_files.push(actual_viz_path.clone());
-
-                if !ctx.quiet {
-                    println!("[{}] saved annotated → {:?}", file_label, actual_viz_path);
-                }
-            }
+            write_whole_image_crop(
+                &image,
+                file_label,
+                out,
+                viz_path,
+                person_for_crop,
+                &detections,
+                &face_bboxes,
+                &all_crop_regions,
+                &mut output_files,
+                ctx,
+            )?;
         } else {
-            if ctx.margin < 0.0 {
-                bail!("--margin must be ≥ 0, got {}", ctx.margin);
-            }
-
-            let raw_bbox: BBox = crop_bbox.clone().expect("crop bbox should exist");
-            let person_bbox_for_adjustment = crop_bbox;
-            let suitable_formats = detect_suitable_formats(
-                image.width(),
-                image.height(),
-                &raw_bbox,
-                ctx.margin,
-                ctx.crop_config,
-            );
-
-            if suitable_formats.is_empty() {
-                if !ctx.quiet {
-                    println!("[{}] no suitable crop formats; using fallback.", file_label);
-                }
-                let tier = if ctx.classify_output {
-                    Some(
-                        try_get_classification_tier(ctx.classifier, &image, file_label)
-                            .unwrap_or(0),
-                    ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
-                } else {
-                    None
-                };
-                save_fallback_crop(&image, output_path, tier, ctx.jpeg_quality)?;
-                output_files.push(output_path.to_path_buf());
-            } else {
-                if !ctx.quiet {
-                    println!(
-                        "[{}] suitable formats: {}",
-                        file_label,
-                        suitable_formats.join(", ")
-                    );
-                }
-
-                let stem = output_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("crop");
-                let ext = if ctx.jpeg_quality.is_some() {
-                    "jpg"
-                } else {
-                    output_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jpg")
-                };
-                let viz_stem = viz_path.and_then(|path| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                });
-                let viz_ext = if ctx.jpeg_quality.is_some() {
-                    Some("jpg".to_string())
-                } else {
-                    viz_path.and_then(|path| {
-                        path.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|s| s.to_string())
-                    })
-                };
-
-                let focal = crate::focal_point::compute_focal_point(
-                    person_bbox_for_adjustment.as_ref(),
-                    &face_bboxes,
-                    image_width,
-                    image_height,
-                );
-
-                for format in &suitable_formats {
-                    let working_bbox =
-                        apply_margin_to_bbox(&raw_bbox, ctx.margin, image.width(), image.height());
-                    let original_crop = match format.as_str() {
-                        "21:9" => calculate_landscape_21_9_crop_with_face(
-                            image.width(),
-                            image.height(),
-                            &working_bbox,
-                            &face_bboxes,
-                            &focal,
-                            ctx.crop_config,
-                            ctx.artistic_config,
-                        ),
-                        "9:21" => calculate_portrait_9_21_crop_with_face(
-                            image.width(),
-                            image.height(),
-                            &working_bbox,
-                            &face_bboxes,
-                            &focal,
-                            ctx.crop_config,
-                            ctx.artistic_config,
-                        ),
-                        "9:16" => calculate_portrait_9_16_crop_with_face(
-                            image.width(),
-                            image.height(),
-                            &working_bbox,
-                            &face_bboxes,
-                            &focal,
-                            ctx.crop_config,
-                            ctx.artistic_config,
-                        ),
-                        other => {
-                            eprintln!(
-                                "[WARN][{}] unknown format '{}' — skipping.",
-                                file_label, other
-                            );
-                            None
-                        }
-                    };
-
-                    let original_crop = match original_crop {
-                        Some(crop) => crop,
-                        None => continue,
-                    };
-
-                    let adjusted_crop = crate::face_aware_cropping::enforce_eye_safety(
-                        &original_crop,
-                        &face_bboxes,
-                        image_width,
-                        image_height,
-                    );
-
-                    all_crop_regions.push(adjusted_crop.clone());
-
-                    // Generate the cropped DynamicImage
-                    let xyxy = adjusted_crop.to_xyxy_clamped(image.width(), image.height());
-                    let final_crop = crop_image(&image, xyxy)
-                        .with_context(|| format!("Failed to crop image to region {:?}", xyxy))?;
-
-                    let tier = if ctx.classify_output {
-                        Some(
-                            try_get_classification_tier(ctx.classifier, &final_crop, file_label)
-                                .unwrap_or(0),
-                        ) // unknown tier (0) when classifier fails → lands in landscape-0 etc.
-                    } else {
-                        None
-                    };
-
-                    let crop_path = output_sorting::get_sorted_output_path(
-                        output_path,
-                        format,
-                        stem,
-                        ext,
-                        ctx.sort_output,
-                        tier,
-                    )
-                    .with_context(|| {
-                        format!("Failed to build output path for format {}", format)
-                    })?;
-
-                    save_image_with_exif(&final_crop, &crop_path, tier, ctx.jpeg_quality)
-                        .with_context(|| {
-                            format!("Failed to save cropped image to {:?}", crop_path)
-                        })?;
-                    output_files.push(crop_path.clone());
-
-                    if !ctx.quiet {
-                        println!("[{}] saved {} crop → {:?}", file_label, format, crop_path);
-                    }
-
-                    if let (Some(vstem), Some(vext), Some(viz_target)) =
-                        (&viz_stem, &viz_ext, viz_path)
-                    {
-                        let viz_base = viz_target;
-                        let viz_output_path = output_sorting::get_annotated_output_path(
-                            viz_base,
-                            format,
-                            vstem,
-                            vext,
-                            ctx.sort_output,
-                            tier,
-                        )
-                        .with_context(|| {
-                            format!("Failed to build annotated path for format {}", format)
-                        })?;
-
-                        save_visualized_with_faces(
-                            &image,
-                            &detections,
-                            &face_bboxes,
-                            std::slice::from_ref(&adjusted_crop),
-                            &viz_output_path,
-                        )?;
-                        output_files.push(viz_output_path.clone());
-
-                        if !ctx.quiet {
-                            println!(
-                                "[{}] saved {} annotated → {:?}",
-                                file_label, format, viz_output_path
-                            );
-                        }
-                    }
-                }
-            }
+            write_multi_format_crops(
+                &image,
+                file_label,
+                out,
+                viz_path,
+                crop_bbox.as_ref().expect("crop bbox is Some here"),
+                &face_bboxes,
+                &detections,
+                image_width,
+                image_height,
+                &mut output_files,
+                &mut all_crop_regions,
+                ctx,
+            )?;
         }
-    } else if let Some(viz_path) = viz_path {
-        save_visualized_with_faces(
-            &image,
-            &detections,
-            &face_bboxes,
-            &all_crop_regions,
-            viz_path,
-        )?;
-        output_files.push(viz_path.to_path_buf());
-
+    } else if let Some(viz) = viz_path {
+        save_visualized_with_faces(&image, &detections, &face_bboxes, &all_crop_regions, viz)?;
+        output_files.push(viz.to_path_buf());
         if !ctx.quiet {
-            println!("[{}] saved annotated → {:?}", file_label, viz_path);
+            println!("[{}] saved annotated → {:?}", file_label, viz);
         }
     }
 
-    if let Some(boxes_path) = boxes_path {
-        save_detections_json(&detections, &face_bboxes, boxes_path)?;
-        output_files.push(boxes_path.to_path_buf());
-
+    if let Some(boxes) = boxes_path {
+        save_detections_json(&detections, &face_bboxes, boxes)?;
+        output_files.push(boxes.to_path_buf());
         if !ctx.quiet {
             println!(
                 "[{}] saved {} person + {} face detection(s) → {:?}",
                 file_label,
                 detections
                     .iter()
-                    .filter(|detection| detection.class_id == PERSON_CLASS_ID)
+                    .filter(|d| d.class_id == PERSON_CLASS_ID)
                     .count(),
                 face_bboxes.len(),
-                boxes_path,
+                boxes,
             );
         }
     }
@@ -677,11 +774,15 @@ fn process_image_with_base_paths(
         output_files,
         person_count: detections
             .iter()
-            .filter(|detection| detection.class_id == PERSON_CLASS_ID)
+            .filter(|d| d.class_id == PERSON_CLASS_ID)
             .count(),
         face_count: face_bboxes.len(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Batch dispatch
+// ---------------------------------------------------------------------------
 
 fn process_one_in_batch(
     image_path: &Path,
@@ -730,13 +831,7 @@ fn process_one_in_batch(
         path
     });
 
-    if let Some(ref path) = output_path {
-        ensure_parent_directories(path)?;
-    }
-    if let Some(ref path) = viz_path {
-        ensure_parent_directories(path)?;
-    }
-    if let Some(ref path) = boxes_path {
+    for path in [&output_path, &viz_path, &boxes_path].into_iter().flatten() {
         ensure_parent_directories(path)?;
     }
 
@@ -759,37 +854,33 @@ pub fn process_single_image(
 ) -> Result<ProcessingResult> {
     if ctx.rename {
         let new_stem = uuid::Uuid::new_v4().to_string();
-
         let apply_rename = |p: Option<&Path>| -> Option<PathBuf> {
             p.map(|path| {
-                let mut path_buf = path.to_path_buf();
-                let ext = path_buf
+                let mut pb = path.to_path_buf();
+                let ext = pb
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_owned();
-                path_buf.set_file_name(&new_stem);
+                pb.set_file_name(&new_stem);
                 if !ext.is_empty() {
-                    path_buf.set_extension(ext);
+                    pb.set_extension(ext);
                 }
-                path_buf
+                pb
             })
         };
-
         let new_output = apply_rename(output_path);
         let new_viz = apply_rename(viz_path);
         let new_boxes = apply_rename(boxes_path);
-
-        process_image_with_base_paths(
+        return process_image_with_base_paths(
             input_path,
             new_output.as_deref(),
             new_viz.as_deref(),
             new_boxes.as_deref(),
             ctx,
-        )
-    } else {
-        process_image_with_base_paths(input_path, output_path, viz_path, boxes_path, ctx)
+        );
     }
+    process_image_with_base_paths(input_path, output_path, viz_path, boxes_path, ctx)
 }
 
 /// Run the batch processing pipeline in parallel.
@@ -823,7 +914,7 @@ pub fn run_batch(
                                 "[OK][{}] {} person(s), {} face(s)",
                                 image_path
                                     .file_name()
-                                    .and_then(|name| name.to_str())
+                                    .and_then(|n| n.to_str())
                                     .unwrap_or("<unknown>"),
                                 result.person_count,
                                 result.face_count,
@@ -836,7 +927,7 @@ pub fn run_batch(
                             "[ERROR][{}] {}",
                             image_path
                                 .file_name()
-                                .and_then(|name| name.to_str())
+                                .and_then(|n| n.to_str())
                                 .unwrap_or("<unknown>"),
                             error
                         );
@@ -859,7 +950,7 @@ pub fn run_batch(
         }
     };
 
-    failed.sort_by(|left, right| left.0.cmp(&right.0));
+    failed.sort_by(|l, r| l.0.cmp(&r.0));
 
     BatchSummary {
         total: image_paths.len(),
