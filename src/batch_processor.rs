@@ -177,22 +177,20 @@ fn ensure_parent_directories(path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Run person detection and return all confidence-filtered detections.
+///
+/// Uses [`Model::infer`] (the one-shot path) which eliminates the Candle tensor
+/// round-trip for ORT-backed YOLO models while falling back to the legacy
+/// `preprocess → forward → postprocess` sequence for any other implementor.
 fn run_detection(
     image: &DynamicImage,
     file_label: &str,
     model: &dyn Model,
     confidence: f32,
 ) -> Result<Vec<Detection>> {
-    let input_tensor = model
-        .preprocess(std::slice::from_ref(image))
-        .map_err(|e| anyhow::anyhow!("Preprocessing failed: {e}"))?;
-    let (logits, boxes) = model
-        .forward(&input_tensor)
-        .map_err(|e| anyhow::anyhow!("Inference failed: {e}"))?;
-    let raw = model
-        .postprocess(logits, boxes)
-        .map_err(|e| anyhow::anyhow!("Postprocessing failed: {e}"))?;
     let _ = file_label; // reserved for future per-image logging
+    let raw = model
+        .infer(image)
+        .map_err(|e| anyhow::anyhow!("Inference failed: {e}"))?;
     Ok(raw
         .into_iter()
         .map(Detection::from)

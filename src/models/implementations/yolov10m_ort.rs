@@ -46,4 +46,9 @@ impl Model for YOLOv10mOrt {
     fn input_size(&self) -> (usize, usize) {
         self.inner.input_size()
     }
+
+    /// M6 hot path: direct ndarray inference, no Candle tensor round-trip.
+    fn infer(&self, image: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        self.inner.infer_direct(image)
+    }
 }

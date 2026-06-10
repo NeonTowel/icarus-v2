@@ -142,6 +142,23 @@ pub trait Model: Send + Sync {
 
     /// The (width, height) in pixels that this model's input layer expects.
     fn input_size(&self) -> (usize, usize);
+
+    /// Run inference on a single image and return all detected objects.
+    ///
+    /// The **default** implementation calls `preprocess → forward → postprocess` in
+    /// sequence (the legacy three-step path). ORT-backed YOLO models override this
+    /// with a direct ndarray path that:
+    /// - Eliminates the Candle tensor round-trip (`DynamicImage → Tensor → Vec<f32>`).
+    /// - Keeps original `(width, height)` on the call stack rather than in a
+    ///   `thread_local!` side-channel.
+    ///
+    /// Callers (e.g. `batch_processor::run_detection`) should prefer this method over
+    /// the three-step dance.
+    fn infer(&self, image: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        let tensor = self.preprocess(std::slice::from_ref(image))?;
+        let (logits, boxes) = self.forward(&tensor)?;
+        self.postprocess(logits, boxes)
+    }
 }
 
 // ---------------------------------------------------------------------------

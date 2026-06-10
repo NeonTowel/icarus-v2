@@ -22,9 +22,8 @@ const VARIANT_CONFIG: YOLOv10VariantConfig = YOLOv10VariantConfig {
 /// ```rust,ignore
 /// let device = candle_core::Device::Cpu;
 /// let model = YOLOv10Ort::from_hub(&device)?;
-/// let tensor = model.preprocess(&[img])?;
-/// let (logits, boxes) = model.forward(&tensor)?;
-/// let detections = model.postprocess(logits, boxes)?;
+/// // Hot path: one-shot inference (no Candle tensor round-trip)
+/// let detections = model.infer(&img)?;
 /// ```
 pub struct YOLOv10Ort {
     inner: YOLOv10OrtInner,
@@ -58,5 +57,10 @@ impl Model for YOLOv10Ort {
 
     fn input_size(&self) -> (usize, usize) {
         self.inner.input_size()
+    }
+
+    /// M6 hot path: direct ndarray inference, no Candle tensor round-trip.
+    fn infer(&self, image: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        self.inner.infer_direct(image)
     }
 }
