@@ -120,6 +120,11 @@ struct Args {
 
     #[arg(long)]
     flatten: bool,
+
+    /// Print per-stage timing breakdown after processing (decode/person_detect/face_detect/crop/classify/encode).
+    /// Off by default; adding this flag changes no output files.
+    #[arg(long, default_value_t = false)]
+    metrics: bool,
 }
 
 #[tokio::main]
@@ -165,6 +170,7 @@ async fn main() -> Result<()> {
         rename: args.rename,
         jpeg_quality: args.jpeg,
         flatten: args.flatten,
+        collect_metrics: args.metrics,
     };
 
     dispatch(&args, &context).await
@@ -281,6 +287,14 @@ async fn dispatch(args: &Args, context: &ProcessingContext<'_>) -> Result<()> {
                 "Done. Found {} person(s), {} face(s).",
                 result.person_count, result.face_count
             );
+        }
+
+        if args.metrics {
+            let mut bm = icarus_v2::metrics::BatchMetrics::default();
+            if let Some(m) = result.metrics {
+                bm.record(m);
+            }
+            bm.print_summary();
         }
 
         return Ok(());

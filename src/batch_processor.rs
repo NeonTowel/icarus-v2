@@ -11,6 +11,8 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::metrics::{BatchMetrics, ImageMetrics, StageTimer};
+
 use crate::config::{ArtisticCropConfig, CropConfig};
 use crate::detections_json::save_detections_json;
 use crate::directory_walker::relative_to;
@@ -48,6 +50,8 @@ pub struct ProcessingContext<'a> {
     pub rename: bool,
     pub jpeg_quality: Option<u8>,
     pub flatten: bool,
+    /// When `true`, per-stage timings are collected and returned with each result.
+    pub collect_metrics: bool,
 }
 
 /// Result metadata for one processed image.
@@ -57,6 +61,8 @@ pub struct ProcessingResult {
     pub output_files: Vec<PathBuf>,
     pub person_count: usize,
     pub face_count: usize,
+    /// Per-stage timings. `None` when `ctx.collect_metrics` is `false`.
+    pub metrics: Option<ImageMetrics>,
 }
 
 /// Summary of a batch run.
@@ -319,6 +325,7 @@ fn process_classify_only(
         output_files,
         person_count: 0,
         face_count: 0,
+        metrics: None,
     })
 }
 
@@ -674,28 +681,43 @@ fn process_image_with_base_paths(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
+
+    let t_decode = StageTimer::start();
     let image = image::open(image_path).with_context(|| {
         format!(
             "[{}] failed to open input image: {:?}",
             file_label, image_path
         )
     })?;
-    let image_width = image.width();
-    let image_height = image.height();
+    let (image_width, image_height) = (image.width(), image.height());
+    let dur_decode = t_decode.elapsed();
 
     if ctx.classify_only {
-        return process_classify_only(image_path, &image, file_label, output_path, ctx);
+        let mut r = process_classify_only(image_path, &image, file_label, output_path, ctx)?;
+        r.metrics = ctx.collect_metrics.then(|| ImageMetrics {
+            decode: dur_decode,
+            ..Default::default()
+        });
+        return Ok(r);
     }
 
+    let t_detect = StageTimer::start();
     let detections = run_detection(&image, file_label, ctx.model, ctx.confidence)?;
     let person_detections: Vec<&Detection> = detections
         .iter()
         .filter(|d| d.class_id == PERSON_CLASS_ID)
         .collect();
+    let dur_detect = t_detect.elapsed();
+
+    let t_face = StageTimer::start();
     let face_bboxes = detect_faces_nonfatal(&image, file_label, ctx.face_detector, ctx.quiet);
+    let dur_face = t_face.elapsed();
+
+    let t_crop = StageTimer::start();
     let base_bbox = compute_base_bbox(&person_detections, file_label, ctx.crop_config, ctx.quiet);
     let crop_bbox = compute_crop_bbox(base_bbox, &face_bboxes);
     let person_for_crop = find_best_person_detection(&detections);
+    let dur_crop = t_crop.elapsed();
 
     if !ctx.quiet && detections.is_empty() {
         println!(
@@ -707,6 +729,7 @@ fn process_image_with_base_paths(
     let mut all_crop_regions: Vec<CropRegion> = Vec::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
 
+    let t_encode = StageTimer::start();
     if let Some(out) = output_path {
         output_sorting::ensure_output_dirs(
             out.parent().unwrap_or(Path::new(".")),
@@ -768,6 +791,16 @@ fn process_image_with_base_paths(
             );
         }
     }
+    let dur_encode = t_encode.elapsed();
+
+    let stage_metrics = ctx.collect_metrics.then(|| ImageMetrics {
+        decode: dur_decode,
+        person_detect: dur_detect,
+        face_detect: dur_face,
+        crop: dur_crop,
+        classify: Default::default(), // classify time is within encode; future M7 can split
+        encode: dur_encode,
+    });
 
     Ok(ProcessingResult {
         input_path: image_path.to_path_buf(),
@@ -777,6 +810,7 @@ fn process_image_with_base_paths(
             .filter(|d| d.class_id == PERSON_CLASS_ID)
             .count(),
         face_count: face_bboxes.len(),
+        metrics: stage_metrics,
     })
 }
 
@@ -893,7 +927,10 @@ pub fn run_batch(
     ctx: &ProcessingContext<'_>,
     thread_count: usize,
 ) -> BatchSummary {
+    use std::sync::Mutex;
+
     let succeeded = AtomicUsize::new(0);
+    let batch_metrics: Mutex<BatchMetrics> = Mutex::new(BatchMetrics::default());
 
     let collect_failures = || -> Vec<(PathBuf, String)> {
         image_paths
@@ -909,6 +946,11 @@ pub fn run_batch(
                 ) {
                     Ok(result) => {
                         succeeded.fetch_add(1, Ordering::Relaxed);
+                        if let Some(m) = result.metrics {
+                            if let Ok(mut bm) = batch_metrics.lock() {
+                                bm.record(m);
+                            }
+                        }
                         if !ctx.quiet {
                             println!(
                                 "[OK][{}] {} person(s), {} face(s)",
@@ -941,7 +983,6 @@ pub fn run_batch(
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(thread_count.max(1))
         .build();
-
     let mut failed: Vec<(PathBuf, String)> = match thread_pool {
         Ok(pool) => pool.install(collect_failures),
         Err(error) => {
@@ -951,6 +992,12 @@ pub fn run_batch(
     };
 
     failed.sort_by(|l, r| l.0.cmp(&r.0));
+
+    if ctx.collect_metrics {
+        if let Ok(bm) = batch_metrics.lock() {
+            bm.print_summary();
+        }
+    }
 
     BatchSummary {
         total: image_paths.len(),
