@@ -87,15 +87,16 @@ struct Args {
         default_value = "freepik",
         value_name = "NAME",
         help = "Image classifier to use when --classify-output or --classify-only is set.\n\
-                  Options:\n  \
-                  freepik              — Existing 4-tier Freepik NSFW (current default)\n  \
-                  wd-swinv2            — SmilingWolf WD SwinV2-Base v3, 5-tier (~250ms CPU, F1 0.45)\n  \
-                  idolsankaku-swinv2   — deepghs Idolsankaku SwinV2-Base v1, 5-tier (~250ms CPU, F1 0.62)\n  \
-                  wd-eva02             — SmilingWolf WD EVA02-Large v3, 5-tier (~900ms CPU, F1 0.48)\n  \
-                  idolsankaku          — deepghs Idolsankaku EVA02-Large v1, 5-tier (~900ms CPU, F1 0.60)\n  \
-                  wd-ensemble-fast     — SwinV2 ensemble (~500ms CPU, balanced) ⭐ recommended\n  \
-                  wd-ensemble-accurate — EVA02-Large ensemble (~1700ms CPU, highest F1)\n  \
-                  wd-ensemble          — alias for wd-ensemble-accurate (backward compat)"
+                Options (fastest first):\n  \
+                wd-vit               — WD ViT-Base v3 (~200ms CPU, F1 0.44, anime) ⚡ raw speed\n  \
+                idolsankaku-swinv2   — Idolsankaku SwinV2 v1 (~300ms CPU, F1 0.62, real photos) ⚡ raw speed\n  \
+                wd-swinv2            — WD SwinV2-Base v3 (~300ms CPU, F1 0.45, anime)\n  \
+                wd-ensemble-fast     — SwinV2 ensemble (~500ms CPU, balanced) ⭐ recommended\n  \
+                wd-eva02             — WD EVA02-Large v3 (~900ms CPU, F1 0.48, anime)\n  \
+                idolsankaku          — Idolsankaku EVA02-Large v1 (~900ms CPU, F1 0.60, real photos)\n  \
+                wd-ensemble-accurate — EVA02-Large ensemble (~1700ms CPU, highest F1)\n  \
+                freepik              — Legacy 4-tier Freepik NSFW (current default, will change)\n  \
+                wd-ensemble          — alias for wd-ensemble-accurate (backward compat)"
     )]
     classifier: String,
 

@@ -71,6 +71,15 @@ pub const CONFIG_IDOLSANKAKU_SWINV2: WdTaggerConfig = WdTaggerConfig {
     rating_layout: RatingLayoutKind::Sankaku3,
 };
 
+pub const CONFIG_WD_VIT: WdTaggerConfig = WdTaggerConfig {
+    display_name: "wd-vit-tagger-v3",
+    hf_repo: "SmilingWolf/wd-vit-tagger-v3",
+    hf_onnx_filename: "model.onnx",
+    hf_csv_filename: "selected_tags.csv",
+    input_size: 448,
+    rating_layout: RatingLayoutKind::Wd4,
+};
+
 /// Identifies a model's rating-tag taxonomy and projection strategy into the
 /// canonical [general, sensitive, questionable, explicit] slots.
 #[derive(Debug, Clone, Copy)]

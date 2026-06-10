@@ -77,6 +77,7 @@ pub async fn load_classifier(
             ClassifierKind::IdolsankakuSwinv2 => {
                 Ok(Box::new(SingleWdClassifier::idolsankaku_swinv2()?))
             }
+            ClassifierKind::WdVit => Ok(Box::new(SingleWdClassifier::wd_vit()?)),
             ClassifierKind::WdEnsembleFast => Ok(Box::new(WdEnsembleClassifier::fast()?)),
             ClassifierKind::WdEnsembleAccurate => Ok(Box::new(WdEnsembleClassifier::accurate()?)),
         }

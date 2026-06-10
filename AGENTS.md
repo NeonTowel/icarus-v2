@@ -63,7 +63,7 @@ Useful flags implemented in `src/main.rs`:
 - `--visualize <path>` for annotated output
 - `--output-boxes <path>` for JSON detections
 - `--sort-output` for aspect-ratio subfolder organization
-- `--classifier freepik|wd-eva02|idolsankaku|wd-swinv2|idolsankaku-swinv2|wd-ensemble-fast|wd-ensemble-accurate` for content rating backend selection
+- `--classifier wd-vit|wd-swinv2|idolsankaku-swinv2|wd-eva02|idolsankaku|freepik|wd-ensemble-fast|wd-ensemble-accurate` for content rating backend selection
 - `--margin <percent>` for bbox expansion before crop computation
 - `--crop-config <yaml>` and `--visibility-threshold <percent>` for crop rules
 - `--artistic-mode conservative|balanced|aggressive`
@@ -152,6 +152,7 @@ Classifiers currently wired in CLI and loader:
   `idolsankaku-swinv2` (~500ms CPU, ~2-3GB RAM); ⭐ recommended fast option
 - `wd-ensemble-accurate` — confidence-weighted combination of `wd-eva02` +
   `idolsankaku` (~1700ms CPU, ~4-6GB RAM); highest F1
+- `wd-vit` — 5-tier rating head from `SmilingWolf/wd-vit-tagger-v3` (ViT-Base/16, ~86M params, ~150-250ms CPU est.); ⚡ fastest single-model (anime). Real-photo raw-speed lane is `idolsankaku-swinv2`.
 - `wd-ensemble` — backward-compatible alias for `wd-ensemble-accurate`
 
 Note: Several Candle-centric/deferred wrappers exist for future roadmap work; do not assume

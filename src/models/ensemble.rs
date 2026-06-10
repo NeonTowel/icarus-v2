@@ -6,7 +6,7 @@ use image::DynamicImage;
 use crate::models::candle_backend::ImageClassifier;
 use crate::models::implementations::wd_tagger_ort::{
     WdTaggerConfig, WdTaggerOnnx, CONFIG_IDOLSANKAKU, CONFIG_IDOLSANKAKU_SWINV2, CONFIG_WD_EVA02,
-    CONFIG_WD_SWINV2,
+    CONFIG_WD_SWINV2, CONFIG_WD_VIT,
 };
 
 /// Identifies which image classifier to load and use at runtime.
@@ -25,6 +25,10 @@ pub enum ClassifierKind {
     WdSwinv2,
     /// deepghs/idolsankaku-swinv2-tagger-v1, 5-tier (SwinV2-Base, ~98M params).
     IdolsankakuSwinv2,
+    /// SmilingWolf/wd-vit-tagger-v3, 5-tier (ViT-Base/16, ~86M params).
+    /// Fastest single-model option in the lineage (~150-250ms CPU).
+    /// Anime/illustration domain. F1 0.4402.
+    WdVit,
     /// Fast ensemble: wd-swinv2 + idolsankaku-swinv2 (both SwinV2-Base).
     /// ~500ms/image CPU, ~810MB disk, ~2-3GB RAM.
     WdEnsembleFast,
@@ -43,12 +47,13 @@ impl FromStr for ClassifierKind {
             "idolsankaku" => Ok(Self::Idolsankaku),
             "wd-swinv2" => Ok(Self::WdSwinv2),
             "idolsankaku-swinv2" => Ok(Self::IdolsankakuSwinv2),
+            "wd-vit" => Ok(Self::WdVit),
             "wd-ensemble-fast" => Ok(Self::WdEnsembleFast),
             // "wd-ensemble" retained as backward-compatible alias
             "wd-ensemble-accurate" | "wd-ensemble" => Ok(Self::WdEnsembleAccurate),
             other => anyhow::bail!(
-                "Unknown classifier '{}'. Valid options: \
-                 freepik, wd-eva02, idolsankaku, wd-swinv2, idolsankaku-swinv2, \
+                "Unknown classifier '{}'. Valid options (fastest first): \
+                 freepik, wd-vit, wd-swinv2, idolsankaku-swinv2, wd-eva02, idolsankaku, \
                  wd-ensemble-fast, wd-ensemble-accurate",
                 other
             ),
@@ -86,6 +91,12 @@ impl SingleWdClassifier {
     pub fn idolsankaku_swinv2() -> Result<Self> {
         Ok(Self {
             inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU_SWINV2)?,
+        })
+    }
+
+    pub fn wd_vit() -> Result<Self> {
+        Ok(Self {
+            inner: WdTaggerOnnx::from_hub(CONFIG_WD_VIT)?,
         })
     }
 }
@@ -267,6 +278,14 @@ mod tests {
         assert_eq!(
             "idolsankaku-swinv2".parse::<ClassifierKind>().unwrap(),
             ClassifierKind::IdolsankakuSwinv2
+        );
+    }
+
+    #[test]
+    fn parses_wd_vit() {
+        assert_eq!(
+            "wd-vit".parse::<ClassifierKind>().unwrap(),
+            ClassifierKind::WdVit
         );
     }
 
