@@ -5,7 +5,8 @@ use image::DynamicImage;
 
 use crate::models::candle_backend::ImageClassifier;
 use crate::models::implementations::wd_tagger_ort::{
-    WdTaggerOnnx, CONFIG_IDOLSANKAKU, CONFIG_WD_EVA02,
+    WdTaggerConfig, WdTaggerOnnx, CONFIG_IDOLSANKAKU, CONFIG_IDOLSANKAKU_SWINV2, CONFIG_WD_EVA02,
+    CONFIG_WD_SWINV2,
 };
 
 /// Identifies which image classifier to load and use at runtime.
@@ -16,25 +17,39 @@ use crate::models::implementations::wd_tagger_ort::{
 pub enum ClassifierKind {
     /// Existing 4-tier classifier (Freepik/nsfw_image_detector via Candle).
     Freepik,
-    /// SmilingWolf/wd-eva02-large-tagger-v3, rating head only, 5 tiers.
+    /// SmilingWolf/wd-eva02-large-tagger-v3, 5-tier (EVA02-Large, ~305M params).
     WdEva02,
-    /// deepghs/idolsankaku-eva02-large-tagger-v1, rating head only, 5 tiers.
+    /// deepghs/idolsankaku-eva02-large-tagger-v1, 5-tier (EVA02-Large, ~305M params).
     Idolsankaku,
-    /// Both above models combined via confidence-weighted severity ensemble, 5 tiers.
-    WdEnsemble,
+    /// SmilingWolf/wd-swinv2-tagger-v3, 5-tier (SwinV2-Base, ~98M params).
+    WdSwinv2,
+    /// deepghs/idolsankaku-swinv2-tagger-v1, 5-tier (SwinV2-Base, ~98M params).
+    IdolsankakuSwinv2,
+    /// Fast ensemble: wd-swinv2 + idolsankaku-swinv2 (both SwinV2-Base).
+    /// ~500ms/image CPU, ~810MB disk, ~2-3GB RAM.
+    WdEnsembleFast,
+    /// Accurate ensemble: wd-eva02-large + idolsankaku-eva02-large.
+    /// ~1700ms/image CPU, ~2.5GB disk, ~4-6GB RAM.
+    WdEnsembleAccurate,
 }
 
 impl FromStr for ClassifierKind {
     type Err = anyhow::Error;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
             "freepik" => Ok(Self::Freepik),
             "wd-eva02" => Ok(Self::WdEva02),
             "idolsankaku" => Ok(Self::Idolsankaku),
-            "wd-ensemble" => Ok(Self::WdEnsemble),
+            "wd-swinv2" => Ok(Self::WdSwinv2),
+            "idolsankaku-swinv2" => Ok(Self::IdolsankakuSwinv2),
+            "wd-ensemble-fast" => Ok(Self::WdEnsembleFast),
+            // "wd-ensemble" retained as backward-compatible alias
+            "wd-ensemble-accurate" | "wd-ensemble" => Ok(Self::WdEnsembleAccurate),
             other => anyhow::bail!(
-                "Unknown classifier '{}'. Valid options: freepik, wd-eva02, idolsankaku, wd-ensemble",
+                "Unknown classifier '{}'. Valid options: \
+                 freepik, wd-eva02, idolsankaku, wd-swinv2, idolsankaku-swinv2, \
+                 wd-ensemble-fast, wd-ensemble-accurate",
                 other
             ),
         }
@@ -61,6 +76,18 @@ impl SingleWdClassifier {
             inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU)?,
         })
     }
+
+    pub fn wd_swinv2() -> Result<Self> {
+        Ok(Self {
+            inner: WdTaggerOnnx::from_hub(CONFIG_WD_SWINV2)?,
+        })
+    }
+
+    pub fn idolsankaku_swinv2() -> Result<Self> {
+        Ok(Self {
+            inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU_SWINV2)?,
+        })
+    }
 }
 
 impl ImageClassifier for SingleWdClassifier {
@@ -78,13 +105,38 @@ impl ImageClassifier for SingleWdClassifier {
 pub struct WdEnsembleClassifier {
     anime: WdTaggerOnnx,
     real: WdTaggerOnnx,
+    display_name: &'static str,
 }
 
 impl WdEnsembleClassifier {
-    pub fn from_hub() -> Result<Self> {
-        let anime = WdTaggerOnnx::from_hub(CONFIG_WD_EVA02)?;
-        let real = WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU)?;
-        Ok(Self { anime, real })
+    pub fn from_configs(
+        anime_config: WdTaggerConfig,
+        real_config: WdTaggerConfig,
+        display_name: &'static str,
+    ) -> Result<Self> {
+        let anime = WdTaggerOnnx::from_hub(anime_config)?;
+        let real = WdTaggerOnnx::from_hub(real_config)?;
+        Ok(Self {
+            anime,
+            real,
+            display_name,
+        })
+    }
+
+    pub fn fast() -> Result<Self> {
+        Self::from_configs(
+            CONFIG_WD_SWINV2,
+            CONFIG_IDOLSANKAKU_SWINV2,
+            "wd-ensemble-fast (swinv2 + idolsankaku-swinv2)",
+        )
+    }
+
+    pub fn accurate() -> Result<Self> {
+        Self::from_configs(
+            CONFIG_WD_EVA02,
+            CONFIG_IDOLSANKAKU,
+            "wd-ensemble-accurate (eva02-large + idolsankaku-eva02-large)",
+        )
     }
 }
 
@@ -168,13 +220,13 @@ pub fn ensemble_tier(raw_anime: [f32; 4], raw_real: [f32; 4]) -> u8 {
 
 impl ImageClassifier for WdEnsembleClassifier {
     fn classify(&self, image: &DynamicImage) -> Result<u8> {
-        let raw_anime = self.anime.predict_ratings(image)?;
-        let raw_real = self.real.predict_ratings(image)?;
-        Ok(ensemble_tier(raw_anime, raw_real))
+        let raw_a = self.anime.predict_ratings(image)?;
+        let raw_b = self.real.predict_ratings(image)?;
+        Ok(ensemble_tier(raw_a, raw_b))
     }
 
     fn name(&self) -> &str {
-        "wd-ensemble (eva02 + idolsankaku)"
+        self.display_name
     }
 }
 
@@ -191,10 +243,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_wd_ensemble() {
+    fn parses_wd_ensemble_alias_maps_to_accurate() {
         assert_eq!(
             "wd-ensemble".parse::<ClassifierKind>().unwrap(),
-            ClassifierKind::WdEnsemble
+            ClassifierKind::WdEnsembleAccurate
+        );
+        assert_eq!(
+            "wd-ensemble-accurate".parse::<ClassifierKind>().unwrap(),
+            ClassifierKind::WdEnsembleAccurate
+        );
+    }
+
+    #[test]
+    fn parses_new_fast_variants() {
+        assert_eq!(
+            "wd-ensemble-fast".parse::<ClassifierKind>().unwrap(),
+            ClassifierKind::WdEnsembleFast
+        );
+        assert_eq!(
+            "wd-swinv2".parse::<ClassifierKind>().unwrap(),
+            ClassifierKind::WdSwinv2
+        );
+        assert_eq!(
+            "idolsankaku-swinv2".parse::<ClassifierKind>().unwrap(),
+            ClassifierKind::IdolsankakuSwinv2
         );
     }
 

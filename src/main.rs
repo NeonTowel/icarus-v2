@@ -86,11 +86,16 @@ struct Args {
         long,
         default_value = "freepik",
         value_name = "NAME",
-        help = "Image classifier to use when --classify-output or --classify-only is set. \
-                Options:\n  freepik       — Existing 4-tier Freepik NSFW (default)\n  \
-                wd-eva02      — SmilingWolf WD EVA02-Large v3, 5-tier rating head\n  \
-                idolsankaku   — deepghs Idolsankaku EVA02-Large v1, 5-tier rating head\n  \
-                wd-ensemble   — Confidence-weighted ensemble of wd-eva02 + idolsankaku, 5-tier"
+        help = "Image classifier to use when --classify-output or --classify-only is set.\n\
+                  Options:\n  \
+                  freepik              — Existing 4-tier Freepik NSFW (current default)\n  \
+                  wd-swinv2            — SmilingWolf WD SwinV2-Base v3, 5-tier (~250ms CPU, F1 0.45)\n  \
+                  idolsankaku-swinv2   — deepghs Idolsankaku SwinV2-Base v1, 5-tier (~250ms CPU, F1 0.62)\n  \
+                  wd-eva02             — SmilingWolf WD EVA02-Large v3, 5-tier (~900ms CPU, F1 0.48)\n  \
+                  idolsankaku          — deepghs Idolsankaku EVA02-Large v1, 5-tier (~900ms CPU, F1 0.60)\n  \
+                  wd-ensemble-fast     — SwinV2 ensemble (~500ms CPU, balanced) ⭐ recommended\n  \
+                  wd-ensemble-accurate — EVA02-Large ensemble (~1700ms CPU, highest F1)\n  \
+                  wd-ensemble          — alias for wd-ensemble-accurate (backward compat)"
     )]
     classifier: String,
 

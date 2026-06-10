@@ -73,7 +73,12 @@ pub async fn load_classifier(
             ClassifierKind::Freepik => Ok(Box::new(FreepikEva02::from_hub(&device)?)),
             ClassifierKind::WdEva02 => Ok(Box::new(SingleWdClassifier::wd_eva02()?)),
             ClassifierKind::Idolsankaku => Ok(Box::new(SingleWdClassifier::idolsankaku()?)),
-            ClassifierKind::WdEnsemble => Ok(Box::new(WdEnsembleClassifier::from_hub()?)),
+            ClassifierKind::WdSwinv2 => Ok(Box::new(SingleWdClassifier::wd_swinv2()?)),
+            ClassifierKind::IdolsankakuSwinv2 => {
+                Ok(Box::new(SingleWdClassifier::idolsankaku_swinv2()?))
+            }
+            ClassifierKind::WdEnsembleFast => Ok(Box::new(WdEnsembleClassifier::fast()?)),
+            ClassifierKind::WdEnsembleAccurate => Ok(Box::new(WdEnsembleClassifier::accurate()?)),
         }
     })
     .await

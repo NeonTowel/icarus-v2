@@ -63,7 +63,7 @@ Useful flags implemented in `src/main.rs`:
 - `--visualize <path>` for annotated output
 - `--output-boxes <path>` for JSON detections
 - `--sort-output` for aspect-ratio subfolder organization
-- `--classifier freepik|wd-eva02|idolsankaku|wd-ensemble` for content rating backend selection
+- `--classifier freepik|wd-eva02|idolsankaku|wd-swinv2|idolsankaku-swinv2|wd-ensemble-fast|wd-ensemble-accurate` for content rating backend selection
 - `--margin <percent>` for bbox expansion before crop computation
 - `--crop-config <yaml>` and `--visibility-threshold <percent>` for crop rules
 - `--artistic-mode conservative|balanced|aggressive`
@@ -144,8 +144,15 @@ Classifiers currently wired in CLI and loader:
   `SmilingWolf/wd-eva02-large-tagger-v3`
 - `idolsankaku` — 5-tier rating head from
   `deepghs/idolsankaku-eva02-large-tagger-v1`
-- `wd-ensemble` — confidence-weighted combination of `wd-eva02` +
-  `idolsankaku` using shared 5-tier severity mapping
+- `wd-swinv2` — 5-tier rating head from
+  `SmilingWolf/wd-swinv2-tagger-v3` (SwinV2-Base, ~98M params, ~250ms CPU)
+- `idolsankaku-swinv2` — 5-tier rating head from
+  `deepghs/idolsankaku-swinv2-tagger-v1` (SwinV2-Base, ~98M params, ~250ms CPU)
+- `wd-ensemble-fast` — confidence-weighted combination of `wd-swinv2` +
+  `idolsankaku-swinv2` (~500ms CPU, ~2-3GB RAM); ⭐ recommended fast option
+- `wd-ensemble-accurate` — confidence-weighted combination of `wd-eva02` +
+  `idolsankaku` (~1700ms CPU, ~4-6GB RAM); highest F1
+- `wd-ensemble` — backward-compatible alias for `wd-ensemble-accurate`
 
 Note: Several Candle-centric/deferred wrappers exist for future roadmap work; do not assume
 they are production-ready without checking loader wiring in `src/models/mod.rs` and CLI
