@@ -142,54 +142,6 @@ impl Default for CropConfig {
 // Face-aware artistic crop configuration
 // ---------------------------------------------------------------------------
 
-/// Strategy for selecting the dominant face when multiple faces are detected.
-///
-/// # Deprecation Notice
-/// This enum is deprecated. Face selection is now always `MostCentral` (closest
-/// face centroid to image center). Use [`ArtisticMode`] to control aggressiveness.
-///
-/// # Example
-/// ```rust,ignore
-/// let strategy = FaceSelectionStrategy::MostCentral;
-/// ```
-#[deprecated(
-    since = "2.1.0",
-    note = "Face selection is now always MostCentral. Use ArtisticMode to control aggressiveness."
-)]
-#[allow(deprecated)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FaceSelectionStrategy {
-    /// Select the face with the largest bounding box area.
-    Largest,
-    /// Select the face with the highest detection confidence.
-    HighestConfidence,
-    /// Select the face closest to the image center (Euclidean distance).
-    MostCentral,
-    /// Composite score: 50% bbox area + 30% confidence + 20% centrality (default).
-    #[default]
-    WeightedScore,
-}
-
-#[allow(deprecated)]
-impl FromStr for FaceSelectionStrategy {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "largest" => Ok(Self::Largest),
-            "highest_confidence" => Ok(Self::HighestConfidence),
-            "most_central" => Ok(Self::MostCentral),
-            "weighted_score" => Ok(Self::WeightedScore),
-            other => anyhow::bail!(
-                "Unknown face selection strategy '{}'. Valid options: \
-                 largest, highest_confidence, most_central, weighted_score",
-                other
-            ),
-        }
-    }
-}
-
 /// Controls how aggressively face-aware crop adjustment is applied.
 ///
 /// - **Conservative**: Larger safety margin (20px) around face; minimal adjustment.
@@ -226,25 +178,6 @@ impl FromStr for ArtisticMode {
             ),
         }
     }
-}
-
-/// Derived margins and bias values for each [`ArtisticMode`].
-///
-/// # Deprecation Notice
-/// This struct is deprecated. Parameters are now embedded in [`ArtisticCropConfig`]
-/// via [`ArtisticCropConfig::from_mode`].
-#[deprecated(
-    since = "2.1.0",
-    note = "Use ArtisticCropConfig::from_mode() to get the new config with embedded parameters."
-)]
-#[derive(Debug, Clone)]
-pub struct ArtisticModeParams {
-    /// Bias of the crop center toward the face centroid (0.0 = no bias, 1.0 = full).
-    pub face_centroid_bias: f32,
-    /// Multiplier applied to `face_margin_px` (1.0 = base, >1 = more margin).
-    pub margin_multiplier: f32,
-    /// Minimum fraction of the person body that must remain visible (0.0–1.0).
-    pub min_body_visibility: f32,
 }
 
 /// Runtime configuration for the face-aware crop adjustment algorithm.
