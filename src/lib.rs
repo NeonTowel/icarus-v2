@@ -4,14 +4,17 @@
 /// using multiple AI models (DETR, YOLO, DFINE, RF-DETR).
 pub mod batch_processor;
 pub mod config;
+pub mod detections_json;
 pub mod directory_walker;
 pub mod error;
 pub mod face_aware_cropping;
 pub mod face_detection;
 pub mod focal_point;
+pub mod image_io;
 pub mod image_utils;
 pub mod models;
 pub mod multi_format_cropping;
 pub mod output_sorting;
+pub mod visualization;
 
 pub use error::{Error, Result};
