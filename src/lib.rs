@@ -4,6 +4,7 @@
 /// using multiple AI models (DETR, YOLO, DFINE, RF-DETR).
 pub mod batch_processor;
 pub mod config;
+pub mod crop;
 pub mod detections_json;
 pub mod directory_walker;
 pub mod error;
