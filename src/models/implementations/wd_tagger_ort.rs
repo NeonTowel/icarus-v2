@@ -239,6 +239,7 @@ impl WdTaggerOnnx {
             rating_layout
         );
 
+        // Use ORT default thread count. See M7 decision in yolov10_common.rs.
         let session = Session::builder()
             .map_err(|error| anyhow::anyhow!("ort Session::builder: {error}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)

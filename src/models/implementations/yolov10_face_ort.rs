@@ -32,6 +32,8 @@ const DEFAULT_CONF_THRESHOLD: f32 = 0.4;
 /// NMS IoU threshold for suppressing overlapping face boxes.
 const DEFAULT_NMS_THRESHOLD: f32 = 0.45;
 
+// M7 Decision: use ORT default. See yolov10_common.rs M7 decision comment.
+
 /// Single-class label list for face detection.
 const FACE_CLASSES: &[&str] = &["face"];
 
@@ -50,6 +52,7 @@ impl YoloV10FaceOrt {
 
         log::info!("yolov10-face-ort: loading ONNX model from {:?}", model_path);
 
+        // Use ORT default thread count. See M7 decision comment above.
         let session = Session::builder()
             .map_err(|error| anyhow::anyhow!("ort Session builder failed: {error}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)

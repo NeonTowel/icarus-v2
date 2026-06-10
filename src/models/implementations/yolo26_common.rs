@@ -19,6 +19,10 @@ thread_local! {
     static YOLO26_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
 }
 
+// M7 Decision: use ORT default (no explicit with_intra_threads).
+// Strategy A (intra_threads=1) was benchmarked as 10× slower on 10-core hardware.
+// See yolov10_common.rs M7 decision comment for full analysis.
+
 use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
 
 /// Model input width and height in pixels.
@@ -53,6 +57,7 @@ impl YOLOv26OrtInner {
             model_path
         );
 
+        // Use ORT default thread count. See M7 decision comment above.
         let session = Session::builder()
             .map_err(|error| anyhow::anyhow!("ort Session builder failed: {error}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)

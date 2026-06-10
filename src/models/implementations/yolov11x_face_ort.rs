@@ -52,6 +52,8 @@ thread_local! {
 // Constants
 // ---------------------------------------------------------------------------
 
+// M7 Decision: use ORT default. See yolov10_common.rs M7 decision comment.
+
 /// HuggingFace Hub repository for YOLOv11x-Face ONNX weights.
 const HF_REPO: &str = "AdamCodd/YOLOv11x-face-detection";
 
@@ -122,6 +124,7 @@ impl YoloV11xFaceOrt {
             model_path
         );
 
+        // Use ORT default thread count. See M7 decision comment above.
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("ort Session builder failed: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
