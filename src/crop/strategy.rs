@@ -15,6 +15,7 @@
 use super::geometry::{
     person_is_reasonably_visible_threshold, place_focal_point, BBox, CropRegion,
 };
+use super::joint_analyzer::JointAnalysis;
 use super::pose::{detect_pose_direction, Direction};
 use crate::config::{ArtisticCropConfig, CropConfig};
 use crate::focal_point::FocalPoint;
@@ -45,7 +46,8 @@ pub struct CropParams {
 /// A crop algorithm for one output format (21:9, 9:21, or 9:16).
 ///
 /// Implementors supply `params()` and `format_name()`; the shared `calculate()`
-/// default method handles all geometry so there is no duplicated logic.
+/// and `calculate_with_joint()` default methods handle all geometry so there is
+/// no duplicated logic.
 pub trait CropStrategy {
     /// Returns aspect ratio, vertical bias, and dimension ordering for this format.
     fn params(&self, config: &CropConfig) -> CropParams;
@@ -53,10 +55,21 @@ pub trait CropStrategy {
     /// Human-readable format name, e.g. `"21:9"`.
     fn format_name(&self) -> &'static str;
 
-    /// Compute the crop region for this format. Returns `None` when the person
-    /// would not be sufficiently visible at the computed position.
+    /// Compute the crop region for this format, optionally guided by a
+    /// [`JointAnalysis`] recommendation.
+    ///
+    /// When `joint` is `None` (the default), behavior is identical to the original
+    /// `calculate` method — byte-for-byte the same crops are produced.
+    ///
+    /// When `joint` is `Some(analysis)`:
+    /// - `analysis.target_y_frac_override` replaces the strategy's normal vertical
+    ///   placement computation if `Some(v)` (already clamped to `[0.10, 0.50]`).
+    /// - The `extra_margin_percent` has already been applied to `bbox` by the caller
+    ///   before this method is invoked.
+    ///
+    /// Returns `None` when the person would not be sufficiently visible.
     #[allow(clippy::too_many_arguments)]
-    fn calculate(
+    fn calculate_with_joint(
         &self,
         photo_w: u32,
         photo_h: u32,
@@ -65,6 +78,7 @@ pub trait CropStrategy {
         focal: &FocalPoint,
         config: &CropConfig,
         artistic: &ArtisticCropConfig,
+        joint: Option<&JointAnalysis>,
     ) -> Option<CropRegion> {
         let CropParams {
             aspect_ratio,
@@ -106,7 +120,13 @@ pub trait CropStrategy {
             };
         }
 
-        let target_y_frac = (target_y_frac_base + artistic.target_y_offset()).clamp(0.10, 0.50);
+        // Apply target_y_frac: use the joint analyzer's override when present,
+        // otherwise fall back to the strategy's normal value.
+        let target_y_frac = match joint.and_then(|j| j.target_y_frac_override) {
+            Some(v) => v.clamp(0.10, 0.50),
+            None => (target_y_frac_base + artistic.target_y_offset()).clamp(0.10, 0.50),
+        };
+
         let crop = place_focal_point(
             photo_w,
             photo_h,
@@ -128,6 +148,25 @@ pub trait CropStrategy {
         } else {
             None
         }
+    }
+
+    /// Compute the crop region using the standard strategy (no joint analysis).
+    ///
+    /// This is a thin delegate to `calculate_with_joint(..., None)`. All existing
+    /// tests, free-function wrappers, and `detect_suitable_formats` continue to
+    /// call this method, so behavior is unchanged when enhanced-crop is off.
+    #[allow(clippy::too_many_arguments)]
+    fn calculate(
+        &self,
+        photo_w: u32,
+        photo_h: u32,
+        bbox: &BBox,
+        faces: &[BBox],
+        focal: &FocalPoint,
+        config: &CropConfig,
+        artistic: &ArtisticCropConfig,
+    ) -> Option<CropRegion> {
+        self.calculate_with_joint(photo_w, photo_h, bbox, faces, focal, config, artistic, None)
     }
 }
 
@@ -485,5 +524,126 @@ mod tests {
         assert!(strategy_for("9:16").is_some());
         assert!(strategy_for("unknown").is_none());
         assert_eq!(strategy_for("21:9").unwrap().format_name(), "21:9");
+    }
+
+    // ── M2: calculate_with_joint parity tests ──────────────────────────────
+
+    /// `calculate_with_joint(..., None)` must equal `calculate(...)` byte-for-byte.
+    #[test]
+    fn test_calculate_with_joint_none_equals_calculate_landscape() {
+        let bbox = BBox {
+            x1: 200.0,
+            y1: 50.0,
+            x2: 500.0,
+            y2: 900.0,
+        };
+        let config = CropConfig::default();
+        let artistic = ArtisticCropConfig::default();
+        let focal = crate::focal_point::compute_focal_point(Some(&bbox), &[], 3024, 4032);
+
+        let via_calculate =
+            Landscape21x9.calculate(3024, 4032, &bbox, &[], &focal, &config, &artistic);
+        let via_joint = Landscape21x9.calculate_with_joint(
+            3024,
+            4032,
+            &bbox,
+            &[],
+            &focal,
+            &config,
+            &artistic,
+            None,
+        );
+
+        assert_eq!(
+            via_calculate, via_joint,
+            "calculate_with_joint(None) must equal calculate() for 21:9"
+        );
+    }
+
+    #[test]
+    fn test_calculate_with_joint_none_equals_calculate_portrait_9x16() {
+        let bbox = BBox {
+            x1: 800.0,
+            y1: 200.0,
+            x2: 2200.0,
+            y2: 3800.0,
+        };
+        let config = CropConfig::default();
+        let artistic = ArtisticCropConfig::default();
+        let focal = crate::focal_point::compute_focal_point(Some(&bbox), &[], 3024, 4032);
+
+        let via_calculate =
+            Portrait9x16.calculate(3024, 4032, &bbox, &[], &focal, &config, &artistic);
+        let via_joint = Portrait9x16.calculate_with_joint(
+            3024,
+            4032,
+            &bbox,
+            &[],
+            &focal,
+            &config,
+            &artistic,
+            None,
+        );
+
+        assert_eq!(
+            via_calculate, via_joint,
+            "calculate_with_joint(None) must equal calculate() for 9:16"
+        );
+    }
+
+    /// With a joint analysis that overrides target_y_frac, the crop position should change.
+    /// With a joint analysis that overrides target_y_frac, the crop position should change.
+    ///
+    /// Use 21:9 landscape (HeightFirst) with a wide, short person bbox so the person is
+    /// visible in the landscape crop and there IS room to move the crop vertically.
+    #[test]
+    fn test_calculate_with_joint_override_moves_crop_vertically() {
+        // 3024×4032 at 21:9: crop_h ≈ 1296, crop_w = 3024.
+        // Wide person (1800×1000), well within crop height → visible.
+        let bbox = BBox {
+            x1: 600.0,
+            y1: 500.0,
+            x2: 2400.0,
+            y2: 1500.0,
+        };
+        let config = CropConfig::default();
+        let artistic = ArtisticCropConfig::default();
+        // Focal point at person center_y = (200+3800)/2 = 2000
+        let focal = crate::focal_point::compute_focal_point(Some(&bbox), &[], 3024, 4032);
+
+        // Baseline: target_y_frac = 0.50 (default)
+        let crop_no_joint =
+            Landscape21x9.calculate(3024, 4032, &bbox, &[], &focal, &config, &artistic);
+
+        // Override: target_y_frac = 0.20 (substantially different)
+        let joint = JointAnalysis {
+            target_y_frac_override: Some(0.20),
+            extra_margin_percent: 0.0,
+            relaxed: false,
+            full_person_height_expected: false,
+        };
+        let crop_with_joint = Landscape21x9.calculate_with_joint(
+            3024,
+            4032,
+            &bbox,
+            &[],
+            &focal,
+            &config,
+            &artistic,
+            Some(&joint),
+        );
+
+        assert!(crop_no_joint.is_some(), "baseline crop must exist");
+        assert!(crop_with_joint.is_some(), "joint crop must exist");
+
+        if let (Some(c_base), Some(c_joint)) = (&crop_no_joint, &crop_with_joint) {
+            let differ = (c_base.y - c_joint.y).abs() > 0.5;
+            assert!(
+                differ,
+                "joint override 0.20 vs default 0.50 must change vertical position; \
+                 base.y={:.1} joint.y={:.1}",
+                c_base.y, c_joint.y
+            );
+        }
     }
 }

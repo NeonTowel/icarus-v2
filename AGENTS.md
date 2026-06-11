@@ -67,6 +67,8 @@ Useful flags implemented in `src/main.rs`:
 - `--margin <percent>` for bbox expansion before crop computation
 - `--crop-config <yaml>` and `--visibility-threshold <percent>` for crop rules
 - `--artistic-mode conservative|balanced|aggressive`
+- `--enhanced-crop` for joint person+face analysis (full-height bias + min-dimension relaxation); off by default — omitting produces byte-for-byte baseline crops
+- `--min-pixels <N>` skips images whose long side is below N pixels (default 1200; set to 0 to disable); only active with `--enhanced-crop`; use to filter out thumbnails before inference
 
 ## Architecture (high level)
 

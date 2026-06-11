@@ -124,6 +124,21 @@ struct Args {
     /// Off by default; adding this flag changes no output files.
     #[arg(long, default_value_t = false)]
     metrics: bool,
+
+    /// Use joint person+face analysis to improve full-person-height preservation and
+    /// relax crops below minimum output dimensions. Off by default; when off, crops are
+    /// byte-for-byte identical to the baseline. Overrides `enable_enhanced_crop` in
+    /// `--crop-config`.
+    #[arg(long, default_value_t = false)]
+    enhanced_crop: bool,
+
+    /// Minimum acceptable output size in pixels counted from the long side edge of the
+    /// photo. Photos whose long side is below this are skipped before inference, and
+    /// final crops below it are relaxed (more margin/headroom). Only active with
+    /// --enhanced-crop. Applies to landscape (21:9), portrait (9:16), and mobile (9:21)
+    /// categories. Set to 0 to disable the check. CLI value overrides crop_config YAML.
+    #[arg(long, default_value_t = 1200, value_name = "PIXELS")]
+    min_pixels: u32,
 }
 
 #[tokio::main]
@@ -175,6 +190,10 @@ async fn main() -> Result<()> {
         jpeg_quality: args.jpeg,
         flatten: args.flatten,
         collect_metrics: args.metrics,
+        enhanced_crop: args.enhanced_crop,
+        // CLI --min-pixels always overrides crop_config.min_long_side_pixels (CLI wins).
+        // 0 = disable the check (long_side_passes treats 0 as "always pass").
+        min_long_side_pixels: args.min_pixels,
     };
 
     dispatch(&args, &context, thread_count).await
@@ -300,6 +319,9 @@ async fn dispatch(args: &Args, context: &ProcessingContext<'_>, thread_count: us
             let mut bm = icarus_v2::metrics::BatchMetrics::default();
             if let Some(m) = result.metrics {
                 bm.record(m);
+            }
+            if let Some(a) = result.accuracy {
+                bm.record_accuracy(a);
             }
             bm.print_summary();
         }

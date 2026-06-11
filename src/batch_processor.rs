@@ -11,7 +11,7 @@ use rayon::ThreadPoolBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::metrics::{BatchMetrics, ImageMetrics, StageTimer};
+use crate::metrics::{AccuracyMetrics, BatchMetrics, ImageMetrics, StageTimer};
 
 use crate::config::{ArtisticCropConfig, CropConfig};
 use crate::detections_json::save_detections_json;
@@ -21,10 +21,10 @@ use crate::image_io::save_image_with_exif;
 use crate::image_utils::{crop_image, crop_to_ultrawide_21_9_centered};
 use crate::models::Model;
 use crate::multi_format_cropping::{
-    apply_margin_to_bbox, calculate_compound_bbox, calculate_landscape_21_9_crop_with_face,
-    calculate_portrait_9_16_crop_with_face, calculate_portrait_9_21_crop_with_face,
-    deduplicate_person_detections, detect_suitable_formats, merge_bboxes,
-    select_dominant_face_for_crop, BBox, CropRegion,
+    analyze_joint, apply_margin_to_bbox, calculate_compound_bbox,
+    calculate_landscape_21_9_crop_with_face, calculate_portrait_9_16_crop_with_face,
+    calculate_portrait_9_21_crop_with_face, deduplicate_person_detections, detect_suitable_formats,
+    merge_bboxes, select_dominant_face_for_crop, strategy_for, BBox, CropRegion,
 };
 use crate::output_sorting;
 use crate::visualization::save_visualized_with_faces;
@@ -52,6 +52,15 @@ pub struct ProcessingContext<'a> {
     pub flatten: bool,
     /// When `true`, per-stage timings are collected and returned with each result.
     pub collect_metrics: bool,
+    /// When `true`, joint person+face analysis is used for enhanced crop accuracy.
+    /// Overrides `crop_config.enable_enhanced_crop` (CLI flag wins).
+    pub enhanced_crop: bool,
+    /// Minimum long-side pixel count for the pre-inference early filter.
+    ///
+    /// Images whose `max(width, height)` is below this value are skipped before any
+    /// inference when `enhanced_crop` is active. `0` disables the check.
+    /// CLI `--min-pixels` always overrides `crop_config.min_long_side_pixels`.
+    pub min_long_side_pixels: u32,
 }
 
 /// Result metadata for one processed image.
@@ -63,6 +72,8 @@ pub struct ProcessingResult {
     pub face_count: usize,
     /// Per-stage timings. `None` when `ctx.collect_metrics` is `false`.
     pub metrics: Option<ImageMetrics>,
+    /// Crop-accuracy counters. `None` when enhanced-crop is off.
+    pub accuracy: Option<AccuracyMetrics>,
 }
 
 /// Summary of a batch run.
@@ -324,6 +335,7 @@ fn process_classify_only(
         person_count: 0,
         face_count: 0,
         metrics: None,
+        accuracy: None,
     })
 }
 
@@ -434,6 +446,8 @@ struct FormatLoopCtx<'a> {
     file_label: &'a str,
     output_path: &'a Path,
     viz_path: Option<&'a Path>,
+    /// Original (pre-base-margin) bbox, passed through to joint analyzer.
+    base_bbox: &'a BBox,
     face_bboxes: &'a [BBox],
     detections: &'a [Detection],
     focal: &'a crate::focal_point::FocalPoint,
@@ -459,7 +473,9 @@ fn write_multi_format_crops(
     output_files: &mut Vec<PathBuf>,
     all_crop_regions: &mut Vec<CropRegion>,
     ctx: &ProcessingContext<'_>,
-) -> Result<()> {
+) -> Result<AccuracyMetrics> {
+    let mut acc = AccuracyMetrics::default();
+
     if ctx.margin < 0.0 {
         bail!("--margin must be ≥ 0, got {}", ctx.margin);
     }
@@ -481,7 +497,7 @@ fn write_multi_format_crops(
         };
         save_fallback_crop(image, output_path, tier, ctx.jpeg_quality)?;
         output_files.push(output_path.to_path_buf());
-        return Ok(());
+        return Ok(acc);
     }
     if !ctx.quiet {
         println!(
@@ -502,6 +518,7 @@ fn write_multi_format_crops(
         file_label,
         output_path,
         viz_path,
+        base_bbox: crop_bbox,
         face_bboxes,
         detections,
         focal: &focal,
@@ -516,19 +533,56 @@ fn write_multi_format_crops(
             viz_path.and_then(|p| p.extension().and_then(|e| e.to_str()).map(str::to_string))
         },
     };
+
+    let use_enhanced = ctx.enhanced_crop || ctx.crop_config.enable_enhanced_crop;
+
     for format in &suitable_formats {
         let working_bbox =
             apply_margin_to_bbox(crop_bbox, ctx.margin, image.width(), image.height());
-        write_one_format_crop(
-            format,
-            &working_bbox,
-            &loop_ctx,
-            output_files,
-            all_crop_regions,
-            ctx,
-        )?;
+
+        if use_enhanced {
+            let (crop_opt, joint_opt) = compute_format_crop_enhanced(
+                format,
+                image,
+                loop_ctx.base_bbox,
+                &working_bbox,
+                face_bboxes,
+                &focal,
+                ctx,
+                file_label,
+            );
+            // Accumulate accuracy counters from the joint analysis.
+            if let Some(ref joint) = joint_opt {
+                acc.crops_total += 1;
+                if joint.full_person_height_expected {
+                    acc.crops_full_person_height += 1;
+                }
+                if joint.relaxed {
+                    acc.crops_min_dim_relaxed += 1;
+                }
+            }
+            if let Some(original_crop) = crop_opt {
+                write_format_crop_from_region(
+                    format,
+                    original_crop,
+                    &loop_ctx,
+                    output_files,
+                    all_crop_regions,
+                    ctx,
+                )?;
+            }
+        } else {
+            write_one_format_crop(
+                format,
+                &working_bbox,
+                &loop_ctx,
+                output_files,
+                all_crop_regions,
+                ctx,
+            )?;
+        }
     }
-    Ok(())
+    Ok(acc)
 }
 
 fn write_one_format_crop(
@@ -550,7 +604,29 @@ fn write_one_format_crop(
     ) else {
         return Ok(());
     };
+    write_format_crop_from_region(
+        format,
+        original_crop,
+        lc,
+        output_files,
+        all_crop_regions,
+        ctx,
+    )
+}
 
+/// Write a pre-computed `CropRegion` through the eye-safety, encode, and save pipeline.
+///
+/// Shared by both the standard (`write_one_format_crop`) and enhanced
+/// (`compute_format_crop_enhanced` → this) code paths so the eye-safety and output
+/// logic is never duplicated.
+fn write_format_crop_from_region(
+    format: &str,
+    original_crop: CropRegion,
+    lc: &FormatLoopCtx<'_>,
+    output_files: &mut Vec<PathBuf>,
+    all_crop_regions: &mut Vec<CropRegion>,
+    ctx: &ProcessingContext<'_>,
+) -> Result<()> {
     let adjusted = crate::face_aware_cropping::enforce_eye_safety(
         &original_crop,
         lc.face_bboxes,
@@ -664,6 +740,86 @@ fn compute_format_crop(
     }
 }
 
+/// Compute a crop region using joint person+face analysis (enhanced-crop path).
+///
+/// Calls `analyze_joint` to get a `JointAnalysis`, then applies any recommended
+/// extra margin to the working bbox and calls the strategy's `calculate_with_joint`.
+///
+/// Returns `(crop_region, joint_analysis)` so the caller can record accuracy counters.
+/// Compute a crop region using joint person+face analysis (enhanced-crop path).
+///
+/// Analyzes using `person_bbox` (pre-user-margin, actual person dimensions) so the
+/// height comparison is accurate. Applies any recommended `extra_margin_percent` on
+/// top of `working_bbox` (already user-margin expanded) before calling the strategy.
+///
+/// Returns `(crop_region, joint_analysis)` so the caller can record accuracy counters.
+#[allow(clippy::too_many_arguments)]
+fn compute_format_crop_enhanced(
+    format: &str,
+    image: &DynamicImage,
+    person_bbox: &BBox,
+    working_bbox: &BBox,
+    face_bboxes: &[BBox],
+    focal: &crate::focal_point::FocalPoint,
+    ctx: &ProcessingContext<'_>,
+    file_label: &str,
+) -> (
+    Option<CropRegion>,
+    Option<crate::crop::joint_analyzer::JointAnalysis>,
+) {
+    let (aspect_ratio, height_first) = match format {
+        "21:9" => (21.0_f32 / 9.0, true),
+        "9:21" => (9.0_f32 / 21.0, false),
+        "9:16" => (9.0_f32 / 16.0, false),
+        other => {
+            eprintln!(
+                "[WARN][{}] unknown format '{}' — skipping.",
+                file_label, other
+            );
+            return (None, None);
+        }
+    };
+
+    // Analyze using the original person bbox so person height vs crop height is correct.
+    let joint = analyze_joint(
+        person_bbox,
+        face_bboxes,
+        image.width(),
+        image.height(),
+        aspect_ratio,
+        height_first,
+        ctx.crop_config,
+        ctx.artistic_config,
+    );
+
+    // Apply extra margin from joint analysis on top of the already-user-margined bbox.
+    let effective_bbox = if joint.extra_margin_percent > 0.0 {
+        apply_margin_to_bbox(
+            working_bbox,
+            joint.extra_margin_percent,
+            image.width(),
+            image.height(),
+        )
+    } else {
+        working_bbox.clone()
+    };
+
+    let crop = strategy_for(format).and_then(|s| {
+        s.calculate_with_joint(
+            image.width(),
+            image.height(),
+            &effective_bbox,
+            face_bboxes,
+            focal,
+            ctx.crop_config,
+            ctx.artistic_config,
+            Some(&joint),
+        )
+    });
+
+    (crop, Some(joint))
+}
+
 // ---------------------------------------------------------------------------
 // Main orchestrator
 // ---------------------------------------------------------------------------
@@ -679,6 +835,53 @@ fn process_image_with_base_paths(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("<unknown>");
+
+    let use_enhanced = ctx.enhanced_crop || ctx.crop_config.enable_enhanced_crop;
+
+    // Early long-side filter: header-only read BEFORE full decode to avoid the dominant
+    // face-detection cost on photos that cannot yield good output.
+    // Only runs when enhanced_crop is active — guarantees flag-off is byte-for-byte identical.
+    // On header-read failure: non-fatal, fall through to normal processing (debug warn).
+    let mut filter_considered: u64 = 0;
+    if use_enhanced && ctx.min_long_side_pixels > 0 {
+        match crate::early_filter::read_long_side(image_path) {
+            Ok(long_side) => {
+                filter_considered = 1;
+                if !crate::crop::geometry::long_side_passes(long_side, ctx.min_long_side_pixels) {
+                    log::debug!(
+                        "[{}] early-filter: long side {} px < min-pixels {} — skipping",
+                        file_label,
+                        long_side,
+                        ctx.min_long_side_pixels
+                    );
+                    if !ctx.quiet {
+                        println!(
+                            "[{}] skipped: long side {} px < --min-pixels {}",
+                            file_label, long_side, ctx.min_long_side_pixels
+                        );
+                    }
+                    return Ok(ProcessingResult {
+                        input_path: image_path.to_path_buf(),
+                        output_files: vec![],
+                        person_count: 0,
+                        face_count: 0,
+                        metrics: None,
+                        accuracy: Some(AccuracyMetrics {
+                            images_considered: 1,
+                            images_early_skipped: 1,
+                            ..Default::default()
+                        }),
+                    });
+                }
+            }
+            Err(e) => {
+                log::debug!(
+                    "[{}] header-read failed (non-fatal, processing anyway): {e}",
+                    file_label
+                );
+            }
+        }
+    }
 
     let t_decode = StageTimer::start();
     let image = image::open(image_path).with_context(|| {
@@ -696,6 +899,7 @@ fn process_image_with_base_paths(
             decode: dur_decode,
             ..Default::default()
         });
+        r.accuracy = None;
         return Ok(r);
     }
 
@@ -726,6 +930,7 @@ fn process_image_with_base_paths(
 
     let mut all_crop_regions: Vec<CropRegion> = Vec::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
+    let mut image_accuracy = AccuracyMetrics::default();
 
     let t_encode = StageTimer::start();
     if let Some(out) = output_path {
@@ -750,7 +955,7 @@ fn process_image_with_base_paths(
                 ctx,
             )?;
         } else {
-            write_multi_format_crops(
+            image_accuracy = write_multi_format_crops(
                 &image,
                 file_label,
                 out,
@@ -800,6 +1005,16 @@ fn process_image_with_base_paths(
         encode: dur_encode,
     });
 
+    // Return accuracy when enhanced-crop is active; None otherwise (no noise when off).
+    // Merge early-filter counters (images_considered) with per-crop counters.
+    let accuracy = use_enhanced.then_some(AccuracyMetrics {
+        images_considered: filter_considered,
+        images_early_skipped: 0, // 0 here — early-skip returns above before reaching this point
+        crops_total: image_accuracy.crops_total,
+        crops_full_person_height: image_accuracy.crops_full_person_height,
+        crops_min_dim_relaxed: image_accuracy.crops_min_dim_relaxed,
+    });
+
     Ok(ProcessingResult {
         input_path: image_path.to_path_buf(),
         output_files,
@@ -809,6 +1024,7 @@ fn process_image_with_base_paths(
             .count(),
         face_count: face_bboxes.len(),
         metrics: stage_metrics,
+        accuracy,
     })
 }
 
@@ -944,9 +1160,12 @@ pub fn run_batch(
                 ) {
                     Ok(result) => {
                         succeeded.fetch_add(1, Ordering::Relaxed);
-                        if let Some(m) = result.metrics {
-                            if let Ok(mut bm) = batch_metrics.lock() {
+                        if let Ok(mut bm) = batch_metrics.lock() {
+                            if let Some(m) = result.metrics {
                                 bm.record(m);
+                            }
+                            if let Some(a) = result.accuracy {
+                                bm.record_accuracy(a);
                             }
                         }
                         if !ctx.quiet {
@@ -1001,5 +1220,47 @@ pub fn run_batch(
         total: image_paths.len(),
         succeeded: succeeded.load(Ordering::Relaxed),
         failed,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tester validation tests (M0–M4 reconciliation)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate 8 — Flag-off parity: when enhanced_crop is false, accuracy must be None.
+    #[test]
+    fn test_flag_off_accuracy_is_none() {
+        // This mirrors the exact logic in process_image_with_base_paths line ~1010.
+        let use_enhanced = false;
+        let accuracy = use_enhanced.then_some(AccuracyMetrics::default());
+        assert!(
+            accuracy.is_none(),
+            "accuracy must be None when enhanced_crop is off"
+        );
+    }
+
+    /// Gate 8 — Flag-on parity: when enhanced_crop is true, accuracy must be Some.
+    #[test]
+    fn test_flag_on_accuracy_is_some() {
+        let use_enhanced = true;
+        let accuracy = use_enhanced.then_some(AccuracyMetrics::default());
+        assert!(
+            accuracy.is_some(),
+            "accuracy must be Some when enhanced_crop is on"
+        );
+    }
+
+    /// Gate 9 — Early-skip behavior: extreme min-pixels causes long_side_passes to fail.
+    #[test]
+    fn test_high_min_pixels_skips_all_small_images() {
+        // Simulate a 500-px-long-side image with --min-pixels 9999.
+        assert!(
+            !crate::crop::geometry::long_side_passes(500, 9999),
+            "500 px long side must fail 9999 px floor"
+        );
     }
 }

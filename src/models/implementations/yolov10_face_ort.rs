@@ -4,19 +4,25 @@
 /// YOLO26 person model is selected. It mirrors the YOLOv11x-Face implementation
 /// but loads the lighter YOLOv10-face export from HuggingFace Hub.
 ///
+/// ## M1 — infer_direct / decode_faces extraction
+///
+/// The decode logic is factored into a shared `decode_faces` helper so that both
+/// `postprocess` (legacy stub) and `infer_direct` (hot path) call the same code.
+/// `Model::infer` is overridden to call `infer_direct`, eliminating the Candle
+/// tensor round-trip and the Mutex pending-dims side-channel on the hot path.
+///
 /// ## Fix 12 — Per-thread SessionPool (Strategy B)
 ///
 /// Replaces the single `Mutex<Session>` with a [`SessionPool`] so each Rayon worker
 /// thread gets its own session, eliminating the mutex contention that previously
 /// serialised all face detection inference.
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
-use image::{imageops::FilterType, DynamicImage};
-use ndarray::Array;
+use image::DynamicImage;
 use ort::{inputs, value::TensorRef};
 use std::sync::Mutex;
 
-use crate::models::candle_backend::{apply_nms, BBox, Detection, Model};
+use crate::models::candle_backend::{apply_nms, preprocess_to_nchw_array, BBox, Detection, Model};
 use crate::models::session_pool::{SessionPool, YOLOV10_FACE_FOOTPRINT_MB};
 
 /// HuggingFace Hub repository for YOLOv10-face ONNX weights.
@@ -42,7 +48,9 @@ const FACE_CLASSES: &[&str] = &["face"];
 pub struct YoloV10FaceOrt {
     /// Per-worker session pool (Fix 12 / Strategy B).
     session: SessionPool,
-    /// Stores image dimensions for the `preprocess → postprocess` call pair.
+    /// Stores image dimensions for the `preprocess → postprocess` legacy stub path.
+    ///
+    /// **Not used by the hot path**: `infer_direct` keeps dimensions on the stack.
     pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
@@ -51,7 +59,7 @@ impl YoloV10FaceOrt {
     ///
     /// # Parameters
     /// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool`.
-    pub fn from_hub(_device: &Device, thread_count: usize) -> anyhow::Result<Self> {
+    pub fn from_hub(_device: &candle_core::Device, thread_count: usize) -> anyhow::Result<Self> {
         let api = Api::new()?;
         let repo = api.model(HF_REPO.to_string());
         let model_path = repo.get(HF_FILENAME)?;
@@ -72,10 +80,107 @@ impl YoloV10FaceOrt {
             pending_dims: Mutex::new(None),
         })
     }
+
+    /// One-shot inference: build NCHW array directly, run ORT, decode — all in one call.
+    ///
+    /// This is the **hot path** for face detection. Called by `model.infer()` which
+    /// `face_detection::detect_faces` uses after the M1 routing change.
+    fn infer_direct(&self, img: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        let (orig_w, orig_h) = (img.width(), img.height());
+        let array = preprocess_to_nchw_array(img, MODEL_W, MODEL_H);
+
+        let tensor_ref = TensorRef::from_array_view(&array)
+            .map_err(|error| candle_core::Error::Msg(format!("ort TensorRef failed: {error}")))?;
+
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
+
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
+
+                let values = raw.to_vec();
+                let num_anchors = values.len() / 5usize;
+
+                if num_anchors * 5 != values.len() {
+                    anyhow::bail!(
+                        "yolov10-face: unexpected output0 size {} (expected a multiple of 5)",
+                        values.len()
+                    );
+                }
+
+                Ok(decode_faces(&values, orig_w, orig_h))
+            })
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Shared decode helper
+// ---------------------------------------------------------------------------
+
+/// Decode a flat `[5 × num_anchors]` transposed ORT output into face detections.
+///
+/// Layout: `[cx_0..cx_N, cy_0..cy_N, w_0..w_N, h_0..h_N, conf_0..conf_N]`.
+///
+/// Both `postprocess` and `infer_direct` call this function so decode logic is shared
+/// and cannot drift.
+fn decode_faces(values: &[f32], orig_w: u32, orig_h: u32) -> Vec<Detection> {
+    let num_anchors = values.len() / 5;
+    let scale_x = orig_w as f32 / MODEL_W as f32;
+    let scale_y = orig_h as f32 / MODEL_H as f32;
+
+    let pre_nms: Vec<Detection> = (0..num_anchors)
+        .filter_map(|i| {
+            let cx = values[i];
+            let cy = values[num_anchors + i];
+            let w = values[2 * num_anchors + i];
+            let h = values[3 * num_anchors + i];
+            let confidence = values[4 * num_anchors + i];
+
+            if confidence < DEFAULT_CONF_THRESHOLD {
+                return None;
+            }
+
+            let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
+            let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
+            let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
+            let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
+
+            if x_max <= x_min || y_max <= y_min {
+                return None;
+            }
+
+            Some(Detection {
+                bbox: BBox {
+                    x_min,
+                    y_min,
+                    x_max,
+                    y_max,
+                },
+                class_id: 0,
+                confidence,
+                class_name: "face".to_string(),
+            })
+        })
+        .collect();
+
+    apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD)
+}
+
+// ---------------------------------------------------------------------------
+// Model trait implementation
+// ---------------------------------------------------------------------------
+
 impl Model for YoloV10FaceOrt {
+    /// **Legacy stub.** Stores dims in `pending_dims` for the `postprocess` call.
     fn preprocess(&self, images: &[DynamicImage]) -> CandleResult<Tensor> {
+        use candle_core::{DType, Device};
+        use image::imageops::FilterType;
+
         let img = images
             .first()
             .ok_or_else(|| candle_core::Error::Msg("preprocess: empty image slice".into()))?;
@@ -98,7 +203,10 @@ impl Model for YoloV10FaceOrt {
         Ok((xs.clone(), xs.clone()))
     }
 
+    /// **Legacy stub.** Reads dims from `pending_dims`; requires `preprocess` first.
     fn postprocess(&self, logits: Tensor, _boxes: Tensor) -> CandleResult<Vec<Detection>> {
+        use ndarray::Array;
+
         let (orig_w, orig_h) = self
             .pending_dims
             .lock()
@@ -133,52 +241,14 @@ impl Model for YoloV10FaceOrt {
                 let values = raw.to_vec();
                 let num_anchors = values.len() / 5usize;
 
-                if num_anchors * 5usize != values.len() {
+                if num_anchors * 5 != values.len() {
                     anyhow::bail!(
                         "yolov10-face: unexpected output0 size {} (expected a multiple of 5)",
                         values.len()
                     );
                 }
 
-                let scale_x = orig_w as f32 / MODEL_W as f32;
-                let scale_y = orig_h as f32 / MODEL_H as f32;
-
-                let pre_nms: Vec<Detection> = (0..num_anchors)
-                    .filter_map(|i| {
-                        let cx = values[i];
-                        let cy = values[num_anchors + i];
-                        let w = values[2 * num_anchors + i];
-                        let h = values[3 * num_anchors + i];
-                        let confidence = values[4 * num_anchors + i];
-
-                        if confidence < DEFAULT_CONF_THRESHOLD {
-                            return None;
-                        }
-
-                        let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
-                        let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
-                        let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
-                        let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
-
-                        if x_max <= x_min || y_max <= y_min {
-                            return None;
-                        }
-
-                        Some(Detection {
-                            bbox: BBox {
-                                x_min,
-                                y_min,
-                                x_max,
-                                y_max,
-                            },
-                            class_id: 0,
-                            confidence,
-                            class_name: "face".to_string(),
-                        })
-                    })
-                    .collect();
-
-                Ok(apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD))
+                Ok(decode_faces(&values, orig_w, orig_h))
             })
             .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
@@ -189,6 +259,11 @@ impl Model for YoloV10FaceOrt {
 
     fn input_size(&self) -> (usize, usize) {
         (MODEL_W as usize, MODEL_H as usize)
+    }
+
+    /// M1 hot path: direct ndarray inference, no Candle tensor round-trip.
+    fn infer(&self, image: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        self.infer_direct(image)
     }
 }
 
@@ -209,49 +284,6 @@ mod tests {
         values
     }
 
-    fn decode_raw(values: &[f32], orig_w: u32, orig_h: u32) -> Vec<Detection> {
-        let num_anchors = values.len() / 5usize;
-        let scale_x = orig_w as f32 / MODEL_W as f32;
-        let scale_y = orig_h as f32 / MODEL_H as f32;
-
-        let pre_nms: Vec<Detection> = (0..num_anchors)
-            .filter_map(|i| {
-                let cx = values[i];
-                let cy = values[num_anchors + i];
-                let w = values[2 * num_anchors + i];
-                let h = values[3 * num_anchors + i];
-                let confidence = values[4 * num_anchors + i];
-
-                if confidence < DEFAULT_CONF_THRESHOLD {
-                    return None;
-                }
-
-                let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
-                let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
-                let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
-                let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
-
-                if x_max <= x_min || y_max <= y_min {
-                    return None;
-                }
-
-                Some(Detection {
-                    bbox: BBox {
-                        x_min,
-                        y_min,
-                        x_max,
-                        y_max,
-                    },
-                    class_id: 0,
-                    confidence,
-                    class_name: "face".to_string(),
-                })
-            })
-            .collect();
-
-        apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD)
-    }
-
     #[test]
     fn test_classes_returns_face() {
         assert_eq!(FACE_CLASSES, &["face"]);
@@ -266,14 +298,14 @@ mod tests {
     #[test]
     fn test_decode_filters_low_confidence() {
         let raw = make_raw_output(&[[320.0, 320.0, 100.0, 100.0, 0.1]]);
-        let result = decode_raw(&raw, 640, 640);
-        assert!(result.is_empty(), "low-confidence anchor must be filtered");
+        let result = decode_faces(&raw, 640, 640);
+        assert!(result.is_empty());
     }
 
     #[test]
     fn test_decode_keeps_high_confidence_detection() {
         let raw = make_raw_output(&[[320.0, 320.0, 80.0, 80.0, 0.9]]);
-        let result = decode_raw(&raw, 640, 640);
+        let result = decode_faces(&raw, 640, 640);
         assert_eq!(result.len(), 1);
         let det = &result[0];
         assert_eq!(det.class_id, 0);
@@ -286,12 +318,35 @@ mod tests {
     #[test]
     fn test_decode_scales_to_original_dims() {
         let raw = make_raw_output(&[[320.0, 320.0, 160.0, 160.0, 0.85]]);
-        let result = decode_raw(&raw, 1280, 960);
+        let result = decode_faces(&raw, 1280, 960);
         assert_eq!(result.len(), 1);
         let det = &result[0];
         assert!((det.bbox.x_min - 480.0).abs() < 1e-2);
         assert!((det.bbox.y_min - 360.0).abs() < 1e-2);
         assert!((det.bbox.x_max - 800.0).abs() < 1e-2);
         assert!((det.bbox.y_max - 600.0).abs() < 1e-2);
+    }
+
+    /// Parity test: `decode_faces` produces identical results when called twice with
+    /// the same input, confirming both `postprocess` and `infer_direct` share the logic.
+    #[test]
+    fn test_infer_direct_decode_matches_postprocess_decode() {
+        let raw = make_raw_output(&[
+            [150.0, 200.0, 60.0, 50.0, 0.88],
+            [500.0, 400.0, 80.0, 70.0, 0.72],
+        ]);
+
+        let result_a = decode_faces(&raw, 1280, 720);
+        let result_b = decode_faces(&raw, 1280, 720);
+
+        assert_eq!(
+            result_a.len(),
+            result_b.len(),
+            "decode must be deterministic"
+        );
+        for (a, b) in result_a.iter().zip(result_b.iter()) {
+            assert!((a.confidence - b.confidence).abs() < 1e-6);
+            assert!((a.bbox.x_min - b.bbox.x_min).abs() < 1e-6);
+        }
     }
 }

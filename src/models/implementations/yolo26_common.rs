@@ -4,24 +4,30 @@
 //! so preprocessing and decoding mirror the YOLOv10 implementation while keeping
 //! the YOLO26-specific HuggingFace repository and variant metadata isolated here.
 //!
+//! ## M1 — infer_direct / side-channel removal
+//!
+//! The original path used a `thread_local! YOLO26_PENDING_DIMS` to pass image
+//! dimensions from `preprocess` to `postprocess`. That side-channel is removed.
+//! [`YOLOv26OrtInner::infer_direct`] collapses all three trait steps into one
+//! function: dimensions stay on the call stack, preprocessing uses the shared
+//! [`crate::models::candle_backend::preprocess_to_nchw_array`] helper. The legacy
+//! `preprocess`/`forward`/`postprocess` stubs now store dims in a
+//! `Mutex<Option<(u32, u32)>>` field, matching the YOLOv10 pattern.
+//!
 //! ## Fix 12 — Per-thread SessionPool (Strategy B)
 //!
 //! Replaces the single `Mutex<Session>` with a [`SessionPool`] so each Rayon worker
 //! thread gets its own ORT session, eliminating mutex contention on the person
 //! detection stage.
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+use candle_core::{Device, Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
-use image::{imageops::FilterType, DynamicImage};
+use image::DynamicImage;
 use ndarray::Array;
 use ort::{inputs, value::TensorRef};
-use std::cell::RefCell;
+use std::sync::Mutex;
 
-use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
+use crate::models::candle_backend::{preprocess_to_nchw_array, BBox, Detection, COCO_CLASSES};
 use crate::models::session_pool::{SessionPool, YOLO26_FOOTPRINT_MB};
-
-thread_local! {
-    static YOLO26_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
-}
 
 /// Model input width and height in pixels.
 pub(super) const MODEL_W: u32 = 640;
@@ -41,6 +47,10 @@ pub(super) struct YOLOv26VariantConfig {
 pub(super) struct YOLOv26OrtInner {
     /// Per-worker session pool (Fix 12 / Strategy B).
     session: SessionPool,
+    /// Stores image dimensions for the legacy `preprocess → postprocess` stub path.
+    ///
+    /// **Not used by the hot path**: [`infer_direct`] keeps dimensions on the stack.
+    pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
 impl YOLOv26OrtInner {
@@ -72,18 +82,29 @@ impl YOLOv26OrtInner {
         )
         .map_err(|e| anyhow::anyhow!("YOLO26 session pool: {e}"))?;
 
-        Ok(Self { session })
+        Ok(Self {
+            session,
+            pending_dims: Mutex::new(None),
+        })
     }
 
     /// Resize an image to the model input size and normalise pixels to `[0, 1]`.
+    ///
+    /// **Legacy stub.** The hot path uses [`infer_direct`] instead. This method stores
+    /// original dimensions in `pending_dims` for a subsequent [`postprocess`] call.
     pub fn preprocess(&self, images: &[DynamicImage]) -> CandleResult<Tensor> {
+        use candle_core::{DType, Device};
+        use image::imageops::FilterType;
+
         let img = images
             .first()
             .ok_or_else(|| candle_core::Error::Msg("preprocess: empty image slice".into()))?;
 
-        YOLO26_PENDING_DIMS.with(|pending_dims| {
-            *pending_dims.borrow_mut() = Some((img.width(), img.height()));
-        });
+        *self
+            .pending_dims
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("pending_dims lock failed: {e}")))? =
+            Some((img.width(), img.height()));
 
         let resized = img.resize_exact(MODEL_W, MODEL_H, FilterType::Nearest);
         let rgb = resized.to_rgb8();
@@ -101,9 +122,15 @@ impl YOLOv26OrtInner {
     }
 
     /// Run ONNX Runtime inference and decode detections.
+    ///
+    /// **Legacy stub.** The hot path uses [`infer_direct`] instead. This method reads
+    /// dimensions from `pending_dims` (set by [`preprocess`]).
     pub fn postprocess(&self, logits: Tensor, _boxes: Tensor) -> CandleResult<Vec<Detection>> {
-        let (orig_w, orig_h) = YOLO26_PENDING_DIMS
-            .with(|pending_dims| pending_dims.borrow_mut().take())
+        let (orig_w, orig_h) = self
+            .pending_dims
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("pending_dims lock failed: {e}")))?
+            .take()
             .ok_or_else(|| {
                 candle_core::Error::Msg(
                     "postprocess: no image dimensions — call preprocess first".into(),
@@ -119,6 +146,41 @@ impl YOLOv26OrtInner {
 
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|error| candle_core::Error::Msg(format!("ort TensorRef failed: {error}")))?;
+
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
+
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
+
+                decode_output0(raw.to_vec(), orig_w, orig_h)
+                    .map_err(|e| anyhow::anyhow!("yolo26 decode failed: {e}"))
+            })
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
+    }
+
+    /// One-shot inference: build NCHW array directly, run ORT, decode — all in one call.
+    ///
+    /// This is the **hot path** used by YOLO26n/s/m through the
+    /// [`crate::models::candle_backend::Model::infer`] override.
+    ///
+    /// Compared to the legacy `preprocess → forward → postprocess` sequence:
+    /// - No Candle tensor is allocated (the ndarray is built via the shared helper).
+    /// - Original `(width, height)` stays on the call stack — no Mutex side-channel needed.
+    /// - The session pool is consulted once; the calling thread's session is reused.
+    ///
+    /// # Errors
+    /// Returns `Err` if the ORT session fails or the model output has an unexpected shape.
+    pub(super) fn infer_direct(&self, img: &DynamicImage) -> CandleResult<Vec<Detection>> {
+        let (orig_w, orig_h) = (img.width(), img.height());
+        let array = preprocess_to_nchw_array(img, MODEL_W, MODEL_H);
+
+        let tensor_ref = TensorRef::from_array_view(&array)
+            .map_err(|e| candle_core::Error::Msg(format!("ort TensorRef failed: {e}")))?;
 
         self.session
             .with_session(|session| {
@@ -195,7 +257,8 @@ fn decode_output0(values: Vec<f32>, orig_w: u32, orig_h: u32) -> CandleResult<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use candle_core::{DType, Device, Tensor};
+    use image::imageops::FilterType;
 
     #[test]
     fn test_model_input_size_is_640x640() {
@@ -275,20 +338,48 @@ mod tests {
         assert!((detection.bbox.y_max - 540.0).abs() < 1e-3);
     }
 
+    /// Parity test: `preprocess_to_nchw_array` (shared helper) produces byte-for-byte
+    /// identical values to the Candle round-trip for YOLO26 input dimensions.
+    ///
+    /// This guards M1: if this passes, YOLO26's `infer_direct` is numerically equivalent
+    /// to the old `preprocess → forward → postprocess` path.
     #[test]
-    fn test_pending_dims_are_thread_local() {
-        YOLO26_PENDING_DIMS.with(|pending_dims| {
-            *pending_dims.borrow_mut() = Some((320, 240));
-        });
+    fn test_direct_preprocess_matches_candle_preprocess() {
+        let img = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(100, 75, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 200u8])
+        }));
 
-        let thread_result =
-            thread::spawn(|| YOLO26_PENDING_DIMS.with(|pending_dims| *pending_dims.borrow()))
-                .join();
+        // --- Candle round-trip (legacy path) ---
+        let resized = img.resize_exact(MODEL_W, MODEL_H, FilterType::Nearest);
+        let rgb = resized.to_rgb8();
+        let raw_u8: Vec<u8> = rgb.into_raw();
+        let t = Tensor::from_vec(
+            raw_u8,
+            (MODEL_H as usize, MODEL_W as usize, 3),
+            &Device::Cpu,
+        )
+        .unwrap()
+        .permute((2, 0, 1))
+        .unwrap();
+        let t = (t.to_dtype(DType::F32).unwrap() * (1.0f64 / 255.0)).unwrap();
+        let t = t.unsqueeze(0).unwrap();
+        let candle_data: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
 
-        assert_eq!(thread_result.expect("thread should not panic"), None);
+        // --- Shared helper (M1 hot path) ---
+        let direct_arr = preprocess_to_nchw_array(&img, MODEL_W, MODEL_H);
+        let direct_data: Vec<f32> = direct_arr.iter().copied().collect();
 
-        let current_thread_dims =
-            YOLO26_PENDING_DIMS.with(|pending_dims| pending_dims.borrow_mut().take());
-        assert_eq!(current_thread_dims, Some((320, 240)));
+        assert_eq!(candle_data.len(), direct_data.len(), "lengths must match");
+
+        let max_diff = candle_data
+            .iter()
+            .zip(direct_data.iter())
+            .map(|(c, d)| (c - d).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-6,
+            "max diff {max_diff}: YOLO26 shared preprocess must equal Candle round-trip"
+        );
     }
 }

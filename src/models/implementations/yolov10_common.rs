@@ -31,7 +31,7 @@ use ndarray::Array;
 use ort::{inputs, value::TensorRef};
 use std::sync::Mutex;
 
-use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
+use crate::models::candle_backend::{preprocess_to_nchw_array, BBox, Detection, COCO_CLASSES};
 use crate::models::session_pool::{SessionPool, YOLOV10_FOOTPRINT_MB};
 
 /// Model input width and height in pixels.
@@ -185,7 +185,7 @@ impl YOLOv10OrtInner {
     /// Returns `Err` if the ORT session fails or the model output has an unexpected shape.
     pub(super) fn infer_direct(&self, img: &DynamicImage) -> CandleResult<Vec<Detection>> {
         let (orig_w, orig_h) = (img.width(), img.height());
-        let array = preprocess_to_nchw_array(img);
+        let array = preprocess_to_nchw_array(img, MODEL_W, MODEL_H);
 
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|e| candle_core::Error::Msg(format!("ort TensorRef failed: {e}")))?;
@@ -215,36 +215,6 @@ impl YOLOv10OrtInner {
     pub fn input_size(&self) -> (usize, usize) {
         (MODEL_W as usize, MODEL_H as usize)
     }
-}
-
-/// Build an NCHW `Array4<f32>` from `img` without allocating any Candle tensors.
-///
-/// Resizes the image to `MODEL_W × MODEL_H` using nearest-neighbour interpolation,
-/// converts to RGB, and lays the pixel data out as `[1, C, H, W]` (C-contiguous)
-/// with values normalised to `[0.0, 1.0]`.
-///
-/// This produces **byte-for-byte identical values** to the Candle round-trip:
-/// `Tensor::from_vec(HWC u8) → permute(CHW) → F32/255 → unsqueeze(NCHW)`.
-/// The parity is verified by `test_direct_preprocess_matches_candle_preprocess`.
-///
-/// Memory: one allocation of `3 × MODEL_W × MODEL_H × 4` bytes (≈4.7 MB for 640×640).
-fn preprocess_to_nchw_array(img: &DynamicImage) -> ndarray::Array<f32, ndarray::Ix4> {
-    let resized = img.resize_exact(MODEL_W, MODEL_H, FilterType::Nearest);
-    let rgb = resized.to_rgb8();
-    let data = rgb.into_raw(); // HWC Vec<u8>: index = h*W*3 + w*3 + c
-
-    let pixel_count = (MODEL_W * MODEL_H) as usize;
-    let mut nchw_data = vec![0.0f32; 3 * pixel_count];
-
-    // De-interleave HWC → NCHW: collect R-plane, then G-plane, then B-plane.
-    for i in 0..pixel_count {
-        nchw_data[i] = data[i * 3] as f32 / 255.0; // channel 0 (R)
-        nchw_data[pixel_count + i] = data[i * 3 + 1] as f32 / 255.0; // channel 1 (G)
-        nchw_data[2 * pixel_count + i] = data[i * 3 + 2] as f32 / 255.0; // channel 2 (B)
-    }
-
-    Array::from_shape_vec((1, 3, MODEL_H as usize, MODEL_W as usize), nchw_data)
-        .expect("shape is exactly 1 × 3 × MODEL_H × MODEL_W — infallible for fixed constants")
 }
 
 fn decode_output0(values: Vec<f32>, orig_w: u32, orig_h: u32) -> CandleResult<Vec<Detection>> {
@@ -362,10 +332,10 @@ mod tests {
         assert_eq!(detections[0].class_name, "person");
     }
 
-    /// Verify that `preprocess_to_nchw_array` produces byte-for-byte identical values
-    /// to the legacy Candle round-trip (`from_vec → permute → F32/255 → unsqueeze`).
+    /// Verify that the shared `preprocess_to_nchw_array` (now in `candle_backend`) produces
+    /// byte-for-byte identical values to the legacy Candle round-trip.
     ///
-    /// This is the primary parity gate for M6: if this test passes, the direct-ndarray
+    /// This is the primary parity gate for M1: if this test passes, the direct-ndarray
     /// hot path is numerically equivalent to the original code and detection results
     /// will be identical.
     #[test]
@@ -390,8 +360,8 @@ mod tests {
         let t = t.unsqueeze(0).unwrap();
         let candle_data: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
 
-        // --- Direct ndarray path (M6 hot path) ---
-        let direct_array = preprocess_to_nchw_array(&img);
+        // --- Shared helper from candle_backend (M1 hot path) ---
+        let direct_array = preprocess_to_nchw_array(&img, MODEL_W, MODEL_H);
         let direct_data: Vec<f32> = direct_array.iter().copied().collect();
 
         assert_eq!(
@@ -409,7 +379,7 @@ mod tests {
         assert!(
             max_diff < 1e-6,
             "max pixel-value difference {max_diff} exceeds tolerance: \
-             direct preprocess path must be numerically equivalent to candle round-trip"
+             shared preprocess_to_nchw_array must be numerically equivalent to candle round-trip"
         );
     }
 
@@ -417,7 +387,7 @@ mod tests {
     #[test]
     fn test_preprocess_to_nchw_array_shape() {
         let img = image::DynamicImage::new_rgb8(320, 240);
-        let arr = preprocess_to_nchw_array(&img);
+        let arr = preprocess_to_nchw_array(&img, MODEL_W, MODEL_H);
         assert_eq!(
             arr.shape(),
             &[1, 3, MODEL_H as usize, MODEL_W as usize],
@@ -431,7 +401,7 @@ mod tests {
         let img = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(64, 64, |_, _| {
             image::Rgb([0u8, 128u8, 255u8])
         }));
-        let arr = preprocess_to_nchw_array(&img);
+        let arr = preprocess_to_nchw_array(&img, MODEL_W, MODEL_H);
         for &v in arr.iter() {
             assert!(
                 (0.0..=1.0).contains(&v),

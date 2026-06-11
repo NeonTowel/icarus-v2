@@ -18,7 +18,7 @@
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_transformers::object_detection::{non_maximum_suppression, Bbox};
 use hf_hub::api::sync::Api;
-use image::DynamicImage;
+use image::{imageops::FilterType, DynamicImage};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +165,47 @@ pub trait Model: Send + Sync {
 // Preprocessing utilities
 // ---------------------------------------------------------------------------
 
+/// Build an NCHW `[1, 3, model_h, model_w]` f32 ndarray directly from image pixels.
+///
+/// Resizes to `(model_w, model_h)` using nearest-neighbour interpolation, converts to
+/// RGB8, and de-interleaves HWC → NCHW with pixel values normalised to `[0.0, 1.0]`.
+///
+/// This produces **byte-for-byte identical values** to the Candle round-trip:
+/// `Tensor::from_vec(HWC u8) → permute(CHW) → F32/255 → unsqueeze(NCHW)`.
+///
+/// Parity is verified by `test_preprocess_to_nchw_array_matches_candle_path`.
+///
+/// # Memory
+/// One allocation of `3 × model_w × model_h × 4` bytes (≈4.7 MB for 640×640).
+///
+/// # Example
+/// ```rust,ignore
+/// let arr = preprocess_to_nchw_array(&img, 640, 640);
+/// assert_eq!(arr.shape(), &[1, 3, 640, 640]);
+/// ```
+pub fn preprocess_to_nchw_array(
+    img: &DynamicImage,
+    model_w: u32,
+    model_h: u32,
+) -> ndarray::Array<f32, ndarray::Ix4> {
+    let resized = img.resize_exact(model_w, model_h, FilterType::Nearest);
+    let rgb = resized.to_rgb8();
+    let data = rgb.into_raw(); // HWC Vec<u8>: index = h*W*3 + w*3 + c
+
+    let pixel_count = (model_w * model_h) as usize;
+    let mut nchw_data = vec![0.0f32; 3 * pixel_count];
+
+    // De-interleave HWC → NCHW: R-plane, then G-plane, then B-plane.
+    for i in 0..pixel_count {
+        nchw_data[i] = data[i * 3] as f32 / 255.0; // channel 0 (R)
+        nchw_data[pixel_count + i] = data[i * 3 + 1] as f32 / 255.0; // channel 1 (G)
+        nchw_data[2 * pixel_count + i] = data[i * 3 + 2] as f32 / 255.0; // channel 2 (B)
+    }
+
+    ndarray::Array::from_shape_vec((1, 3, model_h as usize, model_w as usize), nchw_data)
+        .expect("shape is exactly 1 × 3 × model_h × model_w — infallible for fixed constants")
+}
+
 /// Resize `img` to `(width, height)` using Lanczos3 (high-quality, no aspect-ratio
 /// preservation — the model input is always square).
 ///
@@ -173,7 +214,7 @@ pub trait Model: Send + Sync {
 /// let resized = resize_image(&img, (640, 640));
 /// ```
 pub fn resize_image(img: &DynamicImage, size: (u32, u32)) -> DynamicImage {
-    img.resize_exact(size.0, size.1, image::imageops::FilterType::Lanczos3)
+    img.resize_exact(size.0, size.1, FilterType::Lanczos3)
 }
 
 /// Encode a single RGB image as a Candle tensor and normalise pixel values to [0, 1].
@@ -729,6 +770,80 @@ mod tests {
         for v in &values {
             assert!(*v >= 0.0 && *v <= 1.0, "pixel value out of [0,1]: {v}");
         }
+    }
+
+    #[test]
+    fn test_preprocess_to_nchw_array_shape_640x640() {
+        let img = DynamicImage::new_rgb8(320, 240);
+        let arr = preprocess_to_nchw_array(&img, 640, 640);
+        assert_eq!(
+            arr.shape(),
+            &[1, 3, 640, 640],
+            "preprocess_to_nchw_array must return [N=1, C=3, H=640, W=640]"
+        );
+    }
+
+    #[test]
+    fn test_preprocess_to_nchw_array_values_in_unit_range() {
+        let img = DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(32, 32, |_, _| {
+            image::Rgb([0u8, 128u8, 255u8])
+        }));
+        let arr = preprocess_to_nchw_array(&img, 64, 64);
+        for &v in arr.iter() {
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "pixel value {v} is outside [0.0, 1.0]"
+            );
+        }
+    }
+
+    /// Defensive test: ensure the function works for non-square model dimensions.
+    #[test]
+    fn test_preprocess_to_nchw_array_non_square_shape() {
+        let img = DynamicImage::new_rgb8(100, 75);
+        let arr = preprocess_to_nchw_array(&img, 320, 240);
+        assert_eq!(
+            arr.shape(),
+            &[1, 3, 240, 320],
+            "output shape must be [1, 3, model_h, model_w]"
+        );
+    }
+
+    /// Verify byte-for-byte parity with the Candle round-trip for the shared helper.
+    #[test]
+    fn test_preprocess_to_nchw_array_matches_candle_path() {
+        use image::imageops::FilterType;
+
+        let img = DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(100, 75, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128u8])
+        }));
+
+        // --- Candle round-trip (legacy path) ---
+        let resized = img.resize_exact(64, 64, FilterType::Nearest);
+        let rgb = resized.to_rgb8();
+        let raw_u8: Vec<u8> = rgb.into_raw();
+        let t = Tensor::from_vec(raw_u8, (64usize, 64usize, 3), &Device::Cpu)
+            .unwrap()
+            .permute((2, 0, 1))
+            .unwrap();
+        let t = (t.to_dtype(DType::F32).unwrap() * (1.0f64 / 255.0)).unwrap();
+        let t = t.unsqueeze(0).unwrap();
+        let candle_data: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+
+        // --- Shared helper ---
+        let direct_arr = preprocess_to_nchw_array(&img, 64, 64);
+        let direct_data: Vec<f32> = direct_arr.iter().copied().collect();
+
+        assert_eq!(candle_data.len(), direct_data.len());
+        let max_diff = candle_data
+            .iter()
+            .zip(direct_data.iter())
+            .map(|(c, d)| (c - d).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "max diff {max_diff}: shared helper must be numerically identical to Candle path"
+        );
     }
 
     #[test]

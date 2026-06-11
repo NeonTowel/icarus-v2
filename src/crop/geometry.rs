@@ -119,6 +119,82 @@ pub fn apply_margin_to_bbox(
 }
 
 // ---------------------------------------------------------------------------
+// Long-side quality gate (shared between early_filter and joint_analyzer)
+// ---------------------------------------------------------------------------
+
+/// Return `true` when a dimension meets the minimum pixel threshold.
+///
+/// - `min_px == 0` disables the check (always returns `true`).
+/// - Equal-to-minimum counts as passing.
+///
+/// Pass `max(crop_w, crop_h)` as `long_side_px` so that landscape crops enforce
+/// on width and portrait/mobile crops enforce on height — both via this single predicate.
+///
+/// # Examples
+/// ```rust
+/// use icarus_v2::crop::geometry::long_side_passes;
+///
+/// assert!(long_side_passes(1200, 1200)); // equal-to-min passes
+/// assert!(long_side_passes(1500, 1200)); // above min passes
+/// assert!(!long_side_passes(1199, 1200)); // below min fails
+/// assert!(long_side_passes(0, 0));       // 0 min disables
+/// assert!(long_side_passes(500, 0));     // 0 min always passes
+/// ```
+pub fn long_side_passes(long_side_px: u32, min_px: u32) -> bool {
+    min_px == 0 || long_side_px >= min_px
+}
+
+// ---------------------------------------------------------------------------
+// Crop dimension calculation (shared between strategy and joint analyzer)
+// ---------------------------------------------------------------------------
+
+/// Compute the pixel dimensions `(crop_width, crop_height)` for a given photo and format.
+///
+/// Mirrors the sizing logic in [`crate::crop::strategy::CropStrategy::calculate`] so
+/// that `joint_analyzer` can reason about the same crop geometry without importing the
+/// strategy module (avoiding circular dependencies).
+///
+/// - `height_first` → `crop_height = photo_height`, width derived (landscape 21:9 style).
+/// - `!height_first` → `crop_width = photo_width`, height derived (portrait 9:21 / 9:16 style).
+///
+/// Both branches cap the unconstrained dimension to the photo bounds.
+///
+/// # Example
+/// ```rust,ignore
+/// // 1920×1080 photo at 21:9 (height-first):
+/// let (w, h) = crop_dimensions(1920, 1080, 21.0 / 9.0, true);
+/// // h == 1080, w == 1080 * 21/9 ≈ 2520 → capped to 1920 → h recalculated
+/// ```
+pub fn crop_dimensions(
+    photo_w: u32,
+    photo_h: u32,
+    aspect_ratio: f32,
+    height_first: bool,
+) -> (f32, f32) {
+    let pw = photo_w as f32;
+    let ph = photo_h as f32;
+    if height_first {
+        let h = ph;
+        let w = h * aspect_ratio;
+        if w > pw {
+            let w2 = pw;
+            (w2, w2 / aspect_ratio)
+        } else {
+            (w, h)
+        }
+    } else {
+        let w = pw;
+        let h = w / aspect_ratio;
+        if h > ph {
+            let h2 = ph;
+            (h2 * aspect_ratio, h2)
+        } else {
+            (w, h)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Crop placement
 // ---------------------------------------------------------------------------
 
@@ -224,6 +300,105 @@ mod tests {
             x2: 2200.0,
             y2: 3800.0,
         }
+    }
+
+    // --- long_side_passes ---
+
+    #[test]
+    fn test_long_side_passes_equal_to_min_passes() {
+        assert!(long_side_passes(1200, 1200), "equal-to-min must pass");
+    }
+
+    #[test]
+    fn test_long_side_passes_above_min_passes() {
+        assert!(long_side_passes(1500, 1200), "above min must pass");
+    }
+
+    #[test]
+    fn test_long_side_passes_below_min_fails() {
+        assert!(!long_side_passes(1199, 1200), "one below min must fail");
+        assert!(!long_side_passes(0, 1200), "zero must fail when min > 0");
+    }
+
+    #[test]
+    fn test_long_side_passes_zero_min_disables_check() {
+        assert!(long_side_passes(0, 0), "0 min always passes");
+        assert!(
+            long_side_passes(500, 0),
+            "0 min always passes for any value"
+        );
+        assert!(long_side_passes(1, 0), "0 min always passes for 1");
+    }
+
+    #[test]
+    fn test_long_side_passes_u32_max_with_zero_min() {
+        assert!(
+            long_side_passes(u32::MAX, 0),
+            "u32::MAX must pass when min is 0 (disabled)"
+        );
+    }
+
+    /// Confirms landscape (21:9) enforces width and portrait/mobile enforce height,
+    /// both via `max(crop_w, crop_h)` — the single long-side predicate.
+    #[test]
+    fn test_long_side_category_mapping_landscape_portrait_mobile() {
+        // Landscape 21:9 on a 4000×2000 photo: crop_w = 4000, crop_h ≈ 1714 → long side = 4000
+        let (cw, ch) = crop_dimensions(4000, 2000, 21.0 / 9.0, true);
+        let long_side = cw.max(ch) as u32;
+        assert!(
+            long_side_passes(long_side, 1200),
+            "landscape long side ({long_side}) passes 1200"
+        );
+
+        // Portrait 9:16 on a 1080×1920 photo: crop_w = 1080, crop_h = 1920 → long side = 1920
+        let (cw, ch) = crop_dimensions(1080, 1920, 9.0 / 16.0, false);
+        let long_side = cw.max(ch) as u32;
+        assert!(
+            long_side_passes(long_side, 1200),
+            "portrait long side ({long_side}) passes 1200"
+        );
+
+        // Mobile 9:21 on a 400×500 photo: crop would be small → long side < 1200
+        let (cw, ch) = crop_dimensions(400, 500, 9.0 / 21.0, false);
+        let long_side = cw.max(ch) as u32;
+        assert!(
+            !long_side_passes(long_side, 1200),
+            "small mobile long side ({long_side}) fails 1200"
+        );
+    }
+
+    // --- crop_dimensions ---
+
+    #[test]
+    fn test_crop_dimensions_height_first_landscape() {
+        // 1920×1080 photo at 21:9 — width would be 2520, capped to 1920.
+        let (w, h) = crop_dimensions(1920, 1080, 21.0 / 9.0, true);
+        assert!((w - 1920.0).abs() < 0.5, "w={w}");
+        assert!((h - 1920.0 / (21.0 / 9.0)).abs() < 0.5, "h={h}");
+    }
+
+    #[test]
+    fn test_crop_dimensions_height_first_wide_photo() {
+        // 4000×2000 photo at 21:9 — width would be ~4666, capped to 4000.
+        let (w, h) = crop_dimensions(4000, 2000, 21.0 / 9.0, true);
+        assert!((w - 4000.0).abs() < 0.5, "w={w}");
+        assert!((h - 4000.0 * 9.0 / 21.0).abs() < 0.5, "h={h}");
+    }
+
+    #[test]
+    fn test_crop_dimensions_width_first_portrait() {
+        // 1080×1920 photo at 9:16 — height would be 1920 exactly.
+        let (w, h) = crop_dimensions(1080, 1920, 9.0 / 16.0, false);
+        assert!((w - 1080.0).abs() < 0.5, "w={w}");
+        assert!((h - 1920.0).abs() < 0.5, "h={h}");
+    }
+
+    #[test]
+    fn test_crop_dimensions_width_first_short_photo() {
+        // 1080×800 photo at 9:16 — height would be 1920, capped to 800.
+        let (w, h) = crop_dimensions(1080, 800, 9.0 / 16.0, false);
+        assert!((h - 800.0).abs() < 0.5, "h={h}");
+        assert!((w - 800.0 * 9.0 / 16.0).abs() < 0.5, "w={w}");
     }
 
     // --- apply_margin_to_bbox ---

@@ -7,6 +7,7 @@ pub mod config;
 pub mod crop;
 pub mod detections_json;
 pub mod directory_walker;
+pub mod early_filter;
 pub mod error;
 pub mod face_aware_cropping;
 pub mod face_detection;

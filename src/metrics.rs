@@ -1,4 +1,4 @@
-//! Per-stage timing metrics for the image processing pipeline.
+//! Per-stage timing metrics and crop-accuracy counters for the image processing pipeline.
 //!
 //! Enabled by `--metrics` at the CLI. Default off — adding `--metrics` to a
 //! run changes nothing except printing a timing table at the end.
@@ -11,6 +11,16 @@
 //!
 //! let mut metrics = ImageMetrics::default();
 //! metrics.person_detect = dur;
+//!
+//! // Accuracy counters (only meaningful when --enhanced-crop is on):
+//! let acc = AccuracyMetrics {
+//!     images_considered: 1,
+//!     images_early_skipped: 0,
+//!     crops_total: 3,
+//!     crops_full_person_height: 2,
+//!     crops_min_dim_relaxed: 1,
+//! };
+//! batch_metrics.record_accuracy(acc);
 //! ```
 
 use std::time::{Duration, Instant};
@@ -72,6 +82,44 @@ impl ImageMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Crop-accuracy counters
+// ---------------------------------------------------------------------------
+
+/// Crop-accuracy counters accumulated during a batch run.
+///
+/// These counters are only meaningful when `--enhanced-crop` is active. When
+/// the flag is off, all counters remain zero and no accuracy lines are printed.
+///
+/// # Example
+/// ```rust,ignore
+/// let acc = AccuracyMetrics {
+///     images_considered: 10,
+///     images_early_skipped: 2,
+///     crops_total: 6,
+///     crops_full_person_height: 4,
+///     crops_min_dim_relaxed: 1,
+/// };
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct AccuracyMetrics {
+    /// Images seen by the early pre-inference long-side filter (header-read succeeded).
+    ///
+    /// Incremented when `--enhanced-crop` is on and `read_long_side` returns `Ok`.
+    /// Denominator for the early-skip percentage.
+    pub images_considered: u64,
+    /// Images skipped before any inference because their long side was below `--min-pixels`.
+    ///
+    /// These images emit no crops. Only incremented when `images_considered` is also 1.
+    pub images_early_skipped: u64,
+    /// Total number of format crops attempted (counts per-format, not per-image).
+    pub crops_total: u64,
+    /// Crops where the joint analyzer expects the full person height to be preserved.
+    pub crops_full_person_height: u64,
+    /// Crops where min-dimension relaxation was triggered (extra margin applied).
+    pub crops_min_dim_relaxed: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Batch aggregation
 // ---------------------------------------------------------------------------
 
@@ -79,72 +127,121 @@ impl ImageMetrics {
 #[derive(Debug, Default)]
 pub struct BatchMetrics {
     samples: Vec<ImageMetrics>,
+    accuracy: AccuracyMetrics,
 }
 
 impl BatchMetrics {
-    /// Record one image's metrics into the batch aggregate.
+    /// Record one image's timing metrics into the batch aggregate.
     pub fn record(&mut self, m: ImageMetrics) {
         self.samples.push(m);
     }
 
+    /// Accumulate crop-accuracy counters from one image into the batch total.
+    ///
+    /// Call once per image (after collecting per-format results).
+    pub fn record_accuracy(&mut self, a: AccuracyMetrics) {
+        self.accuracy.images_considered += a.images_considered;
+        self.accuracy.images_early_skipped += a.images_early_skipped;
+        self.accuracy.crops_total += a.crops_total;
+        self.accuracy.crops_full_person_height += a.crops_full_person_height;
+        self.accuracy.crops_min_dim_relaxed += a.crops_min_dim_relaxed;
+    }
+
     /// Print a human-readable timing summary to stdout.
     ///
-    /// Prints nothing when the batch is empty.
+    /// - Always prints the per-stage timing table (unchanged from M7 baseline).
+    /// - Prints the early-skip line IFF `images_considered > 0`.
+    /// - Prints crop-accuracy lines IFF `crops_total > 0` (i.e. `--enhanced-crop` was active).
+    /// - Prints nothing when the batch is empty and no images were considered.
     pub fn print_summary(&self) {
-        if self.samples.is_empty() {
+        if self.samples.is_empty() && self.accuracy.images_considered == 0 {
             return;
         }
+
         let n = self.samples.len();
 
-        macro_rules! stage_stats {
-            ($field:ident, $label:expr) => {{
-                let mut times: Vec<f64> = self
-                    .samples
-                    .iter()
-                    .map(|m| m.$field.as_secs_f64() * 1000.0)
-                    .collect();
-                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mean = times.iter().sum::<f64>() / n as f64;
-                let p50 = percentile(&times, 50);
-                let p95 = percentile(&times, 95);
-                println!(
-                    "  {:20} mean={:7.1}ms  p50={:7.1}ms  p95={:7.1}ms",
-                    $label, mean, p50, p95
-                );
-            }};
+        if n > 0 {
+            macro_rules! stage_stats {
+                ($field:ident, $label:expr) => {{
+                    let mut times: Vec<f64> = self
+                        .samples
+                        .iter()
+                        .map(|m| m.$field.as_secs_f64() * 1000.0)
+                        .collect();
+                    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mean = times.iter().sum::<f64>() / n as f64;
+                    let p50 = percentile(&times, 50);
+                    let p95 = percentile(&times, 95);
+                    println!(
+                        "  {:20} mean={:7.1}ms  p50={:7.1}ms  p95={:7.1}ms",
+                        $label, mean, p50, p95
+                    );
+                }};
+            }
+
+            println!(
+                "\n── Pipeline Metrics ({} image(s)) ──────────────────────────",
+                n
+            );
+            println!(
+                "  {:20} {:>12}  {:>12}  {:>12}",
+                "Stage", "mean", "p50", "p95"
+            );
+            println!("  {}", "─".repeat(65));
+            stage_stats!(decode, "decode");
+            stage_stats!(person_detect, "person_detect");
+            stage_stats!(face_detect, "face_detect");
+            stage_stats!(crop, "crop");
+            stage_stats!(classify, "classify");
+            stage_stats!(encode, "encode");
+
+            let mut totals: Vec<f64> = self
+                .samples
+                .iter()
+                .map(|m| m.total().as_secs_f64() * 1000.0)
+                .collect();
+            totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean_total = totals.iter().sum::<f64>() / n as f64;
+            let p50_total = percentile(&totals, 50);
+            let p95_total = percentile(&totals, 95);
+            println!("  {}", "─".repeat(65));
+            println!(
+                "  {:20} mean={:7.1}ms  p50={:7.1}ms  p95={:7.1}ms",
+                "TOTAL", mean_total, p50_total, p95_total
+            );
+            println!("──────────────────────────────────────────────────────────────\n");
         }
 
-        println!(
-            "\n── Pipeline Metrics ({} image(s)) ──────────────────────────",
-            n
-        );
-        println!(
-            "  {:20} {:>12}  {:>12}  {:>12}",
-            "Stage", "mean", "p50", "p95"
-        );
-        println!("  {}", "─".repeat(65));
-        stage_stats!(decode, "decode");
-        stage_stats!(person_detect, "person_detect");
-        stage_stats!(face_detect, "face_detect");
-        stage_stats!(crop, "crop");
-        stage_stats!(classify, "classify");
-        stage_stats!(encode, "encode");
+        // Print accuracy lines only when enhanced-crop was active.
+        let acc = &self.accuracy;
 
-        let mut totals: Vec<f64> = self
-            .samples
-            .iter()
-            .map(|m| m.total().as_secs_f64() * 1000.0)
-            .collect();
-        totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mean_total = totals.iter().sum::<f64>() / n as f64;
-        let p50_total = percentile(&totals, 50);
-        let p95_total = percentile(&totals, 95);
-        println!("  {}", "─".repeat(65));
-        println!(
-            "  {:20} mean={:7.1}ms  p50={:7.1}ms  p95={:7.1}ms",
-            "TOTAL", mean_total, p50_total, p95_total
-        );
-        println!("──────────────────────────────────────────────────────────────\n");
+        let has_early_filter = acc.images_considered > 0;
+        let has_crops = acc.crops_total > 0;
+
+        if has_early_filter || has_crops {
+            println!("── Crop Accuracy ────────────────────────────────────────────");
+            if has_early_filter {
+                let skip_pct =
+                    100.0 * acc.images_early_skipped as f64 / acc.images_considered as f64;
+                println!(
+                    "  early-skipped (long side < min): {} / {} ({:.1}%)",
+                    acc.images_early_skipped, acc.images_considered, skip_pct
+                );
+            }
+            if has_crops {
+                let full_pct = 100.0 * acc.crops_full_person_height as f64 / acc.crops_total as f64;
+                let relax_pct = 100.0 * acc.crops_min_dim_relaxed as f64 / acc.crops_total as f64;
+                println!(
+                    "  full-height preserved:           {} / {} ({:.1}%)",
+                    acc.crops_full_person_height, acc.crops_total, full_pct
+                );
+                println!(
+                    "  min-dimension relaxed:           {} / {} ({:.1}%)",
+                    acc.crops_min_dim_relaxed, acc.crops_total, relax_pct
+                );
+            }
+            println!("──────────────────────────────────────────────────────────────\n");
+        }
     }
 }
 
@@ -234,5 +331,133 @@ mod tests {
         let v: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
         assert!((percentile(&v, 50) - 55.0).abs() < 0.1);
         assert!((percentile(&v, 100) - 100.0).abs() < 0.1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // AccuracyMetrics tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_accuracy_metrics_default_is_all_zero() {
+        let a = AccuracyMetrics::default();
+        assert_eq!(a.images_considered, 0);
+        assert_eq!(a.images_early_skipped, 0);
+        assert_eq!(a.crops_total, 0);
+        assert_eq!(a.crops_full_person_height, 0);
+        assert_eq!(a.crops_min_dim_relaxed, 0);
+    }
+
+    #[test]
+    fn test_record_accuracy_sums_fields() {
+        let mut batch = BatchMetrics::default();
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 5,
+            images_early_skipped: 1,
+            crops_total: 3,
+            crops_full_person_height: 2,
+            crops_min_dim_relaxed: 1,
+        });
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 3,
+            images_early_skipped: 2,
+            crops_total: 2,
+            crops_full_person_height: 1,
+            crops_min_dim_relaxed: 0,
+        });
+        assert_eq!(batch.accuracy.images_considered, 8);
+        assert_eq!(batch.accuracy.images_early_skipped, 3);
+        assert_eq!(batch.accuracy.crops_total, 5);
+        assert_eq!(batch.accuracy.crops_full_person_height, 3);
+        assert_eq!(batch.accuracy.crops_min_dim_relaxed, 1);
+    }
+
+    #[test]
+    fn test_print_summary_with_accuracy_does_not_panic() {
+        let mut batch = BatchMetrics::default();
+        batch.record(ImageMetrics {
+            person_detect: Duration::from_millis(100),
+            ..Default::default()
+        });
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 1,
+            images_early_skipped: 0,
+            crops_total: 2,
+            crops_full_person_height: 1,
+            crops_min_dim_relaxed: 0,
+        });
+        // Should not panic.
+        batch.print_summary();
+    }
+
+    #[test]
+    fn test_print_summary_omits_accuracy_when_all_zero() {
+        // When all accuracy counters are zero, accuracy block is omitted.
+        let batch = BatchMetrics::default();
+        batch.print_summary(); // Should be a no-op.
+    }
+
+    #[test]
+    fn test_print_summary_early_filter_only_does_not_panic() {
+        // images_considered > 0 but crops_total == 0 (all images skipped pre-inference).
+        let mut batch = BatchMetrics::default();
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 10,
+            images_early_skipped: 10,
+            ..Default::default()
+        });
+        batch.print_summary(); // Should print early-skip line without panic.
+    }
+
+    #[test]
+    fn test_print_summary_early_skip_percentage_line() {
+        // Verify the early-skip line is printed when images_considered > 0.
+        // (behavioral: just verify no panic and field sums correctly)
+        let mut batch = BatchMetrics::default();
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 8,
+            images_early_skipped: 3,
+            crops_total: 5,
+            crops_full_person_height: 4,
+            crops_min_dim_relaxed: 1,
+        });
+        batch.print_summary();
+        // Verify accumulated values match expectations.
+        assert_eq!(batch.accuracy.images_considered, 8);
+        assert_eq!(batch.accuracy.images_early_skipped, 3);
+    }
+
+    /// When crops_total > 0 but images_considered == 0, only crop-accuracy lines print.
+    #[test]
+    fn test_print_summary_crops_only_no_early_filter() {
+        let mut batch = BatchMetrics::default();
+        batch.record(ImageMetrics {
+            person_detect: Duration::from_millis(100),
+            ..Default::default()
+        });
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 0,
+            images_early_skipped: 0,
+            crops_total: 4,
+            crops_full_person_height: 3,
+            crops_min_dim_relaxed: 1,
+        });
+        // Must not panic; conceptually validates early-skip line is omitted.
+        batch.print_summary();
+        assert_eq!(batch.accuracy.images_considered, 0);
+        assert_eq!(batch.accuracy.crops_total, 4);
+    }
+
+    /// Gate 9 — When all images are early-skipped, crops_total stays at zero.
+    #[test]
+    fn test_early_skip_all_images_zero_crops() {
+        let mut batch = BatchMetrics::default();
+        batch.record_accuracy(AccuracyMetrics {
+            images_considered: 5,
+            images_early_skipped: 5,
+            ..Default::default()
+        });
+        assert_eq!(batch.accuracy.images_considered, 5);
+        assert_eq!(batch.accuracy.images_early_skipped, 5);
+        assert_eq!(batch.accuracy.crops_total, 0);
     }
 }

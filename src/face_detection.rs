@@ -138,20 +138,18 @@ pub fn detect_faces(image: &DynamicImage, detector: &FaceDetector) -> Result<Vec
         FaceDetectorBackend::YoloV10Face(model) => model,
     };
 
-    let tensor = model
-        .preprocess(std::slice::from_ref(image))
-        .map_err(|e| anyhow::anyhow!("Face detection preprocess failed: {e}"))?;
-
-    let (logits, boxes) = model
-        .forward(&tensor)
-        .map_err(|e| anyhow::anyhow!("Face detection forward failed: {e}"))?;
-
+    // M1: use `model.infer()` to reach the `infer_direct` hot path on both face
+    // backends, eliminating the Candle tensor round-trip and the thread_local/Mutex
+    // side-channel.  The three-step preprocess→forward→postprocess is now only used
+    // by callers that exercise the trait methods directly.
     let detections = model
-        .postprocess(logits, boxes)
-        .map_err(|e| anyhow::anyhow!("Face detection postprocess failed: {e}"))?;
+        .infer(image)
+        .map_err(|e| anyhow::anyhow!("Face detection failed: {e}"))?;
 
     // Convert from model-domain BBox (x_min, y_min, x_max, y_max) to
-    // crop-domain BBox (x1, y1, x2, y2). This is the single conversion boundary.
+    // crop-domain BBox (x1, y1, x2, y2). This is the single type-conversion boundary.
+    // Detections come from `apply_nms` which preserves the confidence-descending order
+    // from the per-anchor filter_map, so "sorted by confidence" holds after NMS.
     let face_bboxes: Vec<BBox> = detections
         .into_iter()
         .map(|d| BBox {

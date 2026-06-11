@@ -96,8 +96,14 @@ fn default_visibility_threshold() -> f32 {
 fn default_true() -> bool {
     true
 }
+fn default_false() -> bool {
+    false
+}
 fn default_dedup_iou_threshold() -> f32 {
     0.50
+}
+fn default_min_long_side_pixels() -> u32 {
+    1200
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +128,25 @@ pub struct CropConfig {
 
     #[serde(default = "default_true")]
     pub enable_directional_thirds: bool,
+
+    /// Enable joint person+face crop analysis (enhanced crops). Default `false`.
+    ///
+    /// When `false` (default), crops are byte-for-byte identical to the baseline.
+    /// Can also be enabled via the `--enhanced-crop` CLI flag; the CLI flag wins.
+    #[serde(default = "default_false")]
+    pub enable_enhanced_crop: bool,
+
+    /// Minimum acceptable output size measured from the long side of the photo (pixels).
+    ///
+    /// A single threshold applied to all three output categories via long-side semantics:
+    /// - `landscape` (21:9): enforces on crop width (the long side for wide crops).
+    /// - `portrait` (9:16) and `mobile` (9:21): enforces on crop height (the long side for tall crops).
+    ///
+    /// Comparing against `max(crop_w, crop_h)` is therefore orientation-correct with no
+    /// special-casing and no new aspect ratios. Default 1200. `0` disables the check.
+    /// CLI `--min-pixels` overrides this value when `--enhanced-crop` is active.
+    #[serde(default = "default_min_long_side_pixels")]
+    pub min_long_side_pixels: u32,
 }
 
 impl Default for CropConfig {
@@ -134,6 +159,8 @@ impl Default for CropConfig {
             enable_reflection_dedup: default_true(),
             dedup_iou_threshold: default_dedup_iou_threshold(),
             enable_directional_thirds: default_true(),
+            enable_enhanced_crop: default_false(),
+            min_long_side_pixels: default_min_long_side_pixels(),
         }
     }
 }
