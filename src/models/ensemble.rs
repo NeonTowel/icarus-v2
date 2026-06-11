@@ -70,33 +70,33 @@ pub struct SingleWdClassifier {
 }
 
 impl SingleWdClassifier {
-    pub fn wd_eva02() -> Result<Self> {
+    pub fn wd_eva02(thread_count: usize) -> Result<Self> {
         Ok(Self {
-            inner: WdTaggerOnnx::from_hub(CONFIG_WD_EVA02)?,
+            inner: WdTaggerOnnx::from_hub(CONFIG_WD_EVA02, 1, thread_count)?,
         })
     }
 
-    pub fn idolsankaku() -> Result<Self> {
+    pub fn idolsankaku(thread_count: usize) -> Result<Self> {
         Ok(Self {
-            inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU)?,
+            inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU, 1, thread_count)?,
         })
     }
 
-    pub fn wd_swinv2() -> Result<Self> {
+    pub fn wd_swinv2(thread_count: usize) -> Result<Self> {
         Ok(Self {
-            inner: WdTaggerOnnx::from_hub(CONFIG_WD_SWINV2)?,
+            inner: WdTaggerOnnx::from_hub(CONFIG_WD_SWINV2, 1, thread_count)?,
         })
     }
 
-    pub fn idolsankaku_swinv2() -> Result<Self> {
+    pub fn idolsankaku_swinv2(thread_count: usize) -> Result<Self> {
         Ok(Self {
-            inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU_SWINV2)?,
+            inner: WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU_SWINV2, 1, thread_count)?,
         })
     }
 
-    pub fn wd_vit() -> Result<Self> {
+    pub fn wd_vit(thread_count: usize) -> Result<Self> {
         Ok(Self {
-            inner: WdTaggerOnnx::from_hub(CONFIG_WD_VIT)?,
+            inner: WdTaggerOnnx::from_hub(CONFIG_WD_VIT, 1, thread_count)?,
         })
     }
 }
@@ -120,13 +120,21 @@ pub struct WdEnsembleClassifier {
 }
 
 impl WdEnsembleClassifier {
+    /// Build an ensemble from two model configs.
+    ///
+    /// `models_in_group = 2` is passed to each pool so that both pools together
+    /// stay within the RAM budget (S2 ensemble correction).
     pub fn from_configs(
         anime_config: WdTaggerConfig,
         real_config: WdTaggerConfig,
         display_name: &'static str,
+        thread_count: usize,
     ) -> Result<Self> {
-        let anime = WdTaggerOnnx::from_hub(anime_config)?;
-        let real = WdTaggerOnnx::from_hub(real_config)?;
+        // S2: pass models_in_group=2 so the cap is halved for each pool,
+        // preventing the 2× RAM overrun that would occur if each pool were
+        // budgeted independently.
+        let anime = WdTaggerOnnx::from_hub(anime_config, 2, thread_count)?;
+        let real = WdTaggerOnnx::from_hub(real_config, 2, thread_count)?;
         Ok(Self {
             anime,
             real,
@@ -134,19 +142,21 @@ impl WdEnsembleClassifier {
         })
     }
 
-    pub fn fast() -> Result<Self> {
+    pub fn fast(thread_count: usize) -> Result<Self> {
         Self::from_configs(
             CONFIG_WD_SWINV2,
             CONFIG_IDOLSANKAKU_SWINV2,
             "wd-ensemble-fast (swinv2 + idolsankaku-swinv2)",
+            thread_count,
         )
     }
 
-    pub fn accurate() -> Result<Self> {
+    pub fn accurate(thread_count: usize) -> Result<Self> {
         Self::from_configs(
             CONFIG_WD_EVA02,
             CONFIG_IDOLSANKAKU,
             "wd-ensemble-accurate (eva02-large + idolsankaku-eva02-large)",
+            thread_count,
         )
     }
 }

@@ -8,7 +8,6 @@ use icarus_v2::config::{
     CropConfig,
 };
 use icarus_v2::directory_walker::discover_images;
-use icarus_v2::face_detection::load_face_detector;
 use icarus_v2::models::load_candle_model;
 use std::path::PathBuf;
 
@@ -135,12 +134,17 @@ async fn main() -> Result<()> {
     validate_args(&args)?;
     let crop_config = build_crop_config(&args)?;
     let artistic_config = build_artistic_config(&args)?;
-    let (model, face_detector) = load_models(&args).await?;
+    // Compute thread_count before model loading so SessionPool can tune intra_op_threads (S3).
+    let thread_count = resolve_thread_count(args.threads, available_core_count());
+    let (model, face_detector) = load_models(&args, thread_count).await?;
     let classifier = if args.classify_output || args.classify_only {
         let kind = args
             .classifier
             .parse::<icarus_v2::models::ClassifierKind>()?;
-        Some(icarus_v2::models::load_classifier(kind, &candle_core::Device::Cpu).await?)
+        Some(
+            icarus_v2::models::load_classifier(kind, &candle_core::Device::Cpu, thread_count)
+                .await?,
+        )
     } else {
         None
     };
@@ -173,7 +177,7 @@ async fn main() -> Result<()> {
         collect_metrics: args.metrics,
     };
 
-    dispatch(&args, &context).await
+    dispatch(&args, &context, thread_count).await
 }
 
 fn validate_args(args: &Args) -> Result<()> {
@@ -239,6 +243,7 @@ fn build_artistic_config(args: &Args) -> Result<ArtisticCropConfig> {
 
 async fn load_models(
     args: &Args,
+    thread_count: usize,
 ) -> Result<(
     Box<dyn icarus_v2::models::Model>,
     icarus_v2::face_detection::FaceDetector,
@@ -252,17 +257,19 @@ async fn load_models(
     }
 
     let device = Device::Cpu;
-    let model = load_candle_model(&args.model, &device)
+    let model = load_candle_model(&args.model, &device, thread_count)
         .await
         .with_context(|| format!("Failed to load model '{}'", args.model))?;
-    let face_detector = tokio::task::spawn_blocking(load_face_detector)
-        .await
-        .map_err(|error| anyhow::anyhow!("face model load task panicked: {error}"))??;
+    let face_detector = tokio::task::spawn_blocking(move || {
+        icarus_v2::face_detection::load_face_detector(thread_count)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("face model load task panicked: {error}"))??;
 
     Ok((model, face_detector))
 }
 
-async fn dispatch(args: &Args, context: &ProcessingContext<'_>) -> Result<()> {
+async fn dispatch(args: &Args, context: &ProcessingContext<'_>, thread_count: usize) -> Result<()> {
     let input_metadata = std::fs::metadata(&args.input)
         .with_context(|| format!("Cannot access input path: {:?}", args.input))?;
 
@@ -324,7 +331,6 @@ async fn dispatch(args: &Args, context: &ProcessingContext<'_>) -> Result<()> {
         println!("Found {} image(s) to process.", image_paths.len());
     }
 
-    let thread_count = resolve_thread_count(args.threads, available_core_count());
     if !args.quiet {
         println!(
             "Using {} worker thread(s) for batch processing.",

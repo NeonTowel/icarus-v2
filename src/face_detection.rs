@@ -67,8 +67,12 @@ pub struct FaceDetector {
 ///
 /// This is a **blocking** operation. In async code, call from a blocking context:
 /// ```rust,ignore
-/// let detector = tokio::task::spawn_blocking(load_face_detector).await??;
+/// let detector = tokio::task::spawn_blocking(|| load_face_detector(thread_count)).await??;
 /// ```
+///
+/// # Parameters
+/// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool` for
+///   `intra_op_threads` tuning (S3). Use `resolve_thread_count` output from main.
 ///
 /// # Errors
 /// Returns `Err` if:
@@ -80,20 +84,23 @@ pub struct FaceDetector {
 ///
 /// # Example
 /// ```rust,ignore
-/// let detector = load_face_detector().expect("face model should load");
+/// let detector = load_face_detector(thread_count).expect("face model should load");
 /// ```
-pub fn load_face_detector() -> Result<FaceDetector> {
+pub fn load_face_detector(thread_count: usize) -> Result<FaceDetector> {
     let device = Device::Cpu;
-    let model = YoloV11xFaceOrt::from_hub(&device)?;
+    let model = YoloV11xFaceOrt::from_hub(&device, thread_count)?;
     Ok(FaceDetector {
         backend: FaceDetectorBackend::YoloV11xFace(model),
     })
 }
 
 /// Load the YOLOv10-face detector from HuggingFace Hub cache.
-pub fn load_fast_face_detector() -> Result<FaceDetector> {
+///
+/// # Parameters
+/// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool`.
+pub fn load_fast_face_detector(thread_count: usize) -> Result<FaceDetector> {
     let device = Device::Cpu;
-    let model = YoloV10FaceOrt::from_hub(&device)?;
+    let model = YoloV10FaceOrt::from_hub(&device, thread_count)?;
     Ok(FaceDetector {
         backend: FaceDetectorBackend::YoloV10Face(model),
     })
@@ -173,7 +180,7 @@ mod tests {
     /// If the cache is empty, the test will attempt to download (~60 MB).
     #[test]
     fn test_load_face_detector_succeeds() {
-        if let Err(error) = load_face_detector() {
+        if let Err(error) = load_face_detector(1) {
             eprintln!("Skipping test (model not available): {error}");
         }
     }
@@ -181,7 +188,7 @@ mod tests {
     /// Smoke test: the fast face detector model can be loaded from HF Hub cache.
     #[test]
     fn test_load_fast_face_detector_succeeds() {
-        if let Err(error) = load_fast_face_detector() {
+        if let Err(error) = load_fast_face_detector(1) {
             eprintln!("Skipping test (model not available): {error}");
         }
     }
@@ -189,7 +196,7 @@ mod tests {
     /// Blank images should produce zero detections (not an error).
     #[test]
     fn test_detect_faces_on_blank_image_returns_empty() {
-        let detector = match load_face_detector() {
+        let detector = match load_face_detector(1) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Skipping test (model not available): {e}");

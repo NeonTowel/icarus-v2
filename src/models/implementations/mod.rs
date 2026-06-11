@@ -51,9 +51,11 @@ macro_rules! define_candle_wrapper {
                 Self::from_hub(device)
             }
 
+            /// Legacy wrapper. Uses `thread_count=1` (single-session fallback) since
+            /// these stubs are not wired into the live batch pipeline.
             pub fn from_hub(device: &Device) -> anyhow::Result<Self> {
                 Ok(Self {
-                    inner: YOLOv10Ort::from_hub(device)?,
+                    inner: YOLOv10Ort::from_hub(device, 1)?,
                 })
             }
 

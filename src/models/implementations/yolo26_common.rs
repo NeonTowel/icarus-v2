@@ -3,27 +3,25 @@
 //! YOLO26 uses the same end-to-end `[1, 300, 6]` detection format as YOLOv10,
 //! so preprocessing and decoding mirror the YOLOv10 implementation while keeping
 //! the YOLO26-specific HuggingFace repository and variant metadata isolated here.
+//!
+//! ## Fix 12 — Per-thread SessionPool (Strategy B)
+//!
+//! Replaces the single `Mutex<Session>` with a [`SessionPool`] so each Rayon worker
+//! thread gets its own ORT session, eliminating mutex contention on the person
+//! detection stage.
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
 use image::{imageops::FilterType, DynamicImage};
 use ndarray::Array;
-use ort::{
-    inputs,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
-};
+use ort::{inputs, value::TensorRef};
 use std::cell::RefCell;
-use std::sync::Mutex;
+
+use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
+use crate::models::session_pool::{SessionPool, YOLO26_FOOTPRINT_MB};
 
 thread_local! {
     static YOLO26_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
 }
-
-// M7 Decision: use ORT default (no explicit with_intra_threads).
-// Strategy A (intra_threads=1) was benchmarked as 10× slower on 10-core hardware.
-// See yolov10_common.rs M7 decision comment for full analysis.
-
-use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
 
 /// Model input width and height in pixels.
 pub(super) const MODEL_W: u32 = 640;
@@ -41,12 +39,20 @@ pub(super) struct YOLOv26VariantConfig {
 
 /// Shared inference state for any YOLO26 ONNX Runtime variant.
 pub(super) struct YOLOv26OrtInner {
-    session: Mutex<Session>,
+    /// Per-worker session pool (Fix 12 / Strategy B).
+    session: SessionPool,
 }
 
 impl YOLOv26OrtInner {
-    /// Download the ONNX model from HuggingFace Hub and create an ORT session.
-    pub fn from_hub(config: &YOLOv26VariantConfig, _device: &Device) -> anyhow::Result<Self> {
+    /// Download the ONNX model from HuggingFace Hub and create a session pool.
+    ///
+    /// # Parameters
+    /// - `thread_count`: Active Rayon thread count; used to tune `intra_op_threads`.
+    pub fn from_hub(
+        config: &YOLOv26VariantConfig,
+        _device: &Device,
+        thread_count: usize,
+    ) -> anyhow::Result<Self> {
         let api = Api::new()?;
         let repo = api.model(config.hf_repo.to_string());
         let model_path = repo.get(config.hf_filename)?;
@@ -57,17 +63,16 @@ impl YOLOv26OrtInner {
             model_path
         );
 
-        // Use ORT default thread count. See M7 decision comment above.
-        let session = Session::builder()
-            .map_err(|error| anyhow::anyhow!("ort Session builder failed: {error}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| anyhow::anyhow!("ort optimisation level failed: {error}"))?
-            .commit_from_file(&model_path)
-            .map_err(|error| anyhow::anyhow!("ort session load failed: {error}"))?;
+        let session = SessionPool::new(
+            model_path,
+            config.display_name,
+            YOLO26_FOOTPRINT_MB,
+            1, // single detection model
+            thread_count,
+        )
+        .map_err(|e| anyhow::anyhow!("YOLO26 session pool: {e}"))?;
 
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        Ok(Self { session })
     }
 
     /// Resize an image to the model input size and normalise pixels to `[0, 1]`.
@@ -115,21 +120,20 @@ impl YOLOv26OrtInner {
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|error| candle_core::Error::Msg(format!("ort TensorRef failed: {error}")))?;
 
-        let mut session_guard = self
-            .session
-            .lock()
-            .map_err(|error| candle_core::Error::Msg(format!("session lock failed: {error}")))?;
-        let outputs = session_guard
-            .run(inputs!["images" => tensor_ref])
-            .map_err(|error| candle_core::Error::Msg(format!("ort inference failed: {error}")))?;
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
 
-        let (_shape, raw) = outputs["output0"]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| {
-                candle_core::Error::Msg(format!("ort extract output0 failed: {error}"))
-            })?;
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
 
-        decode_output0(raw.to_vec(), orig_w, orig_h)
+                decode_output0(raw.to_vec(), orig_w, orig_h)
+                    .map_err(|e| anyhow::anyhow!("yolo26 decode failed: {e}"))
+            })
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     /// Return the COCO class names used by all YOLO26 variants.

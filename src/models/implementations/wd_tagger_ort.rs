@@ -10,14 +10,11 @@ use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
 use image::{DynamicImage, ImageBuffer, Rgb, RgbImage};
 use ndarray::Array4;
-use ort::{
-    inputs,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
-};
+use ort::{inputs, value::TensorRef};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use crate::models::session_pool::{SessionPool, WD_BASE_FOOTPRINT_MB, WD_LARGE_FOOTPRINT_MB};
 
 #[derive(Debug, Clone, Copy)]
 pub enum RatingLayoutKind {
@@ -116,7 +113,8 @@ impl RatingLayout {
 
 pub struct WdTaggerOnnx {
     config: WdTaggerConfig,
-    session: Mutex<Session>,
+    /// Per-worker session pool (Fix 12 / Strategy B).
+    pool: SessionPool,
     rating_layout: RatingLayout,
     input_size: u32,
 }
@@ -212,7 +210,19 @@ fn download_hf_text_file_via_raw_url(repo: &str, filename: &str) -> Result<PathB
 }
 
 impl WdTaggerOnnx {
-    pub fn from_hub(config: WdTaggerConfig) -> Result<Self> {
+    /// Download the ONNX model and CSV labels from HuggingFace Hub and create a session pool.
+    ///
+    /// # Parameters
+    /// - `config`: Model configuration (repo, filenames, input size, rating layout).
+    /// - `models_in_group`: 1 for single models; 2 for ensembles. Used to correct the
+    ///   RAM cap so that all co-resident pools together stay within budget (S2).
+    /// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool` for
+    ///   `intra_op_threads` tuning (S3).
+    pub fn from_hub(
+        config: WdTaggerConfig,
+        models_in_group: usize,
+        thread_count: usize,
+    ) -> Result<Self> {
         let api = Api::new().context("HF Hub API init")?;
         let repo = api.model(config.hf_repo.to_string());
 
@@ -239,18 +249,27 @@ impl WdTaggerOnnx {
             rating_layout
         );
 
-        // Use ORT default thread count. See M7 decision in yolov10_common.rs.
-        let session = Session::builder()
-            .map_err(|error| anyhow::anyhow!("ort Session::builder: {error}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| anyhow::anyhow!("ort optimization level: {error}"))?
-            .commit_from_file(&onnx_path)
-            .map_err(|error| anyhow::anyhow!("ort load model from {:?}: {error}", onnx_path))?;
+        // Choose footprint estimate based on model architecture class.
+        // EVA02-Large / ViT-Large → ~1.2-1.5 GB; SwinV2-Base / ViT-Base → ~400-500 MB.
+        let footprint_mb = if config.hf_repo.to_ascii_lowercase().contains("large") {
+            WD_LARGE_FOOTPRINT_MB
+        } else {
+            WD_BASE_FOOTPRINT_MB
+        };
+
+        let pool = SessionPool::new(
+            onnx_path,
+            config.display_name,
+            footprint_mb,
+            models_in_group,
+            thread_count,
+        )
+        .with_context(|| format!("create session pool for {}", config.display_name))?;
 
         Ok(Self {
             input_size: config.input_size,
             config,
-            session: Mutex::new(session),
+            pool,
             rating_layout,
         })
     }
@@ -260,31 +279,28 @@ impl WdTaggerOnnx {
         let tensor_ref = TensorRef::from_array_view(&input)
             .map_err(|error| anyhow::anyhow!("ort TensorRef: {error}"))?;
 
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| anyhow::anyhow!("ort session mutex poisoned"))?;
+        self.pool.with_session(|session| {
+            let outputs = session
+                .run(inputs![tensor_ref])
+                .map_err(|error| anyhow::anyhow!("ort inference: {error}"))?;
 
-        let outputs = session
-            .run(inputs![tensor_ref])
-            .map_err(|error| anyhow::anyhow!("ort inference: {error}"))?;
+            let (_shape, all_logits) = outputs[0]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| anyhow::anyhow!("ort extract output: {error}"))?;
 
-        let (_shape, all_logits) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| anyhow::anyhow!("ort extract output: {error}"))?;
+            let max_index = self.rating_layout.max_index();
+            if all_logits.len() <= max_index {
+                anyhow::bail!(
+                    "model output length {} is too short for rating index {} (model={}, repo={})",
+                    all_logits.len(),
+                    max_index,
+                    self.config.display_name,
+                    self.config.hf_repo
+                );
+            }
 
-        let max_index = self.rating_layout.max_index();
-        if all_logits.len() <= max_index {
-            anyhow::bail!(
-                "model output length {} is too short for rating index {} (model={}, repo={})",
-                all_logits.len(),
-                max_index,
-                self.config.display_name,
-                self.config.hf_repo
-            );
-        }
-
-        Ok(self.rating_layout.extract_4slot(all_logits))
+            Ok(self.rating_layout.extract_4slot(all_logits))
+        })
     }
 
     pub fn display_name(&self) -> &'static str {
@@ -445,7 +461,7 @@ mod tests {
     #[test]
     #[ignore]
     fn smoke_test_wd_eva02_returns_valid_sigmoid_ratings() {
-        let model = WdTaggerOnnx::from_hub(CONFIG_WD_EVA02)
+        let model = WdTaggerOnnx::from_hub(CONFIG_WD_EVA02, 1, 1)
             .expect("wd-eva02 download and load should succeed");
         let image =
             DynamicImage::ImageRgb8(ImageBuffer::from_pixel(600, 400, Rgb([128, 128, 128])));
@@ -479,7 +495,7 @@ mod tests {
     #[test]
     #[ignore]
     fn smoke_test_idolsankaku_loads_and_runs_at_480() {
-        let model = WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU)
+        let model = WdTaggerOnnx::from_hub(CONFIG_IDOLSANKAKU, 1, 1)
             .expect("idolsankaku download and load should succeed");
         assert_eq!(model.input_size, 480);
 

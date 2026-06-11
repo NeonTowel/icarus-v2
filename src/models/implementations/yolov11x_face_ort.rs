@@ -13,19 +13,25 @@
 /// All heavy lifting (session management, graph optimisation, execution providers) is
 /// delegated to ONNX Runtime.
 ///
+/// ## Fix 12 — Per-thread SessionPool (Strategy B)
+///
+/// Replaces the single `Mutex<Session>` with a [`SessionPool`] so that each Rayon worker
+/// thread can hold its own session, eliminating mutex contention on the dominant
+/// always-on pipeline cost (face detection: ~4233 ms/image on M7 baseline).
+///
 /// # Model source
 /// `AdamCodd/YOLOv11x-face-detection` → `model.onnx` (~60 MB).
 /// Downloaded on first use from HuggingFace Hub; cached in `~/.cache/huggingface/`.
 ///
 /// # Thread safety
-/// [`YoloV11xFaceOrt`] is `Send + Sync`. Image dimensions are stored in a
-/// `Mutex<Option<(u32, u32)>>` because `preprocess` and `postprocess` share state
-/// across two separate `&self` calls.
+/// [`YoloV11xFaceOrt`] is `Send + Sync`. The [`SessionPool`] is `Send + Sync`.
+/// Image dimensions are stored in a `thread_local!` `RefCell` because `preprocess`
+/// and `postprocess` share state across two separate `&self` calls.
 ///
 /// # Example
 /// ```rust,ignore
 /// let device = candle_core::Device::Cpu;
-/// let model = YoloV11xFaceOrt::from_hub(&device)?;
+/// let model = YoloV11xFaceOrt::from_hub(&device, thread_count)?;
 /// let tensor = model.preprocess(&[full_image])?;
 /// let (logits, boxes) = model.forward(&tensor)?;
 /// let faces = model.postprocess(logits, boxes)?;
@@ -34,15 +40,11 @@ use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
 use image::{imageops::FilterType, DynamicImage};
 use ndarray::Array;
-use ort::{
-    inputs,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
-};
+use ort::{inputs, value::TensorRef};
 use std::cell::RefCell;
-use std::sync::Mutex;
 
 use crate::models::candle_backend::{apply_nms, BBox, Detection, Model};
+use crate::models::session_pool::{SessionPool, YOLOV11X_FACE_FOOTPRINT_MB};
 
 thread_local! {
     static YOLOV11X_FACE_PENDING_DIMS: RefCell<Option<(u32, u32)>> = const { RefCell::new(None) };
@@ -51,8 +53,6 @@ thread_local! {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-// M7 Decision: use ORT default. See yolov10_common.rs M7 decision comment.
 
 /// HuggingFace Hub repository for YOLOv11x-Face ONNX weights.
 const HF_REPO: &str = "AdamCodd/YOLOv11x-face-detection";
@@ -77,28 +77,29 @@ const FACE_CLASSES: &[&str] = &["face"];
 // YoloV11xFaceOrt struct
 // ---------------------------------------------------------------------------
 
-/// YOLOv11x-Face detector backed by ONNX Runtime.
+/// YOLOv11x-Face detector backed by ONNX Runtime with per-thread session pool.
 ///
 /// Downloads `model.onnx` from `AdamCodd/YOLOv11x-face-detection` on HuggingFace Hub
-/// on first use. The model is loaded into an ORT session and evaluated via `ort::Session::run`.
+/// on first use. The model is loaded into a [`SessionPool`] — each Rayon worker gets
+/// its own session, eliminating the pre-pool mutex contention.
 ///
 /// This struct is `Send + Sync` and can be shared across async inference tasks via `Arc`.
 ///
 /// # Example
 /// ```rust,ignore
 /// let device = candle_core::Device::Cpu;
-/// let model = YoloV11xFaceOrt::from_hub(&device)?;
+/// let model = YoloV11xFaceOrt::from_hub(&device, thread_count)?;
 /// let tensor = model.preprocess(&[image])?;
 /// let (logits, _boxes) = model.forward(&tensor)?;
 /// let faces = model.postprocess(logits, _boxes)?;
 /// ```
 pub struct YoloV11xFaceOrt {
-    /// ONNX Runtime session; `run()` requires `&mut Session`, so wrapped in Mutex.
-    session: Mutex<Session>,
+    /// Per-worker session pool (Fix 12 / Strategy B).
+    session: SessionPool,
 }
 
 impl YoloV11xFaceOrt {
-    /// Download the YOLOv11x-Face ONNX model from HuggingFace Hub and initialise the ORT session.
+    /// Download the YOLOv11x-Face ONNX model from HuggingFace Hub and initialise the pool.
     ///
     /// The `device` parameter is accepted for API compatibility but is not used —
     /// ONNX Runtime manages its own execution providers (CPU by default).
@@ -107,14 +108,18 @@ impl YoloV11xFaceOrt {
     /// Subsequent calls use the local HF Hub cache (`~/.cache/huggingface/hub/`)
     /// with no network I/O.
     ///
+    /// # Parameters
+    /// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool` for
+    ///   `intra_op_threads` tuning (S3).
+    ///
     /// # Errors
     /// Returns `Err` if the download fails or the ONNX session cannot be created.
     ///
     /// # Example
     /// ```rust,ignore
-    /// let model = YoloV11xFaceOrt::from_hub(&Device::Cpu)?;
+    /// let model = YoloV11xFaceOrt::from_hub(&Device::Cpu, thread_count)?;
     /// ```
-    pub fn from_hub(_device: &Device) -> anyhow::Result<Self> {
+    pub fn from_hub(_device: &Device, thread_count: usize) -> anyhow::Result<Self> {
         let api = Api::new()?;
         let repo = api.model(HF_REPO.to_string());
         let model_path = repo.get(HF_FILENAME)?;
@@ -124,19 +129,18 @@ impl YoloV11xFaceOrt {
             model_path
         );
 
-        // Use ORT default thread count. See M7 decision comment above.
-        let session = Session::builder()
-            .map_err(|e| anyhow::anyhow!("ort Session builder failed: {e}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("ort optimisation level failed: {e}"))?
-            .commit_from_file(&model_path)
-            .map_err(|e| anyhow::anyhow!("ort session load failed: {e}"))?;
+        let session = SessionPool::new(
+            model_path,
+            "yolov11x-face",
+            YOLOV11X_FACE_FOOTPRINT_MB,
+            1, // single face detection model
+            thread_count,
+        )
+        .map_err(|e| anyhow::anyhow!("YOLOv11x-Face session pool: {e}"))?;
 
-        log::info!("yolov11x-face-ort: ONNX session created successfully");
+        log::info!("yolov11x-face-ort: session pool created successfully");
 
-        Ok(Self {
-            session: Mutex::new(session),
-        })
+        Ok(Self { session })
     }
 }
 
@@ -177,14 +181,15 @@ impl Model for YoloV11xFaceOrt {
         Ok((xs.clone(), xs.clone()))
     }
 
-    /// Run ORT inference, decode YOLOv11 anchors, and scale bboxes to original image space.
+    /// Run ORT inference via the session pool, decode YOLOv11 anchors, and scale
+    /// bboxes to original image space.
     ///
     /// The model output `output0` has shape `[1, 5, 8400]`. Each of the 8400 anchor slots
     /// encodes `[cx, cy, w, h, confidence]` in 640×640 model coordinate space.
     ///
     /// Steps:
     /// 1. Convert Candle tensor → ndarray for the ORT input.
-    /// 2. Run ORT session.
+    /// 2. Acquire a session from the pool (thread-local fast path or fallback).
     /// 3. Decode anchors: filter by confidence, convert cx/cy/w/h → x_min/y_min/x_max/y_max.
     /// 4. Scale from 640×640 model space → original image dimensions.
     /// 5. Apply NMS to suppress overlapping boxes.
@@ -206,80 +211,82 @@ impl Model for YoloV11xFaceOrt {
             Array::from_shape_vec((1usize, 3usize, MODEL_H as usize, MODEL_W as usize), data)
                 .map_err(|e| candle_core::Error::Msg(format!("ndarray reshape failed: {e}")))?;
 
-        // Run ORT inference.
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|e| candle_core::Error::Msg(format!("ort TensorRef failed: {e}")))?;
-        let mut session_guard = self.session.lock().unwrap();
-        let outputs = session_guard
-            .run(inputs!["images" => tensor_ref])
-            .map_err(|e| candle_core::Error::Msg(format!("ort inference failed: {e}")))?;
 
-        let (_shape, raw) = outputs["output0"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| candle_core::Error::Msg(format!("ort extract output0 failed: {e}")))?;
+        // Acquire a per-thread (or fallback) session from the pool and run inference.
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
 
-        // output0 shape: [1, 5, 8400] — layout is [batch, features, anchors].
-        // features = [cx, cy, w, h, confidence].
-        // We have batch=1, so the flat layout is:
-        //   [cx_0..cx_8399, cy_0..cy_8399, w_0..w_8399, h_0..h_8399, conf_0..conf_8399]
-        let values: Vec<f32> = raw.to_vec();
-        let num_anchors = 8400usize;
-        let num_features = 5usize;
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
 
-        // Validate that the output has the expected number of elements.
-        if values.len() != num_features * num_anchors {
-            return Err(candle_core::Error::Msg(format!(
-                "yolov11x-face-ort: unexpected output0 size {} (expected {})",
-                values.len(),
-                num_features * num_anchors
-            )));
-        }
+                // output0 shape: [1, 5, 8400] — layout is [batch, features, anchors].
+                // features = [cx, cy, w, h, confidence].
+                // Flat layout: [cx_0..cx_8399, cy_0..cy_8399, w_0..w_8399, h_0..h_8399, conf_0..conf_8399]
+                let values: Vec<f32> = raw.to_vec();
+                let num_anchors = 8400usize;
+                let num_features = 5usize;
 
-        let scale_x = orig_w as f32 / MODEL_W as f32;
-        let scale_y = orig_h as f32 / MODEL_H as f32;
-
-        // Decode anchor slots: output is transposed ([features, anchors]),
-        // so feature `f` for anchor `i` is at index `f * num_anchors + i`.
-        let pre_nms: Vec<Detection> = (0..num_anchors)
-            .filter_map(|i| {
-                let cx = values[i];
-                let cy = values[num_anchors + i];
-                let w = values[2 * num_anchors + i];
-                let h = values[3 * num_anchors + i];
-                let confidence = values[4 * num_anchors + i];
-
-                if confidence < DEFAULT_CONF_THRESHOLD {
-                    return None;
+                if values.len() != num_features * num_anchors {
+                    anyhow::bail!(
+                        "yolov11x-face-ort: unexpected output0 size {} (expected {})",
+                        values.len(),
+                        num_features * num_anchors
+                    );
                 }
 
-                // Convert centre-format → corner-format in model coordinate space,
-                // then scale to original image dimensions.
-                let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
-                let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
-                let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
-                let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
+                let scale_x = orig_w as f32 / MODEL_W as f32;
+                let scale_y = orig_h as f32 / MODEL_H as f32;
 
-                // Reject degenerate boxes.
-                if x_max <= x_min || y_max <= y_min {
-                    return None;
-                }
+                // Decode anchor slots: output is transposed ([features, anchors]),
+                // so feature `f` for anchor `i` is at index `f * num_anchors + i`.
+                let pre_nms: Vec<Detection> = (0..num_anchors)
+                    .filter_map(|i| {
+                        let cx = values[i];
+                        let cy = values[num_anchors + i];
+                        let w = values[2 * num_anchors + i];
+                        let h = values[3 * num_anchors + i];
+                        let confidence = values[4 * num_anchors + i];
 
-                Some(Detection {
-                    bbox: BBox {
-                        x_min,
-                        y_min,
-                        x_max,
-                        y_max,
-                    },
-                    class_id: 0,
-                    confidence,
-                    class_name: "face".to_string(),
-                })
+                        if confidence < DEFAULT_CONF_THRESHOLD {
+                            return None;
+                        }
+
+                        // Convert centre-format → corner-format in model coordinate space,
+                        // then scale to original image dimensions.
+                        let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
+                        let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
+                        let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
+                        let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
+
+                        // Reject degenerate boxes.
+                        if x_max <= x_min || y_max <= y_min {
+                            return None;
+                        }
+
+                        Some(Detection {
+                            bbox: BBox {
+                                x_min,
+                                y_min,
+                                x_max,
+                                y_max,
+                            },
+                            class_id: 0,
+                            confidence,
+                            class_name: "face".to_string(),
+                        })
+                    })
+                    .collect();
+
+                // Apply NMS to suppress overlapping face boxes.
+                Ok(apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD))
             })
-            .collect();
-
-        // Apply NMS to suppress overlapping face boxes.
-        Ok(apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD))
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     fn classes(&self) -> &[&str] {
@@ -407,13 +414,13 @@ mod tests {
 
     /// Minimal Model stub to exercise the preprocess logic without a live ORT session.
     struct PreprocessStub {
-        pending_dims: Mutex<Option<(u32, u32)>>,
+        pending_dims: std::sync::Mutex<Option<(u32, u32)>>,
     }
 
     impl PreprocessStub {
         fn new() -> Self {
             Self {
-                pending_dims: Mutex::new(None),
+                pending_dims: std::sync::Mutex::new(None),
             }
         }
 

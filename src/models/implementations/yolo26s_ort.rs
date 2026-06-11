@@ -18,10 +18,10 @@ pub struct YOLOv26sOrt {
 }
 
 impl YOLOv26sOrt {
-    /// Download the YOLO26s ONNX model from HuggingFace Hub and initialise the session.
-    pub fn from_hub(device: &Device) -> anyhow::Result<Self> {
+    /// Download the YOLO26s ONNX model from HuggingFace Hub and initialise the session pool.
+    pub fn from_hub(device: &Device, thread_count: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: YOLOv26OrtInner::from_hub(&VARIANT_CONFIG, device)?,
+            inner: YOLOv26OrtInner::from_hub(&VARIANT_CONFIG, device, thread_count)?,
         })
     }
 }

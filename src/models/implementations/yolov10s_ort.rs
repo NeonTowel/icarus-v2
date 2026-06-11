@@ -18,10 +18,10 @@ pub struct YOLOv10sOrt {
 }
 
 impl YOLOv10sOrt {
-    /// Download the YOLOv10s ONNX model from HuggingFace Hub and initialise the session.
-    pub fn from_hub(device: &Device) -> anyhow::Result<Self> {
+    /// Download the YOLOv10s ONNX model from HuggingFace Hub and initialise the session pool.
+    pub fn from_hub(device: &Device, thread_count: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: YOLOv10OrtInner::from_hub(&VARIANT_CONFIG, device)?,
+            inner: YOLOv10OrtInner::from_hub(&VARIANT_CONFIG, device, thread_count)?,
         })
     }
 }

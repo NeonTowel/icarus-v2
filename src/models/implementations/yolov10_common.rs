@@ -17,41 +17,26 @@
 //! normal batch pipeline (which calls [`Model::infer`] → [`infer_direct`] instead) but
 //! are retained so the trait contract is fulfillable by any code that calls them directly.
 //!
-//! ## M7 — Strategy A: right-sized ORT intra-op threads
+//! ## Fix 12 — Per-thread SessionPool (Strategy B)
 //!
-//! [`ORT_INTRA_OP_THREADS`] is set to `1` so that ONNX Runtime does not compete with
-//! the Rayon worker pool for CPU cores. With one shared `Mutex<Session>`, ORT inference
-//! is already serialised; giving it all cores would starve the Rayon workers that handle
-//! image I/O and crop geometry in parallel.
+//! Replaces the single `Mutex<Session>` with a [`SessionPool`] so each Rayon worker
+//! thread can hold its own ORT session, eliminating serialised inference. The pool
+//! falls back to a shared locked session when the RAM-derived cap is reached, so
+//! degradation is graceful. `intra_op_threads` is sized to `cores / min(threads, cap)`
+//! to prevent CPU oversubscription.
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
 use image::{imageops::FilterType, DynamicImage};
 use ndarray::Array;
-use ort::{
-    inputs,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
-};
+use ort::{inputs, value::TensorRef};
 use std::sync::Mutex;
 
 use crate::models::candle_backend::{BBox, Detection, COCO_CLASSES};
+use crate::models::session_pool::{SessionPool, YOLOV10_FOOTPRINT_MB};
 
 /// Model input width and height in pixels.
 pub(super) const MODEL_W: u32 = 640;
 pub(super) const MODEL_H: u32 = 640;
-
-// M7 Decision: ORT default thread count (no explicit with_intra_threads call).
-//
-// Strategy A (with_intra_threads=1) was benchmarked and found 10× slower per image
-// on a 10-core machine (person_detect: 440ms vs ~44ms; face_detect: 8200ms vs ~820ms).
-// The expected oversubscription does not occur in practice: sleeping Rayon workers
-// (blocked on Mutex<Session>) do not consume CPU cycles while ORT holds the lock.
-// Therefore, letting ORT use all available cores is optimal for the current serialised
-// single-session architecture.
-//
-// TODO (M7 follow-up): implement Strategy B (per-worker sessions, intra_threads=1)
-// gated by RAM availability. RAM cost: ~400MB × workers for wd-vit; NOT viable for
-// wd-ensemble-accurate (~4–6GB × N workers = 20–30GB for 5 workers).
 
 /// Configuration for a specific YOLOv10 model variant.
 pub(super) struct YOLOv10VariantConfig {
@@ -64,22 +49,30 @@ pub(super) struct YOLOv10VariantConfig {
 }
 
 /// Shared inference state for any YOLOv10 ONNX Runtime variant.
+///
+/// Holds a [`SessionPool`] (one ORT session per Rayon worker, bounded by RAM)
+/// and a legacy `pending_dims` mutex for the `preprocess → postprocess` stub path.
 pub(super) struct YOLOv10OrtInner {
-    session: Mutex<Session>,
+    /// Per-worker session pool (Fix 12 / Strategy B).
+    session: SessionPool,
     /// Stores image dimensions for the legacy `preprocess → postprocess` stub path.
     ///
     /// **Not used by the hot path**: [`infer_direct`] keeps dimensions on the stack.
     /// This field exists solely so that callers that invoke `preprocess` + `postprocess`
     /// directly (bypassing [`Model::infer`]) still get correct output.
-    ///
-    /// Concurrency note: concurrent `preprocess` calls from different Rayon workers can
-    /// race on this value. This is acceptable because the hot path never writes here.
     pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
 impl YOLOv10OrtInner {
-    /// Download the ONNX model from HuggingFace Hub and create an ORT session.
-    pub fn from_hub(config: &YOLOv10VariantConfig, _device: &Device) -> anyhow::Result<Self> {
+    /// Download the ONNX model from HuggingFace Hub and create a session pool.
+    ///
+    /// # Parameters
+    /// - `thread_count`: Active Rayon thread count; used to tune `intra_op_threads`.
+    pub fn from_hub(
+        config: &YOLOv10VariantConfig,
+        _device: &Device,
+        thread_count: usize,
+    ) -> anyhow::Result<Self> {
         let api = Api::new()?;
         let repo = api.model(config.hf_repo.to_string());
         let model_path = repo.get(config.hf_filename)?;
@@ -90,16 +83,17 @@ impl YOLOv10OrtInner {
             model_path
         );
 
-        // Use ORT default thread count (all available cores). See M7 decision comment above.
-        let session = Session::builder()
-            .map_err(|error| anyhow::anyhow!("ort Session builder failed: {error}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| anyhow::anyhow!("ort optimisation level failed: {error}"))?
-            .commit_from_file(&model_path)
-            .map_err(|error| anyhow::anyhow!("ort session load failed: {error}"))?;
+        let session = SessionPool::new(
+            model_path,
+            config.display_name,
+            YOLOV10_FOOTPRINT_MB,
+            1, // single detection model
+            thread_count,
+        )
+        .map_err(|e| anyhow::anyhow!("YOLOv10 session pool: {e}"))?;
 
         Ok(Self {
-            session: Mutex::new(session),
+            session,
             pending_dims: Mutex::new(None),
         })
     }
@@ -160,21 +154,20 @@ impl YOLOv10OrtInner {
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|error| candle_core::Error::Msg(format!("ort TensorRef failed: {error}")))?;
 
-        let mut session_guard = self
-            .session
-            .lock()
-            .map_err(|error| candle_core::Error::Msg(format!("session lock failed: {error}")))?;
-        let outputs = session_guard
-            .run(inputs!["images" => tensor_ref])
-            .map_err(|error| candle_core::Error::Msg(format!("ort inference failed: {error}")))?;
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
 
-        let (_shape, raw) = outputs["output0"]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| {
-                candle_core::Error::Msg(format!("ort extract output0 failed: {error}"))
-            })?;
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
 
-        decode_output0(raw.to_vec(), orig_w, orig_h)
+                decode_output0(raw.to_vec(), orig_w, orig_h)
+                    .map_err(|e| anyhow::anyhow!("yolov10 decode failed: {e}"))
+            })
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     /// One-shot inference: build NCHW array directly, run ORT, decode — all in one call.
@@ -186,7 +179,7 @@ impl YOLOv10OrtInner {
     /// - No Candle tensor is allocated (the ndarray is built directly from pixel bytes).
     /// - Original `(width, height)` stays on the call stack — no `thread_local!` or
     ///   shared-mutable side-channel is needed.
-    /// - The ORT session lock is acquired exactly once per image.
+    /// - The session pool is consulted once; the calling thread's session is reused.
     ///
     /// # Errors
     /// Returns `Err` if the ORT session fails or the model output has an unexpected shape.
@@ -197,19 +190,20 @@ impl YOLOv10OrtInner {
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|e| candle_core::Error::Msg(format!("ort TensorRef failed: {e}")))?;
 
-        let mut session_guard = self
-            .session
-            .lock()
-            .map_err(|e| candle_core::Error::Msg(format!("session lock failed: {e}")))?;
-        let outputs = session_guard
-            .run(inputs!["images" => tensor_ref])
-            .map_err(|e| candle_core::Error::Msg(format!("ort inference failed: {e}")))?;
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
 
-        let (_shape, raw) = outputs["output0"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| candle_core::Error::Msg(format!("ort extract output0 failed: {e}")))?;
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
 
-        decode_output0(raw.to_vec(), orig_w, orig_h)
+                decode_output0(raw.to_vec(), orig_w, orig_h)
+                    .map_err(|e| anyhow::anyhow!("yolov10 decode failed: {e}"))
+            })
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     /// Return the COCO class names used by all YOLOv10 variants.

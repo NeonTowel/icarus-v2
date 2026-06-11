@@ -3,18 +3,21 @@
 /// This is the fast face detector used by the v2.1 Speed Demon pipeline when a
 /// YOLO26 person model is selected. It mirrors the YOLOv11x-Face implementation
 /// but loads the lighter YOLOv10-face export from HuggingFace Hub.
+///
+/// ## Fix 12 — Per-thread SessionPool (Strategy B)
+///
+/// Replaces the single `Mutex<Session>` with a [`SessionPool`] so each Rayon worker
+/// thread gets its own session, eliminating the mutex contention that previously
+/// serialised all face detection inference.
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use hf_hub::api::sync::Api;
 use image::{imageops::FilterType, DynamicImage};
 use ndarray::Array;
-use ort::{
-    inputs,
-    session::{builder::GraphOptimizationLevel, Session},
-    value::TensorRef,
-};
+use ort::{inputs, value::TensorRef};
 use std::sync::Mutex;
 
 use crate::models::candle_backend::{apply_nms, BBox, Detection, Model};
+use crate::models::session_pool::{SessionPool, YOLOV10_FACE_FOOTPRINT_MB};
 
 /// HuggingFace Hub repository for YOLOv10-face ONNX weights.
 const HF_REPO: &str = "deepghs/yolo-face";
@@ -32,36 +35,40 @@ const DEFAULT_CONF_THRESHOLD: f32 = 0.4;
 /// NMS IoU threshold for suppressing overlapping face boxes.
 const DEFAULT_NMS_THRESHOLD: f32 = 0.45;
 
-// M7 Decision: use ORT default. See yolov10_common.rs M7 decision comment.
-
 /// Single-class label list for face detection.
 const FACE_CLASSES: &[&str] = &["face"];
 
-/// YOLOv10-face detector backed by ONNX Runtime.
+/// YOLOv10-face detector backed by ONNX Runtime with per-thread session pool.
 pub struct YoloV10FaceOrt {
-    session: Mutex<Session>,
+    /// Per-worker session pool (Fix 12 / Strategy B).
+    session: SessionPool,
+    /// Stores image dimensions for the `preprocess → postprocess` call pair.
     pending_dims: Mutex<Option<(u32, u32)>>,
 }
 
 impl YoloV10FaceOrt {
-    /// Download the YOLOv10-face ONNX model from HuggingFace Hub and initialise the session.
-    pub fn from_hub(_device: &Device) -> anyhow::Result<Self> {
+    /// Download the YOLOv10-face ONNX model from HuggingFace Hub and initialise the pool.
+    ///
+    /// # Parameters
+    /// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool`.
+    pub fn from_hub(_device: &Device, thread_count: usize) -> anyhow::Result<Self> {
         let api = Api::new()?;
         let repo = api.model(HF_REPO.to_string());
         let model_path = repo.get(HF_FILENAME)?;
 
         log::info!("yolov10-face-ort: loading ONNX model from {:?}", model_path);
 
-        // Use ORT default thread count. See M7 decision comment above.
-        let session = Session::builder()
-            .map_err(|error| anyhow::anyhow!("ort Session builder failed: {error}"))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| anyhow::anyhow!("ort optimisation level failed: {error}"))?
-            .commit_from_file(&model_path)
-            .map_err(|error| anyhow::anyhow!("ort session load failed: {error}"))?;
+        let session = SessionPool::new(
+            model_path,
+            "yolov10-face",
+            YOLOV10_FACE_FOOTPRINT_MB,
+            1, // single face detection model
+            thread_count,
+        )
+        .map_err(|e| anyhow::anyhow!("YOLOv10-Face session pool: {e}"))?;
 
         Ok(Self {
-            session: Mutex::new(session),
+            session,
             pending_dims: Mutex::new(None),
         })
     }
@@ -113,69 +120,67 @@ impl Model for YoloV10FaceOrt {
         let tensor_ref = TensorRef::from_array_view(&array)
             .map_err(|error| candle_core::Error::Msg(format!("ort TensorRef failed: {error}")))?;
 
-        let mut session_guard = self
-            .session
-            .lock()
-            .map_err(|error| candle_core::Error::Msg(format!("session lock failed: {error}")))?;
-        let outputs = session_guard
-            .run(inputs!["images" => tensor_ref])
-            .map_err(|error| candle_core::Error::Msg(format!("ort inference failed: {error}")))?;
+        self.session
+            .with_session(|session| {
+                let outputs = session
+                    .run(inputs!["images" => tensor_ref])
+                    .map_err(|e| anyhow::anyhow!("ort inference failed: {e}"))?;
 
-        let (_shape, raw) = outputs["output0"]
-            .try_extract_tensor::<f32>()
-            .map_err(|error| {
-                candle_core::Error::Msg(format!("ort extract output0 failed: {error}"))
-            })?;
+                let (_shape, raw) = outputs["output0"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(|e| anyhow::anyhow!("ort extract output0 failed: {e}"))?;
 
-        let values = raw.to_vec();
-        let num_anchors = values.len() / 5usize;
+                let values = raw.to_vec();
+                let num_anchors = values.len() / 5usize;
 
-        if num_anchors * 5usize != values.len() {
-            return Err(candle_core::Error::Msg(format!(
-                "yolov10-face: unexpected output0 size {} (expected a multiple of 5)",
-                values.len()
-            )));
-        }
-
-        let scale_x = orig_w as f32 / MODEL_W as f32;
-        let scale_y = orig_h as f32 / MODEL_H as f32;
-
-        let pre_nms: Vec<Detection> = (0..num_anchors)
-            .filter_map(|i| {
-                let cx = values[i];
-                let cy = values[num_anchors + i];
-                let w = values[2 * num_anchors + i];
-                let h = values[3 * num_anchors + i];
-                let confidence = values[4 * num_anchors + i];
-
-                if confidence < DEFAULT_CONF_THRESHOLD {
-                    return None;
+                if num_anchors * 5usize != values.len() {
+                    anyhow::bail!(
+                        "yolov10-face: unexpected output0 size {} (expected a multiple of 5)",
+                        values.len()
+                    );
                 }
 
-                let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
-                let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
-                let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
-                let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
+                let scale_x = orig_w as f32 / MODEL_W as f32;
+                let scale_y = orig_h as f32 / MODEL_H as f32;
 
-                if x_max <= x_min || y_max <= y_min {
-                    return None;
-                }
+                let pre_nms: Vec<Detection> = (0..num_anchors)
+                    .filter_map(|i| {
+                        let cx = values[i];
+                        let cy = values[num_anchors + i];
+                        let w = values[2 * num_anchors + i];
+                        let h = values[3 * num_anchors + i];
+                        let confidence = values[4 * num_anchors + i];
 
-                Some(Detection {
-                    bbox: BBox {
-                        x_min,
-                        y_min,
-                        x_max,
-                        y_max,
-                    },
-                    class_id: 0,
-                    confidence,
-                    class_name: "face".to_string(),
-                })
+                        if confidence < DEFAULT_CONF_THRESHOLD {
+                            return None;
+                        }
+
+                        let x_min = ((cx - w / 2.0) * scale_x).max(0.0);
+                        let y_min = ((cy - h / 2.0) * scale_y).max(0.0);
+                        let x_max = ((cx + w / 2.0) * scale_x).min(orig_w as f32);
+                        let y_max = ((cy + h / 2.0) * scale_y).min(orig_h as f32);
+
+                        if x_max <= x_min || y_max <= y_min {
+                            return None;
+                        }
+
+                        Some(Detection {
+                            bbox: BBox {
+                                x_min,
+                                y_min,
+                                x_max,
+                                y_max,
+                            },
+                            class_id: 0,
+                            confidence,
+                            class_name: "face".to_string(),
+                        })
+                    })
+                    .collect();
+
+                Ok(apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD))
             })
-            .collect();
-
-        Ok(apply_nms(pre_nms, DEFAULT_NMS_THRESHOLD))
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     fn classes(&self) -> &[&str] {

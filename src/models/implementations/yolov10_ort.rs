@@ -30,10 +30,14 @@ pub struct YOLOv10Ort {
 }
 
 impl YOLOv10Ort {
-    /// Download the YOLOv10n ONNX model from HuggingFace Hub and initialise the session.
-    pub fn from_hub(device: &Device) -> anyhow::Result<Self> {
+    /// Download the YOLOv10n ONNX model from HuggingFace Hub and initialise the session pool.
+    ///
+    /// # Parameters
+    /// - `thread_count`: Active Rayon thread count; forwarded to `SessionPool` for
+    ///   intra-op thread tuning (S3).
+    pub fn from_hub(device: &Device, thread_count: usize) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: YOLOv10OrtInner::from_hub(&VARIANT_CONFIG, device)?,
+            inner: YOLOv10OrtInner::from_hub(&VARIANT_CONFIG, device, thread_count)?,
         })
     }
 }
