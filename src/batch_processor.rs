@@ -1222,7 +1222,22 @@ pub fn run_batch(
         .num_threads(thread_count.max(1))
         .build();
     let mut failed: Vec<(PathBuf, String)> = match thread_pool {
-        Ok(pool) => pool.install(collect_failures),
+        Ok(pool) => {
+            let result = pool.install(collect_failures);
+            // Leak the pool so Rayon never joins its worker threads.
+            //
+            // Worker threads hold per-thread ORT sessions in THREAD_SESSIONS
+            // (session_pool.rs). Joining threads causes those sessions to be
+            // dropped, which triggers ORT's internal cleanup — a known
+            // deadlock path when ORT's own global threads are still running.
+            //
+            // Leaking is safe: this pool is created once per run_batch call
+            // (one per process invocation in practice), the OS reclaims all
+            // resources on exit, and std::process::exit() in main() ensures
+            // we never reach normal process-exit Drop glue anyway.
+            std::mem::forget(pool);
+            result
+        }
         Err(error) => {
             eprintln!("[WARN] failed to build thread pool ({error}); using default Rayon pool.");
             collect_failures()

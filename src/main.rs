@@ -141,10 +141,46 @@ struct Args {
     min_pixels: u32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Thin entry point — always exits via [`std::process::exit`] to bypass ORT/tokio
+/// teardown hang.
+///
+/// # Why not return from main normally?
+///
+/// ONNX Runtime registers global atexit handlers and spawns internal worker
+/// threads for inference. When the tokio `#[tokio::main]` wrapper drops the
+/// runtime it joins its blocking thread pool. Those threads' exit in turn
+/// triggers ORT's global environment teardown, which blocks on ORT-internal
+/// mutexes that are still held by ORT's own threads — a deadlock.
+///
+/// Calling `std::process::exit` skips all Rust `Drop` glue and tokio runtime
+/// teardown. The OS reclaims all memory. This is safe for a batch CLI: all
+/// output files are already written and closed by the time we reach exit.
+fn main() {
+    // env_logger must be initialised before the tokio runtime so that early
+    // errors (arg parsing, model load) are visible.
     env_logger::init();
 
+    let code = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_or_else(
+            |e| {
+                eprintln!("fatal: failed to build tokio runtime: {e}");
+                1
+            },
+            |rt| match rt.block_on(run()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("Error: {e:#}");
+                    1
+                }
+            },
+        );
+
+    std::process::exit(code);
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
     let crop_config = build_crop_config(&args)?;
@@ -152,8 +188,6 @@ async fn main() -> Result<()> {
     // Compute thread_count before model loading so SessionPool can tune intra_op_threads (S3).
     let thread_count = resolve_thread_count(args.threads, available_core_count());
     // In classify-only mode we do not need person/face models at all.
-    // Avoiding their load also avoids unnecessary ORT session teardown work at
-    // shutdown.
     let (model, face_detector) = if args.classify_only {
         (None, None)
     } else {
@@ -181,43 +215,33 @@ async fn main() -> Result<()> {
         }
     }
 
-    let dispatch_result = {
-        let context = ProcessingContext {
-            model: model.as_deref(),
-            face_detector: face_detector.as_ref(),
-            classifier: classifier.as_deref(),
-            crop_config: &crop_config,
-            artistic_config: &artistic_config,
-            confidence: args.confidence,
-            margin: args.margin,
-            keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
-            sort_output: args.sort_output,
-            classify_output: args.classify_output || args.classify_only,
-            classify_only: args.classify_only,
-            quiet: args.quiet,
-            rename: args.rename,
-            jpeg_quality: args.jpeg,
-            flatten: args.flatten,
-            collect_metrics: args.metrics,
-            enhanced_crop: args.enhanced_crop,
-            // CLI --min-pixels always overrides crop_config.min_long_side_pixels (CLI wins).
-            // 0 = disable the check (long_side_passes treats 0 as "always pass").
-            min_long_side_pixels: args.min_pixels,
-        };
-
-        dispatch(&args, &context, thread_count).await
+    let context = ProcessingContext {
+        model: model.as_deref(),
+        face_detector: face_detector.as_ref(),
+        classifier: classifier.as_deref(),
+        crop_config: &crop_config,
+        artistic_config: &artistic_config,
+        confidence: args.confidence,
+        margin: args.margin,
+        keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
+        sort_output: args.sort_output,
+        classify_output: args.classify_output || args.classify_only,
+        classify_only: args.classify_only,
+        quiet: args.quiet,
+        rename: args.rename,
+        jpeg_quality: args.jpeg,
+        flatten: args.flatten,
+        collect_metrics: args.metrics,
+        enhanced_crop: args.enhanced_crop,
+        // CLI --min-pixels always overrides crop_config.min_long_side_pixels (CLI wins).
+        // 0 = disable the check (long_side_passes treats 0 as "always pass").
+        min_long_side_pixels: args.min_pixels,
     };
 
-    // Workaround: ORT-backed classifier teardown can hang on process shutdown in
-    // classify-only batch runs. We intentionally leak the classifier at process
-    // end to avoid blocking exit. This is bounded to process lifetime.
-    if args.classify_only && dispatch_result.is_ok() {
-        if let Some(classifier) = classifier {
-            std::mem::forget(classifier);
-        }
-    }
-
-    dispatch_result
+    dispatch(&args, &context, thread_count).await
+    // Note: model / face_detector / classifier are NOT explicitly dropped here.
+    // std::process::exit in main() bypasses all Drop glue, which is intentional
+    // — see the comment on main() above.
 }
 
 fn validate_args(args: &Args) -> Result<()> {
