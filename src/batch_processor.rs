@@ -35,8 +35,16 @@ use crate::visualization::save_visualized_with_faces;
 
 /// Shared processing inputs used for a single image.
 pub struct ProcessingContext<'a> {
-    pub model: &'a dyn Model,
-    pub face_detector: &'a FaceDetector,
+    /// Person detection model.
+    ///
+    /// `None` is valid only for `--classify-only` mode where detection is never
+    /// executed.
+    pub model: Option<&'a dyn Model>,
+    /// Face detector model.
+    ///
+    /// `None` is valid only for `--classify-only` mode where face detection is
+    /// never executed.
+    pub face_detector: Option<&'a FaceDetector>,
     pub classifier: Option<&'a dyn crate::models::ImageClassifier>,
     pub crop_config: &'a CropConfig,
     pub artistic_config: &'a ArtisticCropConfig,
@@ -904,7 +912,10 @@ fn process_image_with_base_paths(
     }
 
     let t_detect = StageTimer::start();
-    let detections = run_detection(&image, file_label, ctx.model, ctx.confidence)?;
+    let model = ctx
+        .model
+        .ok_or_else(|| anyhow::anyhow!("internal error: model not initialized"))?;
+    let detections = run_detection(&image, file_label, model, ctx.confidence)?;
     let person_detections: Vec<&Detection> = detections
         .iter()
         .filter(|d| d.class_id == PERSON_CLASS_ID)
@@ -912,7 +923,17 @@ fn process_image_with_base_paths(
     let dur_detect = t_detect.elapsed();
 
     let t_face = StageTimer::start();
-    let face_bboxes = detect_faces_nonfatal(&image, file_label, ctx.face_detector, ctx.quiet);
+    let face_bboxes = if let Some(face_detector) = ctx.face_detector {
+        detect_faces_nonfatal(&image, file_label, face_detector, ctx.quiet)
+    } else {
+        if !ctx.quiet {
+            eprintln!(
+                "[WARN][{}] face detector unavailable; continuing without faces.",
+                file_label
+            );
+        }
+        Vec::new()
+    };
     let dur_face = t_face.elapsed();
 
     let t_crop = StageTimer::start();

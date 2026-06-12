@@ -151,7 +151,15 @@ async fn main() -> Result<()> {
     let artistic_config = build_artistic_config(&args)?;
     // Compute thread_count before model loading so SessionPool can tune intra_op_threads (S3).
     let thread_count = resolve_thread_count(args.threads, available_core_count());
-    let (model, face_detector) = load_models(&args, thread_count).await?;
+    // In classify-only mode we do not need person/face models at all.
+    // Avoiding their load also avoids unnecessary ORT session teardown work at
+    // shutdown.
+    let (model, face_detector) = if args.classify_only {
+        (None, None)
+    } else {
+        let (model, face_detector) = load_models(&args, thread_count).await?;
+        (Some(model), Some(face_detector))
+    };
     let classifier = if args.classify_output || args.classify_only {
         let kind = args
             .classifier
@@ -174,8 +182,8 @@ async fn main() -> Result<()> {
     }
 
     let context = ProcessingContext {
-        model: model.as_ref(),
-        face_detector: &face_detector,
+        model: model.as_deref(),
+        face_detector: face_detector.as_ref(),
         classifier: classifier.as_deref(),
         crop_config: &crop_config,
         artistic_config: &artistic_config,
