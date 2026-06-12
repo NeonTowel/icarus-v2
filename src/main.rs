@@ -181,30 +181,43 @@ async fn main() -> Result<()> {
         }
     }
 
-    let context = ProcessingContext {
-        model: model.as_deref(),
-        face_detector: face_detector.as_ref(),
-        classifier: classifier.as_deref(),
-        crop_config: &crop_config,
-        artistic_config: &artistic_config,
-        confidence: args.confidence,
-        margin: args.margin,
-        keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
-        sort_output: args.sort_output,
-        classify_output: args.classify_output || args.classify_only,
-        classify_only: args.classify_only,
-        quiet: args.quiet,
-        rename: args.rename,
-        jpeg_quality: args.jpeg,
-        flatten: args.flatten,
-        collect_metrics: args.metrics,
-        enhanced_crop: args.enhanced_crop,
-        // CLI --min-pixels always overrides crop_config.min_long_side_pixels (CLI wins).
-        // 0 = disable the check (long_side_passes treats 0 as "always pass").
-        min_long_side_pixels: args.min_pixels,
+    let dispatch_result = {
+        let context = ProcessingContext {
+            model: model.as_deref(),
+            face_detector: face_detector.as_ref(),
+            classifier: classifier.as_deref(),
+            crop_config: &crop_config,
+            artistic_config: &artistic_config,
+            confidence: args.confidence,
+            margin: args.margin,
+            keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
+            sort_output: args.sort_output,
+            classify_output: args.classify_output || args.classify_only,
+            classify_only: args.classify_only,
+            quiet: args.quiet,
+            rename: args.rename,
+            jpeg_quality: args.jpeg,
+            flatten: args.flatten,
+            collect_metrics: args.metrics,
+            enhanced_crop: args.enhanced_crop,
+            // CLI --min-pixels always overrides crop_config.min_long_side_pixels (CLI wins).
+            // 0 = disable the check (long_side_passes treats 0 as "always pass").
+            min_long_side_pixels: args.min_pixels,
+        };
+
+        dispatch(&args, &context, thread_count).await
     };
 
-    dispatch(&args, &context, thread_count).await
+    // Workaround: ORT-backed classifier teardown can hang on process shutdown in
+    // classify-only batch runs. We intentionally leak the classifier at process
+    // end to avoid blocking exit. This is bounded to process lifetime.
+    if args.classify_only && dispatch_result.is_ok() {
+        if let Some(classifier) = classifier {
+            std::mem::forget(classifier);
+        }
+    }
+
+    dispatch_result
 }
 
 fn validate_args(args: &Args) -> Result<()> {
