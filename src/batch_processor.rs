@@ -362,6 +362,8 @@ struct FormatLoopCtx<'a> {
     viz_path: Option<&'a Path>,
     /// Original (pre-base-margin) bbox, passed through to joint analyzer.
     base_bbox: &'a BBox,
+    /// Person-only bbox used to associate faces before final crop safety adjustment.
+    person_bbox: Option<&'a BBox>,
     face_bboxes: &'a [BBox],
     detections: &'a [Detection],
     focal: &'a crate::focal_point::FocalPoint,
@@ -371,6 +373,7 @@ struct FormatLoopCtx<'a> {
     ext: &'a str,
     viz_stem: Option<String>,
     viz_ext: Option<String>,
+    enhanced_crop: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,6 +383,7 @@ fn write_multi_format_crops(
     output_path: &Path,
     viz_path: Option<&Path>,
     crop_bbox: &BBox,
+    person_bbox: Option<&BBox>,
     face_bboxes: &[BBox],
     detections: &[Detection],
     image_width: u32,
@@ -428,6 +432,7 @@ fn write_multi_format_crops(
         output_path,
         viz_path,
         base_bbox: crop_bbox,
+        person_bbox,
         face_bboxes,
         detections,
         focal: &focal,
@@ -441,6 +446,7 @@ fn write_multi_format_crops(
         } else {
             viz_path.and_then(|p| p.extension().and_then(|e| e.to_str()).map(str::to_string))
         },
+        enhanced_crop: ctx.enhanced_crop || ctx.crop_config.enable_enhanced_crop,
     };
 
     let use_enhanced = ctx.enhanced_crop || ctx.crop_config.enable_enhanced_crop;
@@ -536,12 +542,22 @@ fn write_format_crop_from_region(
     all_crop_regions: &mut Vec<CropRegion>,
     ctx: &ProcessingContext<'_>,
 ) -> Result<()> {
-    let adjusted = crate::face_aware_cropping::enforce_eye_safety(
-        &original_crop,
-        lc.face_bboxes,
-        lc.image_width,
-        lc.image_height,
-    );
+    let adjusted = if lc.enhanced_crop {
+        crate::face_aware_cropping::enforce_pose_aware_eye_safety(
+            &original_crop,
+            lc.person_bbox,
+            lc.face_bboxes,
+            lc.image_width,
+            lc.image_height,
+        )
+    } else {
+        crate::face_aware_cropping::enforce_eye_safety(
+            &original_crop,
+            lc.face_bboxes,
+            lc.image_width,
+            lc.image_height,
+        )
+    };
     all_crop_regions.push(adjusted.clone());
 
     let xyxy = adjusted.to_xyxy_clamped(lc.image.width(), lc.image.height());
@@ -808,7 +824,7 @@ fn process_image_with_base_paths(
 
     let t_crop = StageTimer::start();
     let base_bbox = compute_base_bbox(&person_detections, file_label, ctx.crop_config, ctx.quiet);
-    let crop_bbox = compute_crop_bbox(base_bbox, &face_bboxes);
+    let crop_bbox = compute_crop_bbox(base_bbox.clone(), &face_bboxes);
     let person_for_crop = find_best_person_detection(&detections);
     let dur_crop = t_crop.elapsed();
 
@@ -848,6 +864,7 @@ fn process_image_with_base_paths(
                 out,
                 viz_path,
                 crop_bbox.as_ref().expect("crop bbox is Some here"),
+                base_bbox.as_ref(),
                 &face_bboxes,
                 &detections,
                 image_width,
