@@ -23,7 +23,7 @@
 //!     PathBuf::from("model.onnx"),
 //!     "my-model",
 //!     500,  // footprint_mb per session
-//!     1,    // models_in_group (2 for ensembles — halves the cap)
+//!     1,    // models_in_group
 //!     thread_count,
 //! )?;
 //!
@@ -56,8 +56,8 @@ use crate::config::available_core_count;
 thread_local! {
     /// Per-thread sessions keyed by `SessionPool` address.
     ///
-    /// Multiple pools (e.g. both members of an ensemble) coexist via the
-    /// pointer key, so each worker can hold one session per loaded pool.
+    /// Multiple pools coexist via the pointer key, so each worker can hold one
+    /// session per loaded pool.
     /// Entries are never removed; cleanup happens at thread death.
     static THREAD_SESSIONS: RefCell<Vec<(usize, Session)>> =
         const { RefCell::new(Vec::new()) };
@@ -271,11 +271,11 @@ impl SessionPool {
 
 /// Compute the session cap and per-session ORT thread count.
 ///
-/// ## RAM budgeting (S2 — ensemble correction)
+/// ## RAM budgeting
 ///
 /// The usable RAM budget is `available_RAM × 0.70` (30% headroom).
-/// For ensembles, `models_in_group` divides the cap so that all co-resident
-/// pools together stay within budget:
+/// `models_in_group` divides the cap for co-resident pools so they stay within
+/// budget:
 ///
 /// ```text
 /// cap = floor(usable_MB / (footprint_MB × models_in_group))
@@ -293,7 +293,7 @@ impl SessionPool {
 ///
 /// # Parameters
 /// - `footprint_mb`: Estimated per-session RAM in megabytes.
-/// - `models_in_group`: 1 for single models, 2 for two-model ensembles.
+/// - `models_in_group`: Number of co-resident pools.
 /// - `thread_count`: Active Rayon thread count (from `resolve_thread_count`).
 ///
 /// # Returns
@@ -319,7 +319,7 @@ pub fn recommend_max_sessions(
     // 30% headroom for I/O, image decode, crop geometry, etc.
     let usable_mb = (available_mb as f64 * 0.70) as u64;
 
-    // S2: ensemble correction — prevent double-counting across co-resident pools.
+    // Account for all co-resident pools.
     let effective_footprint_mb = footprint_mb.saturating_mul(models_in_group.max(1) as u64);
     let by_ram = (usable_mb / effective_footprint_mb.max(1)).max(1) as usize;
 
@@ -363,12 +363,6 @@ pub const YOLOV11X_FACE_FOOTPRINT_MB: u64 = 250;
 /// Estimated per-session RAM for YOLOv10-Face.
 pub const YOLOV10_FACE_FOOTPRINT_MB: u64 = 150;
 
-/// Estimated per-session RAM for WD ViT-Base / SwinV2-Base classifiers.
-pub const WD_BASE_FOOTPRINT_MB: u64 = 500;
-
-/// Estimated per-session RAM for WD EVA02-Large classifiers.
-pub const WD_LARGE_FOOTPRINT_MB: u64 = 1500;
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -400,20 +394,6 @@ mod tests {
         assert!(
             intra_op_threads >= 1,
             "intra_op_threads must be ≥ 1, got {intra_op_threads}"
-        );
-    }
-
-    #[test]
-    fn ensemble_correction_halves_cap_vs_single() {
-        // With the same footprint, a 2-model ensemble should get at most half
-        // the sessions of a single model (because each "slot" costs 2× RAM).
-        let (single_cap, _) = recommend_max_sessions(500, 1, 4);
-        let (ensemble_cap, _) = recommend_max_sessions(500, 2, 4);
-        // ensemble_cap ≤ single_cap (may be equal if RAM is very plentiful and
-        // the core count is the binding constraint).
-        assert!(
-            ensemble_cap <= single_cap,
-            "ensemble cap ({ensemble_cap}) must not exceed single cap ({single_cap})"
         );
     }
 

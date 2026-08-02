@@ -75,30 +75,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     sort_output: bool,
 
-    #[arg(long, default_value_t = false)]
-    classify_output: bool,
-
-    #[arg(long, default_value_t = false)]
-    classify_only: bool,
-
-    #[arg(
-        long,
-        default_value = "freepik",
-        value_name = "NAME",
-        help = "Image classifier to use when --classify-output or --classify-only is set.\n\
-                Options (fastest first):\n  \
-                wd-vit               — WD ViT-Base v3 (~200ms CPU, F1 0.44, anime) ⚡ raw speed\n  \
-                idolsankaku-swinv2   — Idolsankaku SwinV2 v1 (~300ms CPU, F1 0.62, real photos) ⚡ raw speed\n  \
-                wd-swinv2            — WD SwinV2-Base v3 (~300ms CPU, F1 0.45, anime)\n  \
-                wd-ensemble-fast     — SwinV2 ensemble (~500ms CPU, balanced) ⭐ recommended\n  \
-                wd-eva02             — WD EVA02-Large v3 (~900ms CPU, F1 0.48, anime)\n  \
-                idolsankaku          — Idolsankaku EVA02-Large v1 (~900ms CPU, F1 0.60, real photos)\n  \
-                wd-ensemble-accurate — EVA02-Large ensemble (~1700ms CPU, highest F1)\n  \
-                freepik              — Legacy 4-tier Freepik NSFW (current default, will change)\n  \
-                wd-ensemble          — alias for wd-ensemble-accurate (backward compat)"
-    )]
-    classifier: String,
-
     #[arg(long, value_name = "FLOAT")]
     headroom_ratio: Option<f32>,
 
@@ -120,7 +96,7 @@ struct Args {
     #[arg(long)]
     flatten: bool,
 
-    /// Print per-stage timing breakdown after processing (decode/person_detect/face_detect/crop/classify/encode).
+    /// Print per-stage timing breakdown after processing (decode/person_detect/face_detect/crop/encode).
     /// Off by default; adding this flag changes no output files.
     #[arg(long, default_value_t = false)]
     metrics: bool,
@@ -187,24 +163,7 @@ async fn run() -> Result<()> {
     let artistic_config = build_artistic_config(&args)?;
     // Compute thread_count before model loading so SessionPool can tune intra_op_threads (S3).
     let thread_count = resolve_thread_count(args.threads, available_core_count());
-    // In classify-only mode we do not need person/face models at all.
-    let (model, face_detector) = if args.classify_only {
-        (None, None)
-    } else {
-        let (model, face_detector) = load_models(&args, thread_count).await?;
-        (Some(model), Some(face_detector))
-    };
-    let classifier = if args.classify_output || args.classify_only {
-        let kind = args
-            .classifier
-            .parse::<icarus_v2::models::ClassifierKind>()?;
-        Some(
-            icarus_v2::models::load_classifier(kind, &candle_core::Device::Cpu, thread_count)
-                .await?,
-        )
-    } else {
-        None
-    };
+    let (model, face_detector) = load_models(&args, thread_count).await?;
 
     if let Some(ref model_path) = args.model_path {
         if !args.quiet {
@@ -216,17 +175,14 @@ async fn run() -> Result<()> {
     }
 
     let context = ProcessingContext {
-        model: model.as_deref(),
-        face_detector: face_detector.as_ref(),
-        classifier: classifier.as_deref(),
+        model: model.as_ref(),
+        face_detector: &face_detector,
         crop_config: &crop_config,
         artistic_config: &artistic_config,
         confidence: args.confidence,
         margin: args.margin,
-        keep_aspect_ratio: args.keep_aspect_ratio || args.classify_only,
+        keep_aspect_ratio: args.keep_aspect_ratio,
         sort_output: args.sort_output,
-        classify_output: args.classify_output || args.classify_only,
-        classify_only: args.classify_only,
         quiet: args.quiet,
         rename: args.rename,
         jpeg_quality: args.jpeg,
@@ -239,20 +195,12 @@ async fn run() -> Result<()> {
     };
 
     dispatch(&args, &context, thread_count).await
-    // Note: model / face_detector / classifier are NOT explicitly dropped here.
+    // Note: model / face_detector are NOT explicitly dropped here.
     // std::process::exit in main() bypasses all Drop glue, which is intentional
     // — see the comment on main() above.
 }
 
 fn validate_args(args: &Args) -> Result<()> {
-    if args.classify_only && args.output.is_none() {
-        bail!("--classify-only requires --output");
-    }
-
-    if args.classify_only && !args.sort_output {
-        bail!("--classify-only requires --sort-output");
-    }
-
     if let Some(0) = args.threads {
         bail!("--threads must be >= 1 (omit the flag to auto-select 50% of cores)");
     }

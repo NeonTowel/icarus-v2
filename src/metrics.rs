@@ -63,8 +63,7 @@ pub struct ImageMetrics {
     pub face_detect: Duration,
     /// Time for crop geometry computation.
     pub crop: Duration,
-    /// Time for content classification (0 when --classify-output not set).
-    pub classify: Duration,
+
     /// Time to encode and write output files.
     pub encode: Duration,
 }
@@ -72,12 +71,7 @@ pub struct ImageMetrics {
 impl ImageMetrics {
     /// Total pipeline time for this image.
     pub fn total(&self) -> Duration {
-        self.decode
-            + self.person_detect
-            + self.face_detect
-            + self.crop
-            + self.classify
-            + self.encode
+        self.decode + self.person_detect + self.face_detect + self.crop + self.encode
     }
 }
 
@@ -192,7 +186,6 @@ impl BatchMetrics {
             stage_stats!(person_detect, "person_detect");
             stage_stats!(face_detect, "face_detect");
             stage_stats!(crop, "crop");
-            stage_stats!(classify, "classify");
             stage_stats!(encode, "encode");
 
             let mut totals: Vec<f64> = self
@@ -283,10 +276,9 @@ mod tests {
             person_detect: Duration::from_millis(100),
             face_detect: Duration::from_millis(50),
             crop: Duration::from_millis(5),
-            classify: Duration::from_millis(200),
             encode: Duration::from_millis(20),
         };
-        assert_eq!(m.total(), Duration::from_millis(385));
+        assert_eq!(m.total(), Duration::from_millis(185));
     }
 
     #[test]

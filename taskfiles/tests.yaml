@@ -1,11 +1,11 @@
-version: '3'
+version: "3"
 
 tasks:
   test-with-samples:
     desc: "Test content-aware cropping with sample photos"
     silent: true
     vars:
-      BUILD: 'release' # 'debug' / 'release'
+      BUILD: "release" # 'debug' / 'release'
       VISUALIZE: false # false / true
       QUIET: true # false / true
     cmds:
@@ -39,7 +39,7 @@ tasks:
       VARS:
         - BUILD
     preconditions:
-      - sh: 'test -x target/{{ .BUILD }}/icarus-v2'
+      - sh: "test -x target/{{ .BUILD }}/icarus-v2"
         msg: 'the "target/{{ .BUILD }}/icarus-v2" executable does not exist, build first!'
     cmds:
       - for:
@@ -68,7 +68,6 @@ tasks:
             --output "${OUTPUT}" \{{ if .VISUALIZE }}
             --visualize "${VISUALIZE}" \{{ end }}
             --sort-output \
-            --classify-output \
             --confidence {{ .CONFIDENCE }} \
             --margin {{ .MARGIN }}{{ if .QUIET }} \
             --quiet{{ end }}

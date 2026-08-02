@@ -30,31 +30,20 @@ cargo run --release -- \
   --output <path> \
   --threads 4
 
-# Use the WD ensemble for 5-tier content rating
-cargo run --release -- \
-  --input <dir> --output <out> \
-  --classify-only --sort-output \
-  --classifier wd-ensemble
-
-# Bulk-classify a large collection at maximum speed (anime/illustration content):
-cargo run --release -- \
-  --input ./large-anime-dir --output ./out \
-  --classify-only --sort-output \
-  --classifier wd-vit
 ```
 
 ## Common Flags
 
-| Flag | Purpose |
-|------|---------|
-| `--recurse` | Recurse into subdirectories |
-| `--visualize <path>` | Annotated image output |
-| `--output-boxes <path>` | JSON detections |
-| `--sort-output` | Route by aspect ratio (`landscape`/`portrait`/`mobile`) |
-| `--margin <pct>` | Bbox expansion before crop |
-| `--crop-config <yaml>` | Crop rule overrides |
-| `--visibility-threshold <pct>` | Minimum visible-person ratio |
-| `--classifier <name>` | Classifier mode: `wd-vit` ⚡, `idolsankaku-swinv2` ⚡, `wd-swinv2`, `wd-ensemble-fast` ⭐, `wd-eva02`, `idolsankaku`, `wd-ensemble-accurate`, `freepik` |
+| Flag                           | Purpose                                                 |
+| ------------------------------ | ------------------------------------------------------- |
+| `--recurse`                    | Recurse into subdirectories                             |
+| `--visualize <path>`           | Annotated image output                                  |
+| `--output-boxes <path>`        | JSON detections                                         |
+| `--sort-output`                | Route by aspect ratio (`landscape`/`portrait`/`mobile`) |
+| `--margin <pct>`               | Bbox expansion before crop                              |
+| `--crop-config <yaml>`         | Crop rule overrides                                     |
+| `--visibility-threshold <pct>` | Minimum visible-person ratio                            |
+
 | `-t, --threads <num>` | Batch worker threads (default: 50% cores, min 1, capped at cores) |
 | `--artistic-mode` | `conservative` \| `balanced` \| `aggressive` |
 

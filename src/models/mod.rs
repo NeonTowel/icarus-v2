@@ -12,15 +12,14 @@
 /// All models implement the [`Model`] trait (preprocess → forward → postprocess).
 pub mod backbones;
 pub mod candle_backend;
-pub mod ensemble;
+
 pub mod implementations;
 pub mod session_pool;
 
-pub use candle_backend::{BBox, Detection, ImageClassifier, Model};
-pub use ensemble::{ClassifierKind, SingleWdClassifier, WdEnsembleClassifier};
+pub use candle_backend::{BBox, Detection, Model};
 pub use implementations::{
-    eva2_classifier::FreepikEva02, YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt,
-    YOLOv26sOrt, YoloV10FaceOrt, YoloV11xFaceOrt,
+    YOLOv10Ort, YOLOv10mOrt, YOLOv10sOrt, YOLOv26mOrt, YOLOv26nOrt, YOLOv26sOrt, YoloV10FaceOrt,
+    YoloV11xFaceOrt,
 };
 pub use session_pool::SessionPool;
 
@@ -67,39 +66,4 @@ pub async fn load_candle_model(
     })
     .await
     .map_err(|e| anyhow::anyhow!("model load task panicked: {e}"))?
-}
-
-/// Load an image classifier by runtime kind.
-///
-/// # Parameters
-/// - `thread_count`: Active Rayon thread count; passed to `SessionPool` for
-///   intra-op thread tuning (S3).
-pub async fn load_classifier(
-    kind: ClassifierKind,
-    device: &Device,
-    thread_count: usize,
-) -> anyhow::Result<Box<dyn ImageClassifier>> {
-    let device = device.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<Box<dyn ImageClassifier>> {
-        match kind {
-            ClassifierKind::Freepik => Ok(Box::new(FreepikEva02::from_hub(&device)?)),
-            ClassifierKind::WdEva02 => Ok(Box::new(SingleWdClassifier::wd_eva02(thread_count)?)),
-            ClassifierKind::Idolsankaku => {
-                Ok(Box::new(SingleWdClassifier::idolsankaku(thread_count)?))
-            }
-            ClassifierKind::WdSwinv2 => Ok(Box::new(SingleWdClassifier::wd_swinv2(thread_count)?)),
-            ClassifierKind::IdolsankakuSwinv2 => Ok(Box::new(
-                SingleWdClassifier::idolsankaku_swinv2(thread_count)?,
-            )),
-            ClassifierKind::WdVit => Ok(Box::new(SingleWdClassifier::wd_vit(thread_count)?)),
-            ClassifierKind::WdEnsembleFast => {
-                Ok(Box::new(WdEnsembleClassifier::fast(thread_count)?))
-            }
-            ClassifierKind::WdEnsembleAccurate => {
-                Ok(Box::new(WdEnsembleClassifier::accurate(thread_count)?))
-            }
-        }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("classifier load task panicked: {e}"))?
 }

@@ -1,6 +1,6 @@
 [package]
 name = "icarus-v2"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 
 [dependencies]
@@ -23,15 +23,17 @@ walkdir = "2.5"
 
 # Candle ML framework (retained for utilities: candle_backend trait types, NMS, etc.)
 candle-core = "0.9"
-candle-onnx = "0.9"
 candle-nn = "0.9"
 candle-transformers = "0.9"
 
 # HuggingFace Hub client
 hf-hub = "0.3"
 
+
+
 # safetensors format support
 safetensors = "0.3"
+
 
 # YOLOv10 ONNX Runtime integration (ONNX backend, no Candle)
 yolov10 = { version = "0.2", default-features = false, features = ["cpu"] }
@@ -39,9 +41,6 @@ yolov10 = { version = "0.2", default-features = false, features = ["cpu"] }
 # the ONNX Runtime shared library automatically at build time.
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["download-binaries"] }
 ndarray = "0.16"
-little_exif = "0.6.23"
-ureq = "2"
-xmp-writer = "0.3"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [dev-dependencies]
