@@ -122,10 +122,14 @@ h3 {
   display: block;
   color: #9da9b0;
   margin: 0.2rem 0 0.5rem;
+  line-height: 1.35;
 }
-.primary {
-  background: #246d5f;
-  border-color: #4eb6a8;
+.reason-help {
+  display: block;
+  margin: 0.15rem 0 0 1.35rem;
+  color: #9da9b0;
+  font-size: 0.78rem;
+  line-height: 1.25;
 }
 .note textarea {
   display: block;
@@ -188,12 +192,16 @@ h3 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1rem;
   margin-top: 1rem;
+  container-type: inline-size;
 }
-.previews article {
-  min-height: 8rem;
+.preview-card {
+  min-height: calc((100cqw - 8rem) * 0.1889286 + 4.025rem);
   padding: 1rem;
   background: #181d20;
   border: 1px solid #384147;
+}
+.preview-card:hover {
+  border-color: #4eb6a8;
 }
 .preview-image {
   position: relative;
@@ -206,6 +214,50 @@ h3 {
   display: block;
   max-width: none;
 }
+.preview-image.portrait {
+  width: auto;
+  height: min(calc((100cqw - 8rem) * 0.1889286), calc(100vh - 20rem));
+  max-width: 100%;
+  margin: auto;
+}
+.preview-popup {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+.preview-popup-content {
+  position: relative;
+  pointer-events: auto;
+  padding: 0.35rem;
+  background: rgba(8, 10, 11, 0.96);
+  border: 1px solid #4eb6a8;
+  box-shadow: 0 1rem 3rem rgba(0, 0, 0, 0.55);
+}
+.preview-popup-content p {
+  margin: 0 0 0.3rem;
+  color: #b9c8cc;
+  font-size: 0.8rem;
+}
+.preview-popup-content.landscape {
+  width: min(80vw, calc(90vh * var(--aspect)));
+}
+.preview-popup-content.portrait {
+  height: min(90vh, calc(80vw / var(--aspect)));
+}
+.preview-popup-content .preview-image {
+  width: 100%;
+  height: calc(100% - 1.35rem);
+  aspect-ratio: var(--aspect);
+}
+.preview-popup-content.landscape .preview-image {
+  height: auto;
+}
+.preview-popup-content.portrait .preview-image {
+  width: auto;
+}
 kbd {
   padding: 0.1rem 0.3rem;
   background: #303a40;
@@ -215,6 +267,13 @@ kbd {
 @media (max-width: 950px) {
   .previews {
     grid-template-columns: 1fr;
+  }
+  .preview-card {
+    min-height: 8rem;
+  }
+  .preview-image.portrait {
+    width: 100%;
+    height: auto;
   }
   .workspace {
     grid-template-columns: 1fr;

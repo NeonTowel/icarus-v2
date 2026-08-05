@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
   type BBox = [number, number, number, number];
   type Candidate = { status: string; bbox?: BBox };
   type Format = { name: string; baseline: Candidate; enhanced: Candidate };
@@ -23,17 +25,58 @@
     reason_codes: string[];
     note: string;
   };
+  type Draft = Pick<Review, "reason_codes" | "note">;
+  type PersistedSession = {
+    sample_id?: string;
+    format?: string;
+    reviews: [string, Review][];
+    drafts: [string, Draft][];
+    manual_crops: [string, BBox][];
+  };
 
+  const SESSION_STORAGE_KEY = "icarus-editor.session.v1";
   const reasonOptions = [
-    ["face_cut", "Face cut"],
-    ["face_edge_tight", "Face edge-tight"],
-    ["subject_too_high", "Subject too high"],
-    ["subject_too_low", "Subject too low"],
-    ["subject_too_left", "Subject too left"],
-    ["subject_too_right", "Subject too right"],
-    ["wrong_subject", "Wrong subject"],
-    ["group_framing", "Group framing"],
-    ["detector_error", "Detector error"],
+    ["face_cut", "Face cut", "The crop cuts away part of the detected face."],
+    [
+      "face_edge_tight",
+      "Face edge-tight",
+      "The full face is visible but uncomfortably close to a crop edge.",
+    ],
+    [
+      "subject_too_high",
+      "Subject too high",
+      "Move the crop down to place the subject lower.",
+    ],
+    [
+      "subject_too_low",
+      "Subject too low",
+      "Move the crop up to place the subject higher.",
+    ],
+    [
+      "subject_too_left",
+      "Subject too left",
+      "Move the crop right to place the subject closer to center.",
+    ],
+    [
+      "subject_too_right",
+      "Subject too right",
+      "Move the crop left to place the subject closer to center.",
+    ],
+    [
+      "wrong_subject",
+      "Wrong subject",
+      "The candidate frames a different detected person than the intended subject.",
+    ],
+    [
+      "group_framing",
+      "Group framing",
+      "Judge this as a deliberate group composition, not a single-person crop.",
+    ],
+    [
+      "detector_error",
+      "Detector error",
+      "Person or face detection box is wrong, so crop behavior cannot be fairly judged.",
+    ],
   ] as const;
 
   let sampleIds: string[] = [];
@@ -41,8 +84,10 @@
   let selectedIndex = 0;
   let selectedFormat = "21:9";
   let manualCrop: BBox | undefined;
+  let manualCrops = new Map<string, BBox>();
   let reviews = new Map<string, Review>();
-  let drafts = new Map<string, Pick<Review, "reason_codes" | "note">>();
+  let drafts = new Map<string, Draft>();
+  let restoredSession: PersistedSession | undefined;
   let showPersons = true;
   let showFaces = true;
   let loading = true;
@@ -50,6 +95,8 @@
   let dragging = false;
   let dragOffset: [number, number] = [0, 0];
   let canvas: HTMLDivElement;
+  let hoveredPreview: { label: string; crop: BBox } | undefined;
+  let showPreviewPopup = false;
 
   $: selectedId = sampleIds[selectedIndex];
   $: sample = selectedId ? samples.get(selectedId) : undefined;
@@ -62,8 +109,12 @@
   $: activeDraft = selectedId
     ? drafts.get(reviewKey(selectedId, selectedFormat))
     : undefined;
-  $: if (sample && format) resetCrop();
+  $: if (sample && format) restoreManualCrop();
 
+  onMount(() => {
+    restoredSession = loadSession();
+    if (!loading) restoreSessionSelection();
+  });
   loadManifest();
 
   async function loadManifest() {
@@ -71,6 +122,7 @@
       const manifest = await fetch("/data/manifest.json").then(requireOk);
       sampleIds = manifest.samples;
       await Promise.all(sampleIds.map(loadSample));
+      restoreSessionSelection();
     } catch (cause) {
       error =
         cause instanceof Error ? cause.message : "Could not load editor/data.";
@@ -91,14 +143,74 @@
     return response.json();
   }
 
+  function loadSession(): PersistedSession | undefined {
+    try {
+      const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+      return raw ? (JSON.parse(raw) as PersistedSession) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function restoreSessionSelection() {
+    if (!restoredSession) return;
+    reviews = new Map(restoredSession.reviews ?? []);
+    drafts = new Map(restoredSession.drafts ?? []);
+    manualCrops = new Map(restoredSession.manual_crops ?? []);
+    if (
+      restoredSession.format &&
+      ["21:9", "9:16", "9:21"].includes(restoredSession.format)
+    ) {
+      selectedFormat = restoredSession.format;
+    }
+    if (restoredSession.sample_id) {
+      const index = sampleIds.indexOf(restoredSession.sample_id);
+      if (index >= 0) selectedIndex = index;
+    }
+  }
+
+  function persistSession() {
+    try {
+      localStorage.setItem(
+        SESSION_STORAGE_KEY,
+        JSON.stringify({
+          sample_id: selectedId,
+          format: selectedFormat,
+          reviews: [...reviews.entries()],
+          drafts: [...drafts.entries()],
+          manual_crops: [...manualCrops.entries()],
+        } satisfies PersistedSession),
+      );
+    } catch {
+      // Browser storage can be unavailable or full. Review export still works.
+    }
+  }
+
+  function restoreManualCrop() {
+    if (!sample) return;
+    const saved = manualCrops.get(reviewKey(sample.id, selectedFormat));
+    manualCrop = saved
+      ? ([...saved] as BBox)
+      : baseline
+        ? ([...baseline] as BBox)
+        : undefined;
+  }
+
   function resetCrop() {
+    if (!sample) return;
+    const key = reviewKey(sample.id, selectedFormat);
+    manualCrops.delete(key);
+    manualCrops = manualCrops;
     manualCrop = baseline ? ([...baseline] as BBox) : undefined;
+    persistSession();
   }
 
   function chooseCandidate(kind: "baseline" | "enhanced") {
     const candidate = kind === "baseline" ? baseline : enhanced;
     if (!candidate || !sample) return;
     manualCrop = [...candidate] as BBox;
+    manualCrops.set(reviewKey(sample.id, selectedFormat), manualCrop);
+    manualCrops = manualCrops;
     saveReview(kind, candidate);
   }
 
@@ -118,6 +230,7 @@
       note: activeDraft?.note ?? activeReview?.note ?? "",
     });
     reviews = reviews;
+    persistSession();
   }
 
   function mark(decision: "source_bound" | "skipped") {
@@ -142,6 +255,7 @@
       reason_codes,
     });
     drafts = drafts;
+    persistSession();
   }
 
   function updateNote(event: Event) {
@@ -155,6 +269,7 @@
       note: (event.target as HTMLTextAreaElement).value,
     });
     drafts = drafts;
+    persistSession();
   }
 
   function beginDrag(event: PointerEvent) {
@@ -196,6 +311,7 @@
       });
       reviews = reviews;
     }
+    persistSession();
   }
 
   function endDrag() {
@@ -227,30 +343,73 @@
     return `width:${sourceWidth}%;height:${sourceHeight}%;left:${(-crop[0] / cropWidth) * 100}%;top:${(-crop[1] / cropHeight) * 100}%;`;
   }
 
+  function previewClass(crop: BBox) {
+    return crop[2] - crop[0] >= crop[3] - crop[1] ? "landscape" : "portrait";
+  }
+
+  function previewContainerStyle(crop: BBox) {
+    const aspect = (crop[2] - crop[0]) / (crop[3] - crop[1]);
+    return `aspect-ratio:${aspect};--aspect:${aspect};`;
+  }
+
+  function showPreviewImmediately(label: string, crop: BBox) {
+    hoveredPreview = { label, crop };
+    showPreviewPopup = true;
+  }
+
+  function hidePreviewImmediately() {
+    showPreviewPopup = false;
+    hoveredPreview = undefined;
+  }
+
+  function showPreviewFromKey(event: KeyboardEvent, label: string, crop: BBox) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    showPreviewImmediately(label, crop);
+  }
+
+  function hidePreviewFromKey(event: KeyboardEvent) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    hidePreviewImmediately();
+  }
+
+  function dismissPreviewOnPointerMove() {
+    if (showPreviewPopup) hidePreviewImmediately();
+  }
+
   function next(offset: number) {
     selectedIndex = clamp(
       selectedIndex + offset,
       0,
       Math.max(0, sampleIds.length - 1),
     );
+    persistSession();
+  }
+
+  function selectFormat(format: string) {
+    selectedFormat = format;
+    persistSession();
   }
 
   function exportReviews() {
-    const reviewed = [...reviews.values()].map((review) => {
-      const item = samples
-        .get(review.sample_id)
-        ?.formats.find((value) => value.name === review.format);
-      return {
-        sample_id: review.sample_id,
-        format: review.format,
-        decision: review.decision,
-        baseline_bbox: item?.baseline.bbox,
-        enhanced_bbox: item?.enhanced.bbox,
-        expected_bbox: review.expected_bbox,
-        reason_codes: review.reason_codes,
-        note: review.note,
-      };
-    });
+    const reviewed = [...reviews.values()]
+      .filter((review) => review.decision !== "skipped")
+      .map((review) => {
+        const item = samples
+          .get(review.sample_id)
+          ?.formats.find((value) => value.name === review.format);
+        return {
+          sample_id: review.sample_id,
+          format: review.format,
+          decision: review.decision,
+          baseline_bbox: item?.baseline.bbox,
+          enhanced_bbox: item?.enhanced.bbox,
+          expected_bbox: review.expected_bbox,
+          reason_codes: review.reason_codes,
+          note: review.note,
+        };
+      });
     const blob = new Blob(
       [JSON.stringify({ schema_version: 1, reviews: reviewed }, null, 2)],
       { type: "application/json" },
@@ -264,13 +423,14 @@
 </script>
 
 <svelte:window
+  onpointermove={dismissPreviewOnPointerMove}
   onkeydown={(event) => {
     if (event.target instanceof HTMLTextAreaElement) return;
     if (event.key === "ArrowLeft") next(-1);
     if (event.key === "ArrowRight") next(1);
-    if (event.key === "1") selectedFormat = "21:9";
-    if (event.key === "2") selectedFormat = "9:16";
-    if (event.key === "3") selectedFormat = "9:21";
+    if (event.key === "1") selectFormat("21:9");
+    if (event.key === "2") selectFormat("9:16");
+    if (event.key === "3") selectFormat("9:21");
     if (event.key.toLowerCase() === "a" && baseline)
       chooseCandidate("baseline");
     if (event.key.toLowerCase() === "e" && enhanced)
@@ -309,10 +469,83 @@
         {#each ["21:9", "9:16", "9:21"] as name}
           <button
             class:active={selectedFormat === name}
-            onclick={() => (selectedFormat = name)}>{name}</button
+            onclick={() => selectFormat(name)}>{name}</button
           >
         {/each}
       </div>
+    </section>
+
+    <section class="previews" aria-label="Crop candidates">
+      {#if baseline}
+        <div
+          class="preview-card"
+          onclick={() => showPreviewImmediately("Baseline", baseline)}
+          onkeydown={(event) => showPreviewFromKey(event, "Baseline", baseline)}
+          role="button"
+          tabindex="0"
+          aria-label="Show Baseline crop preview"
+        >
+          <h2>Baseline</h2>
+          <div
+            class="preview-image"
+            class:portrait={previewClass(baseline) === "portrait"}
+            style={previewContainerStyle(baseline)}
+          >
+            <img
+              src={`/data/${sample.source}`}
+              style={previewImageStyle(baseline)}
+              alt="Baseline crop preview"
+            />
+          </div>
+        </div>
+      {/if}
+      {#if enhanced}
+        <div
+          class="preview-card"
+          onclick={() => showPreviewImmediately("Enhanced", enhanced)}
+          onkeydown={(event) => showPreviewFromKey(event, "Enhanced", enhanced)}
+          role="button"
+          tabindex="0"
+          aria-label="Show Enhanced crop preview"
+        >
+          <h2>Enhanced</h2>
+          <div
+            class="preview-image"
+            class:portrait={previewClass(enhanced) === "portrait"}
+            style={previewContainerStyle(enhanced)}
+          >
+            <img
+              src={`/data/${sample.source}`}
+              style={previewImageStyle(enhanced)}
+              alt="Enhanced crop preview"
+            />
+          </div>
+        </div>
+      {/if}
+      {#if manualCrop}
+        <div
+          class="preview-card"
+          onclick={() => showPreviewImmediately("Adjusted", manualCrop!)}
+          onkeydown={(event) =>
+            showPreviewFromKey(event, "Adjusted", manualCrop!)}
+          role="button"
+          tabindex="0"
+          aria-label="Show Adjusted crop preview"
+        >
+          <h2>Adjusted</h2>
+          <div
+            class="preview-image"
+            class:portrait={previewClass(manualCrop) === "portrait"}
+            style={previewContainerStyle(manualCrop)}
+          >
+            <img
+              src={`/data/${sample.source}`}
+              style={previewImageStyle(manualCrop)}
+              alt="Adjusted crop preview"
+            />
+          </div>
+        </div>
+      {/if}
     </section>
 
     <section class="workspace">
@@ -324,23 +557,37 @@
         <label><input type="checkbox" bind:checked={showFaces} /> Faces</label>
         <p>{sample.persons.length} person(s), {sample.faces.length} face(s)</p>
 
-        <h2>Candidate</h2>
+        <h2>Decision</h2>
         <button onclick={() => chooseCandidate("baseline")} disabled={!baseline}
           >Accept baseline</button
         >
-        <small>{candidateLabel(format.baseline)}</small>
+        <small
+          >Use current baseline crop. {candidateLabel(format.baseline)}</small
+        >
         <button onclick={() => chooseCandidate("enhanced")} disabled={!enhanced}
           >Accept enhanced</button
         >
-        <small>{candidateLabel(format.enhanced)}</small>
+        <small
+          >Use current enhanced crop. {candidateLabel(format.enhanced)}</small
+        >
         <button onclick={resetCrop} disabled={!baseline}
           >Reset manual crop</button
         >
-        <button class="primary" onclick={saveManual} disabled={!manualCrop}
+        <small>Discard local drag changes. Restore baseline rectangle.</small>
+        <button onclick={saveManual} disabled={!manualCrop}
           >Commit manual crop</button
         >
-        <button onclick={() => mark("source_bound")}>Source-bound</button>
-        <button onclick={() => mark("skipped")}>Skip</button>
+        <small>Save current red rectangle as intended crop.</small>
+        <button onclick={() => mark("source_bound")}>Mark source-bound</button>
+        <small
+          >Current source lacks pixels for a better crop. Keep this as a
+          reviewed limitation.</small
+        >
+        <button onclick={() => mark("skipped")}>Skip without fixture</button>
+        <small
+          >Defer this format. It is remembered, but excluded from exported
+          reviews.</small
+        >
       </aside>
 
       <div class="canvas-wrap">
@@ -393,8 +640,8 @@
           Current: <strong>{activeReview?.decision ?? "unreviewed"}</strong>
         </p>
         <h3>Reasons</h3>
-        {#each reasonOptions as [code, label]}
-          <label
+        {#each reasonOptions as [code, label, description]}
+          <label title={description}
             ><input
               type="checkbox"
               checked={activeDraft?.reason_codes.includes(code) ??
@@ -402,7 +649,7 @@
                 false}
               onchange={() => toggleReason(code)}
             />
-            {label}</label
+            {label}<span class="reason-help">{description}</span></label
           >
         {/each}
         <label class="note"
@@ -417,53 +664,28 @@
         <p><kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> format · arrows navigate</p>
       </aside>
     </section>
-
-    <section class="previews">
-      <article>
-        <h2>Baseline</h2>
-        {#if baseline}
-          <div
-            class="preview-image"
-            style={`aspect-ratio:${baseline[2] - baseline[0]} / ${baseline[3] - baseline[1]};`}
-          >
-            <img
-              src={`/data/${sample.source}`}
-              style={previewImageStyle(baseline)}
-              alt="Baseline crop preview"
-            />
-          </div>
-        {:else}<p>Unavailable</p>{/if}
-      </article>
-      <article>
-        <h2>Enhanced</h2>
-        {#if enhanced}
-          <div
-            class="preview-image"
-            style={`aspect-ratio:${enhanced[2] - enhanced[0]} / ${enhanced[3] - enhanced[1]};`}
-          >
-            <img
-              src={`/data/${sample.source}`}
-              style={previewImageStyle(enhanced)}
-              alt="Enhanced crop preview"
-            />
-          </div>
-        {:else}<p>Unavailable</p>{/if}
-      </article>
-      <article>
-        <h2>Preview</h2>
-        {#if manualCrop}
-          <div
-            class="preview-image"
-            style={`aspect-ratio:${manualCrop[2] - manualCrop[0]} / ${manualCrop[3] - manualCrop[1]};`}
-          >
-            <img
-              src={`/data/${sample.source}`}
-              style={previewImageStyle(manualCrop)}
-              alt="Adjusted crop preview"
-            />
-          </div>
-        {:else}<p>Unavailable</p>{/if}
-      </article>
-    </section>
   {/if}
 </main>
+
+{#if showPreviewPopup && hoveredPreview && sample}
+  <div class="preview-popup" role="presentation">
+    <div
+      class={`preview-popup-content ${previewClass(hoveredPreview.crop)}`}
+      style={previewContainerStyle(hoveredPreview.crop)}
+      onclick={hidePreviewImmediately}
+      onkeydown={hidePreviewFromKey}
+      role="button"
+      tabindex="0"
+      aria-label="Hide enlarged crop preview"
+    >
+      <p>{hoveredPreview.label}</p>
+      <div class="preview-image">
+        <img
+          src={`/data/${sample.source}`}
+          style={previewImageStyle(hoveredPreview.crop)}
+          alt={`${hoveredPreview.label} crop preview`}
+        />
+      </div>
+    </div>
+  </div>
+{/if}
