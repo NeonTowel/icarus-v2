@@ -9,7 +9,8 @@ use icarus_v2::config::{
 };
 use icarus_v2::directory_walker::discover_images;
 use icarus_v2::models::load_candle_model;
-use std::path::PathBuf;
+use icarus_v2::review::generate_dataset;
+use std::path::{Path, PathBuf};
 
 const VALID_MODELS: &[&str] = &[
     "yolov10", "yolov10s", "yolov10m", "yolo26", "yolo26s", "yolo26m",
@@ -115,6 +116,11 @@ struct Args {
     /// categories. Set to 0 to disable the check. CLI value overrides crop_config YAML.
     #[arg(long, default_value_t = 1200, value_name = "PIXELS")]
     min_pixels: u32,
+
+    /// Generate baseline and enhanced crop candidates for the local Icarus editor.
+    /// Writes only under editor/data and rejects normal crop/output options.
+    #[arg(long, default_value_t = false)]
+    review: bool,
 }
 
 /// Thin entry point — always exits via [`std::process::exit`] to bypass ORT/tokio
@@ -159,6 +165,10 @@ fn main() {
 async fn run() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+    if args.review {
+        return run_review(&args).await;
+    }
+
     let crop_config = build_crop_config(&args)?;
     let artistic_config = build_artistic_config(&args)?;
     // Compute thread_count before model loading so SessionPool can tune intra_op_threads (S3).
@@ -205,7 +215,70 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("--threads must be >= 1 (omit the flag to auto-select 50% of cores)");
     }
 
+    if args.review {
+        let conflicting = review_conflicting_flags(args);
+        if !conflicting.is_empty() {
+            bail!(
+                "--review only accepts --input, --recurse, --model, --model-path, --confidence, --threads, and --quiet; conflicting flags: {}",
+                conflicting.join(", ")
+            );
+        }
+    }
+
     Ok(())
+}
+
+fn review_conflicting_flags(args: &Args) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if args.output.is_some() {
+        flags.push("--output");
+    }
+    if args.output_boxes.is_some() {
+        flags.push("--output-boxes");
+    }
+    if args.visualize.is_some() {
+        flags.push("--visualize");
+    }
+    if args.keep_aspect_ratio {
+        flags.push("--keep-aspect-ratio");
+    }
+    if args.margin != 0.0 {
+        flags.push("--margin");
+    }
+    if args.sort_output {
+        flags.push("--sort-output");
+    }
+    if args.headroom_ratio.is_some() {
+        flags.push("--headroom-ratio");
+    }
+    if args.visibility_threshold.is_some() {
+        flags.push("--visibility-threshold");
+    }
+    if args.crop_config.is_some() {
+        flags.push("--crop-config");
+    }
+    if args.artistic_mode != "balanced" {
+        flags.push("--artistic-mode");
+    }
+    if args.rename {
+        flags.push("--rename");
+    }
+    if args.jpeg.is_some() {
+        flags.push("--jpeg");
+    }
+    if args.flatten {
+        flags.push("--flatten");
+    }
+    if args.metrics {
+        flags.push("--metrics");
+    }
+    if args.enhanced_crop {
+        flags.push("--enhanced-crop");
+    }
+    if args.min_pixels != 1200 {
+        flags.push("--min-pixels");
+    }
+    flags
 }
 
 fn build_crop_config(args: &Args) -> Result<CropConfig> {
@@ -279,6 +352,74 @@ async fn load_models(
     .map_err(|error| anyhow::anyhow!("face model load task panicked: {error}"))??;
 
     Ok((model, face_detector))
+}
+
+async fn run_review(args: &Args) -> Result<()> {
+    if !(0.0..=1.0).contains(&args.confidence) {
+        bail!(
+            "--confidence must be between 0.0 and 1.0, got {}",
+            args.confidence
+        );
+    }
+
+    let metadata = std::fs::metadata(&args.input)
+        .with_context(|| format!("Cannot access input path: {:?}", args.input))?;
+    if metadata.is_file() && args.recurse {
+        bail!(
+            "--recurse is only valid when --input is a directory, but {:?} is a file.",
+            args.input
+        );
+    }
+
+    let (input_root, image_paths) = if metadata.is_file() {
+        let root = args
+            .input
+            .parent()
+            .unwrap_or(Path::new("."))
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize parent of {:?}", args.input))?;
+        (root, vec![args.input.clone()])
+    } else if metadata.is_dir() {
+        let root = args
+            .input
+            .canonicalize()
+            .with_context(|| format!("Failed to canonicalize input directory {:?}", args.input))?;
+        let images = discover_images(&root, args.recurse)?;
+        (root, images)
+    } else {
+        bail!(
+            "Input path {:?} is neither a file nor a directory.",
+            args.input
+        );
+    };
+
+    if image_paths.is_empty() {
+        if !args.quiet {
+            println!("No supported images found in {:?}", args.input);
+        }
+        return Ok(());
+    }
+
+    let thread_count = resolve_thread_count(args.threads, available_core_count());
+    let (model, face_detector) = load_models(args, thread_count).await?;
+    let data_root = Path::new("editor").join("data");
+    let manifest = generate_dataset(
+        &image_paths,
+        &input_root,
+        &data_root,
+        model.as_ref(),
+        &face_detector,
+        args.confidence,
+    )?;
+
+    if !args.quiet {
+        println!(
+            "Review dataset: {} sample(s) written to {:?}",
+            manifest.samples.len(),
+            data_root
+        );
+    }
+    Ok(())
 }
 
 async fn dispatch(args: &Args, context: &ProcessingContext<'_>, thread_count: usize) -> Result<()> {

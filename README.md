@@ -46,6 +46,35 @@ cargo run --release -- \
 
 | `-t, --threads <num>` | Batch worker threads (default: 50% cores, min 1, capped at cores) |
 | `--artistic-mode` | `conservative` \| `balanced` \| `aggressive` |
+| `--review` | Generate baseline and enhanced candidates for `editor/data` |
+
+## Crop Review Editor
+
+Generate a local review dataset without creating normal crop output:
+
+```bash
+cargo run --release -- \
+  --review \
+  --input <image-or-directory> \
+  --recurse \
+  --model yolo26m
+```
+
+`--review` accepts only input and detector configuration: `--input`, `--recurse`,
+`--model`, `--model-path`, `--confidence`, `--threads`, and `--quiet`. It rejects
+normal output and crop-tuning flags to keep candidate generation reproducible.
+
+The command writes raw JPEG source previews and per-image baseline/enhanced candidate
+coordinates under ignored `editor/data/`. Start the editor with:
+
+```bash
+npm --prefix editor run dev
+```
+
+The editor shows person/face boxes, baseline and enhanced candidates, and a constrained
+manual crop. Use **Reset manual crop** or `R` to discard uncommitted drag changes and
+restore the baseline candidate. Exported review JSON records accepted baseline/enhanced
+candidates or manual crop coordinates with reason codes.
 
 ## Development
 

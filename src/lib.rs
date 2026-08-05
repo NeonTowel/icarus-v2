@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod models;
 pub mod multi_format_cropping;
 pub mod output_sorting;
+pub mod review;
 pub mod visualization;
 
 pub use error::{Error, Result};

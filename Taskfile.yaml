@@ -13,6 +13,9 @@ includes:
   tests:
     taskfile: taskfiles/tests.yaml
     flatten: true
+  review:
+    taskfile: taskfiles/review.yaml
+    flatten: true
 
 tasks:
   default:

@@ -1,0 +1,22 @@
+version: '3'
+
+tasks:
+  review:
+    desc: 'Run review dry-run and launch editor web UI'
+    vars:
+      INPUT: '{{ default "input/editor" .INPUT }}'
+      MODEL: '{{ default "yolo26m" .MODEL }}'
+    cmds:
+    - cargo run --release --
+      --review
+      --input {{ .INPUT }}
+      --recurse
+      --model {{ .MODEL }}
+    - task: review:ui
+
+  review:ui:
+    desc: 'Launch editor web UI'
+    dir: editor
+    cmds:
+    - |
+      bun run dev
